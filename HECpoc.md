@@ -1,508 +1,460 @@
 # HECpoc — Focused HEC Proof Of Concept Starting Point
 
-Focus: plan. This document is a workbench control document for arriving at a solid Rust HEC PoC from the current Spank material. It coordinates requirements, architecture, detailed design, implementation sequencing, sink selection, and validation. It does not replace the protocol reference in `spank-rs/docs/HECst.md §1`, the product capsule definitions in `spank-rs/perf/Capsules.md §2`, or the validation lab in `spank-rs/perf/Tools.md §7` through `§13`.
+HECpoc is a fresh Rust implementation effort for a small, testable HTTP Event Collector receiver. The first product is a local endpoint that accepts realistic HEC traffic, preserves events, exposes enough inspection to assert what arrived, and makes compatibility differences explicit.
 
-Update this document when the HEC PoC scope, gate criteria, sink priority, or code review findings change. Resolved protocol facts should graduate to `spank-rs/docs/HECst.md`; product requirements should graduate to `spank-rs/perf/Features.md` and `spank-rs/perf/Features.csv`; repeatable third-party tool procedures should graduate to `spank-rs/perf/Tools.md`.
+The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every test. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
 
----
-
-## Table of Contents
-
-1. Purpose And Non-Repetition Rule
-2. Starting Diagnosis
-3. Existing Material To Reuse
-4. PoC Definition
-5. Review Gates Before More Code
-6. Requirements Baseline
-7. Architecture Boundary
-8. Sink Review And Priority
-9. Detailed Design Decisions To Confirm
-10. Rust Layout And Naming Review
-11. Library And Crate Audit
-12. Implementation Sequence
-13. Validation Strategy
-14. Acceptance Criteria
-15. Open Decisions
-16. First Useful Work Package
-17. References
-Appendix A — Crosswalk To Current Code
-Appendix B — Review Checklist
-Appendix C — Proposed HECpoc Directory Contents
+The document starts with implementation guardrails, then moves through scope, protocol, sinks, validation, Rust structure, reuse of prior code, open work, and references.
 
 ---
 
-## 1. Purpose And Non-Repetition Rule
+## 1. Implementation Guardrails
 
-The purpose is to stop treating the current Rust code as either discarded prototype or unquestioned foundation. The PoC should be derived from requirements, checked against existing design notes, and then implemented by accepting, revising, or replacing code intentionally.
+These guardrails constrain the first implementation. They are here to reduce ambiguity, dependency creep, and inherited architecture debt.
 
-The non-repetition rule is strict: this file cites existing documents for protocol details, product rationale, performance research, tool commands, and historical Python design. It restates only the conclusions needed to make the next implementation decision.
-
-The immediate output is not a finished HEC product. It is a defended starting point where the codebase has known seams, tests exercise those seams, and the next expansion is obvious.
-
-## 2. Starting Diagnosis
-
-The current state has useful material, but the order of confidence is inverted. Some code exists before the requirements, architecture, detailed design, and validation gates have been confirmed.
+### 1.1 Scope and reuse
 
-The main risks are concrete:
-
-| Risk | Current symptom | Consequence | PoC response |
-|------|-----------------|-------------|--------------|
-| Existing code overtrusted | `spank-hec` already has route, parser, auth, queue, and file sender code | Hidden mismatch between Splunk compatibility and current behavior | Treat code as candidate implementation, not spec |
-| Scope too broad | HEC, TCP, API, store, observability, lifecycle, config, and perf docs all touch ingest | Work diffuses before HEC acceptance is stable | Make HEC JSON ingest the lead slice |
-| Sink not chosen | `FileSender`, SQLite store traits, raw chunk ideas, and external shippers coexist | Ingest success cannot be asserted cleanly | Prioritize a testable sink stack |
-| Protocol detail mixed with status | `HECst.md` contains protocol facts and deferred implementation items | Reference doc can become a plan | Keep PoC status here until decisions stabilize |
-| Rust crate usage unconfirmed | `tokio`, `axum`, `serde_json`, `flate2`, `parking_lot`, `arc-swap`, `rusqlite`, and `figment` are already present | Dependencies may encode architecture prematurely | Audit each crate against PoC need and replacement cost |
-| Validation not yet ledgered | `Tools.md` describes tool flows, but PoC pass/fail criteria are not bound to code gates | Manual experiments can masquerade as validation | Convert each tool flow into a repeatable run class |
+The initial scope is HEC ingest, local capture, inspection, and validation. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them.
 
-The corrective principle is: HEC PoC first, but HEC PoC includes enough sink and query assertion to prove that accepted events were preserved and can be inspected.
+Both prior Rust implementation threads are abandoned by default. Code from `spank-rs` or `spank-rs/perf` may be lifted only after review of behavior, requirements fit, naming, file layout, dependency use, and edge cases.
 
-## 3. Existing Material To Reuse
-
-The current documents are inputs with different authority levels. The PoC should cite them by topic instead of copying their contents.
-
-| Source | What it contributes here | How to use it |
-|--------|--------------------------|---------------|
-| `/Users/walter/Work/Spank/spank-rs/perf/Orient.md §5` | Course of action: control set, lead capsule, acceptance tests, engine path discipline | Use for sequencing decisions |
-| `/Users/walter/Work/Spank/spank-rs/perf/Capsules.md §2` | HEC CI Fixture user, promise, required capabilities, acceptance tests | Use as product boundary for PoC |
-| `/Users/walter/Work/Spank/spank-rs/perf/Features.md §8.1` and `§8.2` | Ingest and event requirements behind the matrix rows | Use as requirements vocabulary |
-| `/Users/walter/Work/Spank/spank-rs/perf/Features.csv` | Requirement IDs such as `ING-HEC-JSON`, `ING-HEC-AUTH`, `ING-BACKPRESS`, `EVT-RAW`, `EVT-TIME` | Use in tests, commits, issue names, and validation ledger |
-| `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §1` | HEC wire protocol: endpoints, auth, JSON, raw, health, ACK, channel, error codes | Use as protocol reference |
-| `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §3` | Current spank-rs HEC design decisions | Use as candidate decisions to confirm |
-| `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §4` | Current module map and request pipeline | Use as candidate implementation map |
-| `/Users/walter/Work/Spank/spank-rs/perf/Tools.md §7` through `§13` | Splunk, Vector, curl, corpora, run classes, validation ledger | Use for validation harness design |
-| `/Users/walter/Work/Spank/spank-rs/perf/SpankMax.md §2` and `§3.0` | Engine principles: separate ingestion from search prep, scalar correctness path, borrowed parser slices, bounded staging | Use when choosing sinks and parse boundaries |
-| `/Users/walter/Work/Spank/spank-rs/perf/Redoc.md §16` and `§18` | Do not expand SpankMax prematurely; capability matrix should drive implementation | Use to prevent architecture sprawl |
-| `/Users/walter/Work/Spank/spank-py/HEC.md §5` through `§7` | Prior HEC requirements, architecture, parser boundary, backpressure, ACK design | Use as historical input, not direct spec |
-| `/Users/walter/Work/Spank/spank-py/Testing.md §13` through `§15` | Operational test commands, benchmark tools, real-log probes | Mine for test patterns after Rust acceptance is defined |
-| `/Users/walter/Work/Spank/spank-py/Logs.md §10` and `§11` | Parser priority and real corpus findings | Use after basic HEC JSON/raw preservation passes |
+### 1.2 Naming and layout
 
-The important adjustment is authority: `HECst.md` owns protocol facts; `Features.csv` owns requirement IDs; `Tools.md` owns lab procedures; this document owns the PoC route through them.
+Names should match the domain and data direction. Prefer `Event`, `HecEvent`, `Collector`, `EventSink`, `CaptureSink`, `SinkCommit`, and `InspectQuery`. Avoid `Row` and `Sender` in ingest code unless the role is truly generic and direction-free.
 
-## 4. PoC Definition
+Rename directories, files, and implementation primitives when the current names obscure function, compatibility, or review. Regularity is a feature here because the repo must be understandable by a small team.
 
-The focused PoC is a Rust-only HEC receiver that accepts real HEC client traffic, stores enough event data to assert correctness, exposes enough inspection to verify accepted events, and reports overload or invalid input explicitly.
+### 1.3 Dependencies and errors
 
-The PoC includes:
+Minimize dependencies. Add crates only when need and behavior are clear.
 
-1. `/services/collector/event` JSON ingest with Splunk-style token auth.
-2. Gzip request body decoding.
-3. Basic `/services/collector/raw` support sufficient for Vector and curl compatibility checks.
-4. Health endpoint with load-balancer-usable status.
-5. Backpressure through bounded queues and explicit retryable response.
-6. Deterministic capture sink for tests.
-7. Durable local sink for acceptance runs.
-8. Minimal query/assertion path over `_raw`, `_time`, `host`, `source`, `sourcetype`, `index`, and selected `fields`.
-9. Metrics counters for requests, bytes, outcomes, queue full, accepted rows, committed rows, and sink failures.
+Initial posture:
 
-The PoC excludes:
+- HTTP stack: choose during implementation; favor observable request behavior over framework convenience.
+- Metrics: simple counters or structured run output first; Prometheus later if metrics become an external interface.
+- Middleware: avoid Tower-style hidden layers until repeated cross-cutting behavior exists.
+- Locks: standard locking first; the PoC is not initially a high-concurrency design exercise.
+- Storage: generic event sink boundary, concrete file capture first; no early SQLite tuning.
+- Errors: keep HEC protocol outcomes distinct from internal implementation errors at call sites.
+- Runtime: use Tokio; prefer Axum as a thin HTTP adapter over a framework-free collector core, with Hyper direct remaining the escape hatch if exact protocol control requires it.
 
-1. Full HEC ACK lifecycle.
-2. TLS hardening.
-3. Constant-time token hardening unless production deployment becomes the target.
-4. Full SPL search.
-5. Universal Forwarder ingestion as a HEC sender.
-6. Parser-rich Sigma validation beyond smoke fixtures.
-7. Custom unsafe parser or custom async runtime work.
+### 1.4 Performance and resilience posture
 
-The acceptance identity is: a user can run curl and Vector against Spank, compare behavior with Splunk Enterprise for the selected cases, and inspect stored rows without reading implementation internals.
+Performance matters from the start, but the first goal is measured simplicity rather than clever machinery. The PoC should make CPU, memory, concurrency, and failure behavior visible before optimizing them.
 
-## 5. Review Gates Before More Code
+Initial posture:
 
-The PoC should pass through five gates. The gates are intentionally small, but each requires an artifact.
+- CPU: parse in straightforward code first; keep CPU-heavy parsing, tokenization, indexing, compression expansion, and future regex work out of ordinary request-handler critical sections when they become measurable.
+- Memory: enforce request body limits, decoded body limits, line limits, and bounded queues; avoid unbounded buffering per connection or per request.
+- Concurrency: use Tokio for network concurrency, bounded channels for handoff, and explicit worker boundaries for sink writes; avoid shared mutable state unless ownership through message passing is worse.
+- Backpressure: reject overload at admission or queue handoff with an explicit retryable response rather than awaiting indefinitely.
+- Resilience: define accepted, queued, captured, flushed, and durable as separate states; do not let a success response imply a stronger state than the implementation actually achieved.
+- Degradation: when sink failures or queue saturation persist, expose that through health/run output before adding a full phase machine.
 
-| Gate | Question | Required artifact | Exit criterion |
-|------|----------|-------------------|----------------|
-| G1 Requirements | What exact compatibility is required? | Requirement subset table in this document and matching test names | Every PoC test maps to a feature row |
-| G2 Architecture | Where does HEC stop and storage/search begin? | Boundary diagram and sink priority | No handler writes directly to product storage without a sink trait |
-| G3 Detailed design | What are the exact wire and internal semantics? | Decision table for auth, time, raw splitting, metadata, size, gzip, queue full | No behavior exists only in code comments |
-| G4 Implementation review | Which existing modules survive? | Code crosswalk in Appendix A | Each module is accepted, revised, split, or deferred |
-| G5 Validation | What proves it works? | Automated tests plus tool run ledger | curl, Vector, and local corpus runs produce inspectable evidence |
-
-This is not waterfall ceremony. The gates prevent repeated restarts by forcing the same five questions to be answered before each expansion.
-
-## 6. Requirements Baseline
-
-The PoC requirement subset should be selected from the existing matrix rather than invented locally. These are the minimum rows that make HEC ingest meaningful.
-
-| Requirement ID | PoC meaning | First validation |
-|----------------|-------------|------------------|
-| `ING-HEC-JSON` | Accept one or more JSON HEC envelopes at `/services/collector/event` | curl sends string and object event; stored `_raw` matches expected |
-| `ING-HEC-AUTH` | Accept configured token; reject missing, malformed, and invalid credentials distinctly where Splunk compatibility requires it | curl auth matrix returns expected HTTP/code pairs |
-| `ING-HEC-GZIP` | Decode gzip body before JSON/raw parsing | curl or Vector compressed request stores original event |
-| `ING-HEC-RAW` | Accept raw endpoint line framing with documented newline behavior | curl raw body stores expected event count and bytes/text |
-| `ING-BACKPRESS` | Use bounded queue admission and return retryable server-busy under saturation | forced depth-one queue test returns HTTP 503/code 9 |
-| `EVT-RAW` | Preserve received event payload as `_raw` | assertion sink compares exact text for JSON string and raw line cases |
-| `EVT-TIME` | Normalize event time to nanoseconds while preserving server fallback semantics | fixed `time` requests query into expected range |
-| `EVT-HOST` | Store explicit host and documented fallback | JSON request with host is inspectable |
-| `EVT-SOURCE` | Store explicit source and raw endpoint source derivation | JSON and raw requests produce expected source |
-| `EVT-SOURCETYPE` | Store explicit sourcetype and default profile | JSON defaults to `_json`; raw defaults to `_raw` unless query metadata changes this |
-| `EVT-INDEX` | Store explicit index and enforce or record token index constraints according to chosen PoC scope | JSON request with index round-trips |
-| `OBS-METRICS` | Expose counters that explain protocol and sink outcomes | Prometheus metrics include request, code, bytes, queue full, accepted, committed |
-
-Two rows are deliberately deferred even though HEC users care about them:
-
-| Requirement ID | Deferral reason | Re-entry condition |
-|----------------|-----------------|--------------------|
-| `ING-HEC-ACK` | ACK requires a durable commit model and per-channel ack tracking; adding it before sink semantics stabilize creates false conformance | Raw durable sink or SQLite commit boundary is selected and tested |
-| `PAR-CAP` | Parser capability metadata matters for Sigma and schema evolution, but it is not needed to prove HEC event preservation | Parser/Sigma capsule becomes active |
-
-## 7. Architecture Boundary
-
-The PoC architecture has one inbound protocol boundary and one sink boundary. Everything else is replaceable.
-
-```mermaid
-flowchart LR
-    Client["curl / Vector / Splunk comparison client"] --> HTTP["HTTP listener: axum + tokio"]
-    HTTP --> Admit["admission: phase, size, auth"]
-    Admit --> Body["body decode: gzip or identity"]
-    Body --> Parse["HEC parser: event or raw"]
-    Parse --> Normalize["Record normalization"]
-    Normalize --> Queue["bounded ingest queue"]
-    Queue --> Sink["selected sink trait"]
-    Sink --> Inspect["test/query inspection"]
-    Queue --> Metrics["metrics and outcome counters"]
-```
-
-The handler side owns protocol admission and returns HEC wire outcomes. The sink side owns durability, batching, and inspection. The queue is the seam between network-facing behavior and storage-facing behavior.
-
-The architecture should keep three boundaries explicit:
-
-1. `HecRequest` to `Rows`: pure protocol interpretation where unit tests can run without a server.
-2. `Rows` to `SinkBatch`: sink normalization where storage-specific choices begin.
-3. `SinkCommit` to inspection/query: validation path where accepted data becomes observable.
-
-The current `spank-hec` shape already approximates this split, but the sink side is not yet aligned with the durable/queryable PoC objective.
-
-## 8. Sink Review And Priority
-
-Because the focus is ingest, sink choice is not secondary. The sink determines what an accepted event means and what can be validated.
-
-| Priority | Sink | Purpose | Strength | Weakness | PoC decision |
-|----------|------|---------|----------|----------|--------------|
-| 1 | In-memory assertion sink | Unit and integration tests | Fast, deterministic, exact assertions | Not durable; not representative of deployment | Add or formalize first |
-| 2 | JSONL capture sink | Human-readable evidence and fixture capture | Easy to inspect, diff, archive | Poor query semantics; weak performance model | Keep for bring-up and run ledgers |
-| 3 | SQLite event sink | Local durable acceptance store | Queryable, familiar, already scaffolded | Can hide engine needs behind SQL; write tuning matters | Use as first durable PoC sink if wired through trait |
-| 4 | Raw chunk sink | Durable raw preservation and replay | Best long-term ingest foundation | Needs chunk format, CRC, manifest, replay tools | Design now, implement after PoC JSON path |
-| 5 | Null/blackhole sink | Throughput baseline | Separates protocol cost from storage cost | Cannot validate correctness alone | Use only in benchmarks |
-| 6 | External HEC forwarding sink | Relay to Splunk/another backend | Useful compatibility bridge | Changes product identity from receiver/store to forwarder | Defer until shipper capsule exists |
-| 7 | TCP/S2S-like sink | Compatibility with Splunk forwarder assumptions | Useful later for Splunk ecosystem adjacency | Universal Forwarder is not an HEC sender | Out of HEC PoC |
-
-The recommended first stack is: in-memory assertion sink for tests, JSONL capture for human evidence, SQLite event sink for durable acceptance. Raw chunk design remains documented but not blocking.
-
-A sink trait for the PoC should be narrow:
-
-```rust
-trait HecSink: Send + Sync + 'static {
-    fn submit(&self, batch: HecBatch) -> spank_core::Result<HecCommit>;
-    fn flush(&self, tag: &str) -> spank_core::Result<()>;
-}
-```
-
-The current `Sender` trait in `spank-hec` is close, but its name is ambiguous: in Splunk and Vector contexts a sender usually emits data outward. For ingest PoC clarity, use `Sink` or `EventSink` for inbound storage and reserve `Sender` or `Shipper` for outbound forwarding.
-
-## 9. Detailed Design Decisions To Confirm
-
-The PoC should freeze selected behaviors and explicitly mark the rest as deferred. The table below is the working decision set.
-
-| Area | Candidate behavior | Current signal | PoC decision needed |
-|------|--------------------|----------------|---------------------|
-| Endpoint paths | Support `/services/collector/event`, `/raw`, `/health`; possibly `/services/collector/1.0/event` aliases | `HECst.md §1.1` lists variants; current routes cover base paths | Include aliases only if Vector/Splunk SDK tests require them |
-| Auth schemes | `Authorization: Splunk <token>` primary, `Bearer` tolerated if documented | Current extractor accepts both | Confirm missing vs malformed vs invalid response codes |
-| Token storage | Configured tokens with id and allowed indexes | `spank-cfg` has `HecToken` | Keep config token store for PoC; defer management API |
-| Token comparison | Direct string lookup now; constant-time later | `HECst.md §3.7` identifies production gap | Defer hardening, but document threat boundary |
-| Body size | Reject before decode or after decode | Current check is pre-decode length | Decide whether max applies compressed or decoded size for PoC tests |
-| Gzip | Decode when `Content-Encoding: gzip` | Current `decode_body` supports gzip | Keep and add malformed gzip tests |
-| JSON framing | Accept concatenated JSON envelopes | Current parser streams deserializer | Keep and test multi-envelope acceptance and all-or-reject behavior |
-| Event null | Map absent and null to code 12; empty string to 13 | `HECst.md §3.1`; current code follows code but old comments disagree | Confirm and fix doc/comment drift when editing code |
-| Time | Accept number and decimal string; store nanoseconds | Current `TimeField` supports both and falls back on invalid | Confirm invalid time fallback vs rejection |
-| Fields | Flatten string and scalar fields; reject or stringify nested values | Current code stringifies non-string fields | Decide because indexed fields affect search and Sigma later |
-| Raw splitting | Split on newline; CRLF trimming and whitespace-only behavior must be specified | Current code only filters empty byte slices | Define exact byte/text preservation and test it |
-| Metadata carry-forward | Splunk can carry metadata across envelopes in some clients | `HECst.md §2.11` identifies issue | Defer unless real clients require it |
-| Channel | Header preferred, empty header ignored, token id fallback | Current code does this | Keep for non-ACK mode |
-| ACK | Stub or disabled response | Current route returns 501 code 14 | Choose compatibility response for disabled ACK before Vector test |
-| Backpressure | `try_send`; full queue returns HTTP 503/code 9 | Current receiver does this | Keep, but force-test saturation |
-| Sink failure | Handler accepts once queued; consumer logs sink failure | Current consumer logs only | For PoC, decide whether sink failure should trip phase/degraded status |
-
-The most important not-yet-settled behaviors for a reliable PoC are raw endpoint metadata, sink failure semantics, and inspect/query path.
-
-## 10. Rust Layout And Naming Review
-
-The current crate layout is plausible, but it should be reviewed for naming and ownership before expansion.
-
-Current useful separation:
-
-```text
-crates/spank-hec/src/
-  authenticator.rs
-  token_store.rs
-  processor.rs
-  outcome.rs
-  receiver.rs
-  sender.rs
-```
-
-Recommended PoC naming direction:
-
-```text
-crates/spank-hec/src/
-  auth.rs              HEC credential extraction and token authentication
-  body.rs              gzip/identity body decode and size policy
-  event.rs             HEC JSON envelope parsing and event semantics
-  raw.rs               raw endpoint parsing and metadata policy
-  outcome.rs           HEC wire outcomes and code/status mapping
-  receiver.rs          axum routes, admission, queue handoff
-  sink.rs              inbound sink trait only if kept in spank-hec
-```
-
-Recommended cross-crate direction:
-
-```text
-crates/spank-core/src/
-  record.rs            canonical event record
-  error.rs             structured project error and recovery class
-
-crates/spank-store/src/
-  hec_capture.rs       in-memory/assertion sink, if test-only possibly under tests
-  jsonl.rs             capture sink
-  sqlite.rs            durable acceptance sink
-  traits.rs            product sink/store traits
-```
-
-Do not rename files just for aesthetic regularity. Rename only when the name prevents correct architecture. The strongest candidate is `sender.rs`, because inbound ingest storage is semantically a sink, not a sender.
-
-Coding convention questions to settle before large edits:
-
-1. Are HEC-specific types named `Hec...` even inside the `spank-hec` crate, or only at public boundaries?
-2. Are wire-protocol outcomes kept separate from internal `SpankError` everywhere?
-3. Are parser functions pure and testable without `axum`?
-4. Are test fixtures kept close to crates, or centralized under a future validation tree?
-5. Are feature IDs used in test names or only in comments and validation ledger rows?
-
-## 11. Library And Crate Audit
-
-The current dependency set is reasonable for a first Rust HEC PoC, but each dependency should be tied to a decision.
-
-| Crate | Current role | Keep for PoC? | Review note |
-|-------|--------------|---------------|-------------|
-| `tokio` | Async runtime, signals, channels, task spawning | Yes | Use for network I/O; keep CPU-heavy parsing out of ordinary async tasks when that work grows |
-| `axum` | HTTP routing and handlers | Yes | Good fit for HTTP PoC; route aliases and request limits need explicit tests |
-| `hyper` | HTTP substrate via axum | Yes, indirect | Avoid direct hyper unless axum blocks required behavior |
-| `tower` / `tower-http` | Middleware and tracing | Maybe | Keep only if actually used in PoC routes; otherwise avoid hidden middleware behavior |
-| `serde` / `serde_json` | HEC JSON envelope parse | Yes | Streaming deserializer is appropriate; preserve absent/null distinction deliberately |
-| `flate2` | gzip decode | Yes | Confirm decompressed size policy and malformed gzip behavior |
-| `metrics` / `metrics-exporter-prometheus` | Counters and Prometheus endpoint | Yes | Metrics are part of PoC acceptance, not decoration |
-| `tracing` / `tracing-subscriber` | Structured events | Yes | Keep logs structured enough to support validation ledger |
-| `figment` | Config layering | Yes for now | Confirm env naming and defaults; avoid config magic hiding test setup |
-| `clap` | CLI config and subcommands | Yes | HEC PoC should prefer config file plus env overrides over many CLI flags |
-| `parking_lot` | Locks in token store and file sink | Accept temporarily | Revisit if standard locks are sufficient; do not optimize locks prematurely |
-| `arc-swap` | Shared phase state | Accept temporarily | Useful if phase changes without locking; keep if health/admission use it clearly |
-| `rusqlite` | SQLite store | Yes if selected durable sink | Use as acceptance sink; avoid letting SQLite schema become final engine design |
-| `tokio-util` | CancellationToken | Yes | Keep lifecycle cancellation explicit |
-| `anyhow` | Binary-level error aggregation | Yes only in `crates/spank` | Library crates should continue returning structured errors |
-| `thiserror` | Structured library errors | Yes | Keep internal errors matchable and testable |
-
-Possible additions should be resisted until a gate requires them. Candidate future crates include `subtle` for constant-time comparison, `tempfile` for tests, `reqwest` or `hyper` test clients for integration tests, and `criterion` for benchmarks. None are required to define the starting point.
-
-## 12. Implementation Sequence
-
-The implementation sequence should be short and evidence-producing. Each step should leave a runnable state.
-
-| Step | Work | Files likely touched | Validation |
-|------|------|----------------------|------------|
-| 1 | Add HEC protocol unit tests for parser/outcome edge cases | `crates/spank-hec/src/processor.rs`, maybe `outcome.rs` | `cargo test -p spank-hec` |
-| 2 | Add receiver integration tests with in-memory sink | `crates/spank-hec/src/receiver.rs`, new test support module | POST valid, bad auth, malformed JSON, gzip, queue full |
-| 3 | Clarify sink trait naming and add assertion sink | `crates/spank-hec/src/sink.rs` or `sender.rs`; tests | Accepted rows are inspectable without file I/O |
-| 4 | Wire durable SQLite or JSONL acceptance sink behind same trait | `crates/spank-store`, `crates/spank/src/main.rs` | Run server; curl events; inspect store/capture |
-| 5 | Normalize raw endpoint policy | `crates/spank-hec/src/processor.rs` or `raw.rs` | CRLF, empty, whitespace, metadata tests |
-| 6 | Add Vector compatibility run | config under future `HECpoc/config/`; results under future `HECpoc/results/` | Vector sends to Spank; accepted rows match expected count |
-| 7 | Add Splunk Enterprise comparison run | manual ledger from `Tools.md §10` | Selected requests compared for status/code/body |
-| 8 | Freeze PoC acceptance report | this document or separate results markdown | Clear pass/fail table and next capsule decision |
-
-Do not implement parser optimization, raw chunk format, ACK, or full search until Step 4 produces durable inspectable accepted events.
-
-## 13. Validation Strategy
-
-Validation should be layered from deterministic to realistic. The PoC is not accepted by a successful server start.
-
-| Layer | Tool | Purpose | Evidence |
-|-------|------|---------|----------|
-| Unit | Rust tests | Parser, outcome, auth, raw split, gzip decode | test names tied to feature IDs |
-| Handler | axum integration tests | HTTP status/body, headers, queue full, phase admission | captured response matrix |
-| Process | `spank serve` plus curl | End-to-end local path through config, runtime, routes, sink | shell transcript and captured sink rows |
-| Shipper | Vector | Real HEC client compatibility | Vector config, Vector logs, Spank metrics, stored rows |
-| Reference | Splunk Enterprise | Behavior comparison for selected protocol cases | request/response diff table |
-| Corpus | tutorial logs and local logs | volume, line shape, raw preservation | counts, parse misses, latency/throughput notes |
-| Benchmark | null/capture/SQLite sinks | identify bottleneck class | rows/sec, bytes/sec, p50/p95/p99 latency, CPU |
-
-Minimum local inputs:
-
-1. `/Users/walter/Work/Spank/Logs/tutorialdata/www1/access.log` for Apache-like line volume.
-2. `/Users/walter/Work/Spank/Logs/tutorialdata/www1/secure.log` for auth/syslog-like line volume.
-3. `/Users/walter/Work/Spank/Logs` production and tool logs after tutorial fixtures pass.
-4. Vector-generated events and Wazuh/Vector NDJSON after raw and JSON preservation are stable.
-
-The validation ledger should record command, config, input corpus, expected rows, accepted rows, rejected rows, outcome codes, sink path, metrics snapshot, and comparison target.
-
-## 14. Acceptance Criteria
-
-HEC PoC acceptance requires all of the following:
-
-1. `cargo test -p spank-hec` passes parser and receiver tests for selected requirements.
-2. `cargo test -p spank-store` passes the selected sink tests if SQLite is used.
-3. A local `spank serve` run accepts curl JSON, gzip JSON, raw, and bad-auth cases with expected wire outcomes.
-4. A Vector source-to-HEC run sends tutorial log lines into Spank and stored row count matches the input event count after documented filtering.
-5. A Splunk Enterprise comparison run has a table for the same curl requests, with each difference classified as match, intentional divergence, or bug.
-6. Metrics explain the run: request count, bytes in, outcome code counts, queue full count, accepted rows, committed rows, sink failures.
-7. The selected sink lets a reader inspect `_raw`, `_time`, `host`, `source`, `sourcetype`, `index`, and fields for representative events.
-8. Backpressure is not theoretical: a forced small-queue test returns retryable/server-busy and increments the queue-full metric.
-9. All deferred behaviors are named and have re-entry conditions.
-
-A run that accepts traffic but cannot prove what was stored is not accepted.
-
-## 15. Open Decisions
-
-These decisions block a clean starting point if left implicit:
-
-| ID | Decision | Options | Recommended default |
-|----|----------|---------|---------------------|
-| HECPOC-D1 | First durable sink | JSONL, SQLite, raw chunk | SQLite for queryable acceptance, JSONL for evidence |
-| HECPOC-D2 | Sink trait home | `spank-hec`, `spank-store`, `spank-core` | Define product trait in `spank-store`; keep HEC adapter narrow |
-| HECPOC-D3 | Raw CRLF policy | Preserve CR, trim CR, normalize newline | Normalize line ending for event text but preserve raw bytes later in raw chunk design |
-| HECPOC-D4 | Body size policy | compressed size, decoded size, both | Enforce request size pre-decode and decoded size before parse |
-| HECPOC-D5 | ACK disabled response | 400/code 14, 501/code 14, omit route | Match Splunk-compatible disabled response if verified; otherwise document intentional 501 for PoC |
-| HECPOC-D6 | Indexed fields policy | stringify all, accept scalars only, reject nested | Accept strings/scalars; reject or ignore nested with metric before Sigma work |
-| HECPOC-D7 | Store schema | single events table, raw chunks plus sidecars, EAV/segments | single events table for PoC; raw chunks/segments later |
-| HECPOC-D8 | Test artifact home | crate tests only, `/HECpoc`, `spank-rs/perf` | crate tests for automation; `/HECpoc` for configs/results until docs graduate |
-
-## 16. First Useful Work Package
-
-The next coding work should be one bounded package:
-
-1. Write a HEC PoC test matrix using feature IDs from `Features.csv`.
-2. Add missing tests around existing `spank-hec` parser and receiver behavior.
-3. Add an in-memory assertion sink or test harness that observes accepted rows.
-4. Fix only the bugs revealed by those tests in the JSON/gzip/auth/backpressure path.
-5. Produce one curl run and one Vector run using tutorial logs.
-
-Expected immediate findings:
-
-1. `sender.rs` naming and responsibility will likely need adjustment.
-2. Raw endpoint policy will need code changes or explicit deferral.
-3. ACK route status/code will need compatibility confirmation.
-4. Sink failure behavior will need phase/degraded semantics before production claims.
-5. SQLite can be used for acceptance, but should not be mistaken for the final performance engine.
-
-The starting point is solid when the HEC handler can be changed with confidence because unit tests, handler tests, process tests, and external client tests all check the same requirement IDs.
+### 1.5 Tests and documentation
+
+Unit tests live with the unit or crate they test. Integration and system tests live where they exercise real process, socket, file, and tool boundaries.
+
+Code comments should explain local invariants, protocol quirks, and non-obvious decisions. Issue IDs, task history, and intermediate status belong in workbench documents and run ledgers, not product code.
 
 ---
 
-## 17. References
+## 2. Scope, Wants, and Capability Bundles
 
-1. `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §1` — HEC wire protocol and endpoint behavior.
-2. `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §3` — current spank-rs HEC design decisions.
-3. `/Users/walter/Work/Spank/spank-rs/docs/HECst.md §4` — current HEC module map and request pipeline.
-4. `/Users/walter/Work/Spank/spank-rs/perf/Orient.md §5` — product-capability course of action.
-5. `/Users/walter/Work/Spank/spank-rs/perf/Capsules.md §2` — HEC CI Fixture capsule.
-6. `/Users/walter/Work/Spank/spank-rs/perf/Features.md §8` and `/Users/walter/Work/Spank/spank-rs/perf/Features.csv` — requirement groups and row IDs.
-7. `/Users/walter/Work/Spank/spank-rs/perf/Tools.md §7` through `§13` — HEC validation targets, curl, Vector, Splunk, run classes, and ledger fields.
-8. `/Users/walter/Work/Spank/spank-rs/perf/SpankMax.md §2` and `§3.0` — performance harness principles and future engine layout.
-9. `/Users/walter/Work/Spank/spank-rs/perf/Redoc.md §16` and `§18` — SpankMax split decision and documentation rework sequence.
-10. `/Users/walter/Work/Spank/spank-py/HEC.md §5` through `§7` — historical Python HEC requirements, architecture, and detailed design.
-11. `/Users/walter/Work/Spank/spank-py/Testing.md §13` through `§15` — historical validation commands and benchmark tools.
-12. `/Users/walter/Work/Spank/spank-py/Logs.md §10` and `§11` — parser format priorities and corpus validation findings.
+The scope starts from user wants, then derives features. It should not be organized around every Splunk feature that can be named.
+
+### 2.1 Wants, features, benefits
+
+The user wants to start a local endpoint, send events using ordinary HEC clients, see clear success or failure, inspect accepted events, compare selected behavior with Splunk, and repeat the same run in development and CI.
+
+| Feature | Benefit |
+|---------|---------|
+| HEC JSON ingest | Applications and shippers use their real output path |
+| Raw ingest | Raw endpoint users and line senders can be tested |
+| Token auth | Bad-token and missing-auth failures are caught |
+| Gzip decode | Common compressed client behavior is covered |
+| Metadata capture | Tests assert time, host, source, sourcetype, and index |
+| File capture sink | Accepted events are directly inspectable |
+| Backpressure response | Overload becomes visible, not silently accepted |
+| Local inspection | Tests assert stored output without reading internals |
+| Bounded resource use | Bad inputs and slow sinks do not consume unbounded memory or worker time |
+| Resilient failure reporting | Users can distinguish rejected, accepted, captured, and failed-after-accept cases |
+
+### 2.2 Capability bundles
+
+Group capabilities by functional bundle and likely sequence, not by requirement prefix.
+
+| Bundle | Contents | Stage |
+|--------|----------|-------|
+| A. JSON, raw, files | `ING-HEC-JSON`, `ING-HEC-RAW`, `EVT-RAW`; visible file/capture evidence | First |
+| B. Backpressure | `ING-BACKPRESS`; explicit retryable failure under saturation | First |
+| C. Time and metadata | `EVT-TIME`, `EVT-HOST`, `EVT-SOURCE`, `EVT-SOURCETYPE`; event identity | First |
+| D. Auth and gzip | `ING-HEC-AUTH`, `ING-HEC-GZIP`; realistic client behavior | First |
+| E. Inspection | `SCH-TERM`, `SCH-TIME`, maybe `SCH-FIELDS`; assertion surface | Early |
+| F. More sinks, index, metrics | `EVT-INDEX`, `OBS-METRICS`, durable sink work | Later |
+| G. ACK and capability metadata | `ING-HEC-ACK`, `PAR-CAP`; commit and parser capability semantics | Later |
+| H. Resource and resilience controls | body limits, queue limits, slow-sink behavior, health degradation | First |
+
+### 2.3 Initial detail level
+
+Capture concrete requirements, high-level architecture, event/sink/validation design, and only the low-level details that block implementation. Work decomposition should stay short. Validation is designed alongside code, not appended after it.
 
 ---
 
-## Appendix A — Crosswalk To Current Code
+## 3. Protocol and Event Semantics
 
-This appendix records how the existing code should be treated during the PoC review. It is not a final code audit.
+Protocol design is the first technical center of gravity. It defines which entities exist, how requests move through states, and what behavior must be tested.
 
-| Current file | Current role | PoC disposition |
-|--------------|--------------|-----------------|
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/lib.rs` | Exports HEC modules and public types | Keep module facade; update exports if sink naming changes |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/outcome.rs` | HEC wire response body and HTTP status | Keep; add exact code/status tests and missing outcomes if needed |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/processor.rs` | gzip decode, JSON event parser, raw parser | Keep as correctness core; likely split later into `body`, `event`, `raw` |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/receiver.rs` | axum routes, admission, auth dispatch, queue handoff, consumer | Keep but add integration tests and route alias decision |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/authenticator.rs` | credential-to-principal trait and token authenticator | Keep; review timing and malformed auth semantics |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/token_store.rs` | concurrent token registry | Keep for config-based PoC; management API deferred |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src/sender.rs` | inbound rows to file writer via `Sender` trait | Rename or wrap conceptually as sink before adding more sinks |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-core/src/record.rs` | canonical `Record` and `Rows` | Keep as PoC event model; verify fields against `EVT-*` rows |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-core/src/error.rs` | structured project error and recovery classes | Keep; ensure sink/queue failures map to recovery classes |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-store/src/traits.rs` | bucket writer/reader/partition manager traits | Use for durable acceptance if not too broad for HEC sink |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-store/src/sqlite.rs` | SQLite bucket implementation | Candidate durable PoC sink; needs HEC wiring and assertion path |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank/src/main.rs` | binary composition and runtime | Keep as process integration target; avoid adding too much HEC policy here |
-| `/Users/walter/Work/Spank/spank-rs/crates/spank-cfg/src/lib.rs` | config defaults, env layering, HEC token config | Keep; add PoC config examples before more CLI flags |
+### 3.1 Request phases and entities
 
-Known high-value review points:
-
-1. Current raw parser splits on `\n` and filters only zero-length slices; CRLF and whitespace-only behavior need tests.
-2. Current body length check occurs before gzip decode; decoded-size limit needs a decision.
-3. Current route set does not include `/services/collector/1.0/*` aliases.
-4. Current ACK route returns HTTP 501/code 14; compatibility response needs verification.
-5. Current consumer logs sink failure after the handler already returned success; phase/degraded semantics need design.
-6. Current `FileSender` groups by `source`, not request tag; this may surprise HEC validation that expects channel/token grouping.
-7. Current parser tests exist, but receiver-level tests and sink-level acceptance are thin or absent.
-
-## Appendix B — Review Checklist
-
-Use this checklist before approving HEC PoC implementation changes.
-
-### B.1 Requirements
-
-1. Does every test map to a `Features.csv` row?
-2. Does each row have one executable validation path?
-3. Are deferred rows named with re-entry conditions?
-4. Are differences from Splunk behavior marked intentional or bug?
-
-### B.2 Architecture
-
-1. Does handler code stop at queue/sink handoff?
-2. Is protocol outcome logic separated from internal storage errors?
-3. Can parser logic be tested without an HTTP server?
-4. Can sink logic be tested without a network listener?
-5. Is backpressure observable at the wire and metric layers?
-
-### B.3 Detailed Design
-
-1. Are auth missing, malformed, and invalid cases distinct if the protocol requires it?
-2. Is body size policy explicit before and after gzip decode?
-3. Are absent, null, empty, scalar, object, and array event values tested?
-4. Are raw newline, CRLF, empty-line, and whitespace-line cases tested?
-5. Is timestamp fallback behavior accepted deliberately?
-6. Are `fields` flattening and nested-value behavior documented?
-7. Is channel/tag derivation tested with present, empty, and absent headers?
-
-### B.4 Implementation
-
-1. Are crate names and file names aligned with direction of data flow?
-2. Are public types minimal and named for domain concepts?
-3. Are dependencies used directly by the PoC or merely inherited?
-4. Are long-running CPU tasks kept out of ordinary async handler execution?
-5. Are lock scopes small and absent from hot parsing loops?
-6. Are panics excluded from normal bad-input paths?
-
-### B.5 Validation
-
-1. Do unit tests pass before process tests run?
-2. Does curl prove protocol edge cases?
-3. Does Vector prove real client compatibility?
-4. Does Splunk Enterprise comparison classify differences?
-5. Does the sink make stored rows inspectable?
-6. Do metrics explain both success and rejection paths?
-7. Are result artifacts named by date, git revision, config, input corpus, and requirement set?
-
-## Appendix C — Proposed HECpoc Directory Contents
-
-Only this file exists initially. If the PoC workbench grows, use a minimal structure:
+Request states:
 
 ```text
-/Users/walter/Work/Spank/HECpoc/
-  HECpoc.md              control document
-  configs/               Splunk, Vector, and Spank sample configs
-  requests/              curl request bodies and expected response matrices
-  fixtures/              copied or generated tiny fixtures, not large corpora
-  results/               dated validation ledgers and response captures
-  scripts/               thin wrappers around documented commands
+HTTP request
+  -> admitted or rejected
+  -> authenticated or rejected
+  -> decoded or rejected
+  -> parsed as event/raw or rejected
+  -> normalized into events
+  -> submitted to sink or rejected by backpressure
+  -> captured or committed
+  -> inspectable
 ```
 
-Large logs should remain under `/Users/walter/Work/Spank/Logs`. Repository code should remain under `/Users/walter/Work/Spank/spank-rs`. This workbench should hold coordination artifacts, not become another product tree.
+Core entities:
+
+| Entity | Meaning |
+|--------|---------|
+| `HecRequest` | Method, path, headers, body, peer context |
+| `HecCredential` | Parsed auth scheme and token |
+| `HecEnvelope` | JSON event endpoint envelope |
+| `HecEvent` | Normalized accepted event |
+| `EventBatch` | One request's accepted events |
+| `SinkCommit` | Sink result visible to validation |
+| `InspectQuery` | Minimal read path over captured events |
+
+Each transition should have a validation case before surrounding code is considered stable.
+
+### 3.2 Endpoint behavior
+
+Minimum surface:
+
+- `/services/collector/event`: accept one or more JSON envelopes.
+- `/services/collector/raw`: accept newline-framed raw events with documented CRLF behavior.
+- `/services/collector/health`: report simple availability.
+- `/services/collector/ack`: return a deliberate disabled/unsupported response until commit semantics exist.
+- Body encoding: identity and gzip, with explicit pre-decode and post-decode size policy.
+- Admission controls: bounded request body, decoded body, per-event raw size, and bounded sink handoff.
+
+Route aliases such as `/services/collector/1.0/*` should wait for client evidence.
+
+### 3.3 Event fields
+
+Initial field rules:
+
+- `_raw`: preserve event text for comparison; raw byte preservation can become a later sink property.
+- `_time`: store parsed event time with an explicit precision decision. Do not assume nanoseconds before Splunk comparison and storage design; microseconds may be enough, nanoseconds may be convenient internally.
+- `host`, `source`, `sourcetype`: store payload values and make defaults visible.
+- `index`: logical namespace first; physical partitioning later.
+- `fields`: start with flat scalar values; nested behavior must be accepted, ignored, or rejected deliberately.
+
+### 3.4 Invalid and questionable input
+
+The main design must capture corner cases because they shape parser, error, sink, and validation code.
+
+| Group | Cases |
+|-------|-------|
+| Auth | missing, malformed, wrong scheme, empty token, invalid token, valid token |
+| JSON | empty, malformed, multiple envelopes, later invalid envelope, event absent, null, empty string, object, array |
+| Raw | empty body, trailing newline, CRLF, blank line, whitespace-only line, invalid UTF-8 if text output is used |
+| Gzip and size | valid gzip, malformed gzip, empty decoded body, pre-decode limit, post-decode limit |
+| Metadata | missing values, explicit empty strings, nested fields, non-scalar fields |
+| Backpressure | full queue, slow sink, sink error after accepted handoff |
+| ACK/channel | channel absent, channel empty, channel present with ACK disabled, ACK request before implementation |
+
+---
+
+## 4. Sink, Store, and Inspection Strategy
+
+Sink choice is part of ingest correctness. The first implementation should prove accepted events are visible before it designs a database.
+
+### 4.1 Sink order
+
+Sort by usefulness and complexity:
+
+1. Capture file sink: first correctness evidence.
+2. In-memory assertion sink: useful once tests need direct event access.
+3. Null sink: benchmark only, not correctness.
+4. Raw chunk or structured file sink: later replay and corruption checks.
+5. SQLite or queryable store: later durable local query; no early optimization.
+6. External forwarding sink: defer; that is another product mode.
+
+The first practical path is capture file plus simple inspection.
+
+### 4.2 Inspection path
+
+Start close to stored evidence: write accepted events to a documented file format, provide a tiny inspection command or test helper, support term/time filters only after semantics are defined, and add indexing only when the simple path fails.
+
+A sink trait is justified only when two concrete implementations need the same call sites and can be tested independently. Until then, a concrete capture sink is simpler than an abstraction display case.
+
+### 4.3 Resource and failure boundaries
+
+The sink boundary is where concurrency and resilience become concrete. The collector should not let request handlers become file-system workers under load.
+
+Initial rules:
+
+- Request handlers may parse and normalize small HEC bodies, but they should not perform long blocking writes.
+- Sink writes should happen through a bounded handoff or a clearly synchronous fixture mode; the chosen mode must be visible in validation.
+- Queue depth, max request bytes, max decoded bytes, max raw event bytes, and max events per request should be configurable or at least named constants.
+- Slow sink behavior should be tested by a deliberately blocking or failing sink.
+- Capture files should use buffered writes, but flush semantics must be tied to explicit validation expectations.
+- Crash resilience is limited at first: file capture should be append-only and inspectable after process exit, but not advertised as durable ACK storage.
+
+---
+
+## 5. Validation Strategy
+
+Validation starts from wants and needs, then checks compatibility and capability. Tests fit under that structure.
+
+| Level | Question | Evidence |
+|-------|----------|----------|
+| Wants and needs | Does this catch real HEC integration mistakes? | local run with inspectable output |
+| Compatibility | Does selected behavior match Splunk or known clients? | curl/Vector/Splunk comparison |
+| Protocol | Are phases and edge cases deliberate? | unit and handler tests |
+| Sink | Do accepted events match stored evidence? | capture inspection |
+| Resource use | Are CPU, memory, and queue limits enforced? | limit tests and run counters |
+| Resilience | Are rejected, accepted, captured, and failed states distinguishable? | slow/failing sink tests |
+| Usability | Can a developer run it without reading source? | README command sequence |
+| Prioritization | Does each feature activate the first workflow? | capability bundle table |
+
+Validation layers are unit tests, handler tests, process tests with curl, Vector shipper tests, Splunk Enterprise comparison, tutorial-log corpus runs, and later benchmarks.
+
+Performance validation starts modestly: report request count, accepted event count, rejected count, bytes in, decoded bytes, max-body rejection, queue-full count, sink write failures, and elapsed time. CPU and RSS measurements can be coarse at first, but each benchmark run should record enough machine and config context to avoid comparing ghosts.
+
+Artifacts stay small:
+
+```text
+fixtures/
+  requests/        curl bodies and expected response snippets
+  scripts/         thin wrappers for curl, Vector, and inspection
+  configs/         small Spank, Vector, and Splunk notes/config fragments
+  logs/            tiny copied fixtures only
+results/
+  README.md        ledger schema and dated run summaries
+```
+
+Large logs remain under `/Users/walter/Work/Spank/Logs`.
+
+---
+
+## 6. Rust Implementation Shape
+
+Rust structure should follow capability and protocol boundaries. Avoid fine-chopping crates before internal completeness, consistency, external reuse, or planned mix-and-match justify the split.
+
+Use Tokio for the server runtime. The default starting shape is Axum as a thin adapter over framework-free collector functions. Hyper direct remains a later option if Axum makes body control, graceful shutdown, or protocol conformance harder to prove.
+
+### 6.1 Initial layout
+
+Start as one small crate with `hec_receiver/` under `src/`:
+
+```text
+src/
+  main.rs
+  config.rs
+  error.rs
+  hec_receiver/
+    mod.rs
+    protocol.rs      endpoint paths, request phases, response mapping
+    body.rs          size policy and gzip/identity decode
+    auth.rs          auth header parsing and token validation
+    event.rs         JSON envelope and HEC event normalization
+    raw.rs           raw endpoint framing and newline policy
+    sink.rs          capture sink and minimal sink boundary
+    inspect.rs       simple readback over capture files
+    limits.rs        resource limits and admission constants/config
+
+tests/
+  hec_protocol.rs
+  hec_process.rs
+
+fixtures/
+  requests/
+  scripts/
+  configs/
+  logs/
+```
+
+Avoid redundant `spank-` prefixes inside this repo.
+
+### 6.2 Crate and trait guidance
+
+A crate split is justified only when the candidate crate is internally complete and separately useful: reusable collector, protocol parser, store, or benchmark harness. Until then, modules are cheaper than crates.
+
+A trait is justified only after separate implementations prove a real boundary. Limit generic boilerplate.
+
+### 6.3 Errors and dependencies
+
+For errors, separate the faces rather than over-designing hierarchy: HEC protocol outcome for HTTP clients, internal error for logs/debugging, sink error for accepted-versus-not-accepted semantics, and test assertion error for developer feedback. A simple `HecError` or `HecOutcome` can map to HTTP responses. Internal shape can evolve without call-site churn.
+
+Likely early crates are `serde`, `serde_json`, gzip support, and maybe `tempfile` for tests. CLI, HTTP, metrics, middleware, database, and benchmarking dependencies should be added only when the current capability bundle needs them.
+
+For the HTTP stack, start with `tokio` plus `axum` unless the first protocol matrix proves that direct Hyper control is cleaner. If Axum is used, it should terminate at an adapter layer that converts HTTP requests into HECpoc request objects and HECpoc outcomes back into HTTP responses. The protocol, event, sink, and validation logic should not depend on Axum extractors.
+
+Concurrency model:
+
+- one Tokio runtime for network and coordination;
+- bounded request-to-sink handoff for normal mode;
+- optional direct synchronous sink only for tiny fixture mode;
+- no blocking filesystem calls in async handlers unless they are isolated and measured;
+- CPU-heavy future parser/index work goes behind explicit worker boundaries, not casual `tokio::spawn`.
+
+---
+
+## 7. Existing Code Reuse Policy
+
+The old `spank-hec` shape is the split under `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src`: authenticator, token store, processor, outcome, receiver, and sender. It is informative, not binding.
+
+Before lifting any module, ask whether it implements a selected HECpoc bundle, matches naming/layout standards, covers invalid inputs, justifies its dependencies, avoids hidden runtime/sink assumptions, and remains understandable outside old `spank-rs`.
+
+Candidate notes:
+
+| Source | Possible value | Caution |
+|--------|----------------|---------|
+| `spank-hec/src/processor.rs` | JSON parser, gzip decode, null/absent handling | raw policy, comments, time precision, fields behavior need review |
+| `spank-hec/src/outcome.rs` | HEC response shape | compare with Splunk and desired error groups |
+| `spank-hec/src/receiver.rs` | phase ordering, queue backpressure example | axum/tokio/metrics may be premature |
+| `spank-hec/src/authenticator.rs` | token credential shape | timing/security and malformed auth need review |
+| `spank-hec/src/sender.rs` | file writing example | `Sender` name and source grouping are likely wrong here |
+| `perf/src/parsers.rs` | memchr/scalar parser examples | parser optimization comes after HEC preservation |
+| `perf/src/store.rs` | null/raw/SQLite benchmark patterns | benchmark input, not first product schema |
+
+---
+
+## 8. Initial Work Sequence
+
+The first sequence should support decisions and clarity. Code and tests can be co-designed, but tests should not narrow attention to only happy-path central cases.
+
+1. Filter HECpoc rows from `Features.csv` into a small local requirement table.
+2. Implement the smallest collector skeleton with JSON event ingest and capture file sink.
+3. Define invalid-input behavior for JSON, auth, gzip, raw newline, and backpressure before expanding features.
+4. Add unit tests for parser/body/auth/sink and process tests for curl-like flows.
+5. Add minimal inspection over capture files.
+6. Run curl validation locally and compare selected cases with Splunk Enterprise.
+7. Add Vector validation once capture and inspection are stable.
+8. Revisit durable store, metrics, route aliases, and ACK after the first evidence loop works.
+
+First target:
+
+```text
+send JSON HEC event with token
+  -> collector accepts request
+  -> event is normalized
+  -> capture sink writes event
+  -> inspection reads event
+  -> test or command verifies _raw and metadata
+```
+
+---
+
+## 9. Open Work, Gaps, and Decisions
+
+This register keeps the unresolved work visible without forcing everything into one artificial component or decision ID chain. Items here are not a replacement for tests or implementation; they are the current map of what must be settled to make the PoC coherent.
+
+### 9.1 Product and scope
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| Primary user | The first user is a CI/developer user, but exact packaging is not settled | Decide whether the first UX is binary plus shell tests, Rust test helper, or later pytest wrapper |
+| Fixture versus emulator | HEC fixture scope can expand into exact HEC emulator behavior | Keep first bundle fixture-oriented; classify emulator-only features separately |
+| Compatibility language | "Splunk-compatible" is too broad | Use capability-specific language: HEC JSON-compatible, Vector-sendable, Splunk-compared |
+| Requirement subset | HECpoc still needs its own filtered matrix | Create local HEC-only requirement table from `Features.csv` |
+| Bundling | Capability bundles A-G are draft groupings | Validate by mapping each to one runnable user workflow |
+
+### 9.2 Protocol behavior
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| Endpoint aliases | `/services/collector/1.0/*` and SDK legacy paths are undecided | Test curl, Vector, and any local SDK client before adding aliases |
+| Auth errors | Missing, malformed, bad scheme, empty token, and invalid token may need distinct outcomes | Compare Splunk Enterprise and choose stable response mapping |
+| `event` semantics | Absent, null, empty string, object, array, number, and boolean need explicit behavior | Build a protocol matrix and tests before parser reuse |
+| `fields` semantics | Flat scalar, nested object, array, and non-string handling are unsettled | Start flat/scalar; classify nested behavior as reject, stringify, or ignore |
+| Time precision | Internal precision is not yet decided | Compare Splunk output, JSON number precision, and sink format; choose microseconds or nanoseconds explicitly |
+| Raw endpoint | CRLF, blank lines, whitespace-only lines, invalid UTF-8, and metadata query params are unsettled | Define raw framing before implementing raw as more than a smoke path |
+| Gzip limits | Pre-decode and post-decode size behavior both matter | Enforce and test both or explicitly defer decoded-size cap |
+| ACK disabled | The response for `/ack` before ACK support is unsettled | Compare Splunk with ACK disabled and Vector behavior |
+| Channel handling | Header, empty header, query channel, UUID validation, and ACK interaction are unsettled | Implement non-ACK channel only after response behavior is documented |
+
+### 9.3 Event, sink, and inspection
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| Capture format | The first file format is not selected | Choose JSONL or length-delimited JSON and document exact fields |
+| Raw preservation | Text preservation and byte preservation are not the same | Start with text comparison; plan raw-byte preservation before replay claims |
+| Sink commit | Accepted, queued, captured, flushed, and durable are different states | Name these states and decide what HTTP success means |
+| Sink failure | A sink may fail after request acceptance | Decide whether failure changes health, phase, metrics, or only run ledger |
+| Inspection API | Term/time inspection is needed, but exact command/interface is unsettled | Start with one readback helper over capture files |
+| Index namespace | `index` is logical first, physical later | Store as event field; defer partitioning |
+| Metrics | Counters are useful, but Prometheus is likely premature | Emit simple counters/run summaries first |
+| CPU budget | Parser, gzip, and sink work may dominate before HTTP does | Measure parse/decode/write time separately before optimizing framework choice |
+| Memory budget | Large request bodies, gzip expansion, and per-request event vectors can grow quickly | Define max body, decoded body, event count, and raw event size limits |
+| Concurrency | Slow clients and slow sinks can consume runtime capacity differently | Separate network concurrency from sink write concurrency with bounded handoff |
+| Resilience state | Success response, file append, flush, fsync, and ACK durability are distinct | Name the strongest state actually reached by each mode |
+
+### 9.4 Validation and fixtures
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| Golden request set | Positive and negative request bodies need to exist as files | Create `fixtures/requests/` with JSON, raw, gzip, and malformed cases |
+| Splunk comparison | Vendor docs are insufficient for edges | Run selected cases against local Splunk Enterprise and record differences |
+| Vector validation | Vector may exercise batching, retries, compression, and channel behavior differently than curl | Add Vector only after curl/capture path works |
+| Corpus scope | Tutorial and production logs are large and varied | Keep tiny fixtures local; reference large corpora by path |
+| Ledger format | Results need enough context to reproduce | Record command, config, git revision, input, expected count, accepted count, response codes, sink path |
+| Test layering | Unit, integration, and process tests need clear homes | Keep unit tests near modules; use `tests/` for process/socket/file validation |
+
+### 9.5 Rust implementation
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| HTTP stack | Framework choice is open | Select the smallest stack that supports observable HEC behavior |
+| Error structure | Singular project error versus HEC-specific errors is unresolved | Keep call sites stable: protocol outcome, internal error, sink error |
+| Traits | Generic interfaces can proliferate too early | Add traits only after two implementations prove the boundary |
+| Crate split | Multiple crates are not justified yet | Start one crate with `src/hec_receiver/` |
+| Locking | Concurrency needs are modest initially | Use standard locks or no locks until measured need appears |
+| Dependency audit | Existing `spank-rs` dependencies should not be inherited automatically | Add dependencies only by bundle need |
+| Naming | Old `Row`, `Sender`, and `Record` names may carry wrong assumptions | Prefer event/sink vocabulary unless reuse justifies otherwise |
+| CPU work in async | Heavy parser/index work can starve Tokio workers | Keep initial parse small; move heavy work to explicit workers when measured |
+| HTTP framework | Axum is likely sufficient but can hide body/extractor behavior | Use Axum as adapter; keep Hyper direct as escape hatch |
+
+### 9.6 Existing-code review
+
+| Area | Gap or question | Near-term action |
+|------|-----------------|------------------|
+| `processor.rs` | Good parser ideas but raw, comments, fields, and time behavior need review | Lift only after protocol matrix passes |
+| `outcome.rs` | Useful wire shape but error coverage may be incomplete | Compare to Splunk/Vector cases |
+| `receiver.rs` | Shows queue/backpressure ordering but imports runtime/framework assumptions | Reuse concepts before code |
+| `sender.rs` | File writing exists but name and grouping are suspect | Rewrite as capture sink unless review proves lift is cheaper |
+| `perf/src` | Useful benchmark patterns but not first product code | Keep for later benchmark phase |
+
+---
+
+## 10. References
+
+The new repo should reuse earlier work without importing the whole previous document system.
+
+### 10.1 Local project inputs
+
+1. `/Users/walter/Work/Spank/spank-rs/docs/HECst.md` — protocol facts, Splunk behavior notes, current-code gaps.
+2. `/Users/walter/Work/Spank/spank-rs/perf/Capsules.md §2` — HEC CI Fixture product promise.
+3. `/Users/walter/Work/Spank/spank-rs/perf/Features.csv` and `/Users/walter/Work/Spank/spank-rs/perf/Features.md §8` — requirement IDs and prose to filter into HECpoc.
+4. `/Users/walter/Work/Spank/spank-rs/perf/Tools.md` — validation tools, corpora, curl, Vector, Splunk Enterprise, tutorial-log, and ledger procedures.
+5. `/Users/walter/Work/Spank/spank-rs/perf/SpankMax.md §2` — scalar reference path, bounded staging, sink separation.
+6. `/Users/walter/Work/Spank/spank-py/HEC.md` — historical requirements and design notes, used as evidence rather than spec.
+
+### 10.2 External comparison points
+
+1. [Splunk: Format events for HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector) — JSON envelope and metadata examples.
+2. [Splunk: Troubleshoot HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/TroubleshootHTTPEventCollector) — error/status behavior.
+3. [Vector `splunk_hec_logs` sink](https://vector.dev/docs/reference/configuration/sinks/splunk_hec_logs/) — real HEC client behavior, batching, ACK, retry, TLS.
+4. [Fluent Bit Splunk output](https://docs.fluentbit.io/manual/data-pipeline/outputs/splunk) — common shipper configuration vocabulary.
+5. OpenTelemetry Collector contrib `splunkhecreceiver` — server-side implementation reference.
+6. Local Splunk Enterprise — ground truth for selected edge cases when docs and clients disagree.

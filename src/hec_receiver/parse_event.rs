@@ -1,0 +1,170 @@
+use bytes::Bytes;
+use serde::Deserialize;
+use serde_json::Value;
+
+use super::{
+    event::{Endpoint, Event},
+    outcome::{HecError, HecOutcome},
+    protocol::Protocol,
+};
+
+#[derive(Debug, Deserialize)]
+struct HecEnvelope {
+    event: Option<Value>,
+    time: Option<Value>,
+    host: Option<String>,
+    source: Option<String>,
+    sourcetype: Option<String>,
+    index: Option<String>,
+    fields: Option<Value>,
+}
+
+pub fn parse_event_body(
+    body: &Bytes,
+    max_events: usize,
+    protocol: &Protocol,
+) -> Result<Vec<Event>, HecOutcome> {
+    if body.is_empty() {
+        return Err(HecError::NoData.outcome(protocol));
+    }
+
+    let stream = serde_json::Deserializer::from_slice(body).into_iter::<HecEnvelope>();
+    let mut events = Vec::new();
+    for (index, envelope) in stream.enumerate() {
+        if index >= max_events {
+            return Err(HecError::ServerBusy.outcome(protocol));
+        }
+        let envelope =
+            envelope.map_err(|_| event_error(HecError::InvalidDataFormat, index, protocol))?;
+        let event_value = envelope
+            .event
+            .ok_or_else(|| event_error(HecError::EventFieldRequired, index, protocol))?;
+        if event_value.is_null() {
+            return Err(event_error(HecError::EventFieldRequired, index, protocol));
+        }
+
+        let raw = match event_value {
+            Value::String(text) => {
+                if text.is_empty() {
+                    return Err(event_error(HecError::EventFieldBlank, index, protocol));
+                }
+                text
+            }
+            other => other.to_string(),
+        };
+
+        let fields = validate_fields(envelope.fields)
+            .map_err(|_| event_error(HecError::HandlingIndexedFields, index, protocol))?;
+
+        let raw_bytes_len = raw.len();
+        events.push(Event {
+            raw,
+            raw_bytes_len,
+            time: parse_time(envelope.time),
+            host: envelope.host,
+            source: envelope.source,
+            sourcetype: envelope.sourcetype,
+            index: envelope.index,
+            fields,
+            endpoint: Endpoint::Event,
+        });
+    }
+
+    if events.is_empty() {
+        Err(HecError::NoData.outcome(protocol))
+    } else {
+        Ok(events)
+    }
+}
+
+fn validate_fields(fields: Option<Value>) -> Result<Option<Value>, ()> {
+    let Some(fields) = fields else {
+        return Ok(None);
+    };
+    let Value::Object(map) = &fields else {
+        return Err(());
+    };
+    if map
+        .values()
+        .any(|value| matches!(value, Value::Object(_) | Value::Array(_)))
+    {
+        return Err(());
+    }
+    Ok(Some(fields))
+}
+
+fn event_error(error: HecError, index: usize, protocol: &Protocol) -> HecOutcome {
+    error.outcome(protocol).with_invalid_event_number(index)
+}
+
+fn parse_time(value: Option<Value>) -> Option<f64> {
+    match value? {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_concatenated_json_events() {
+        let body = Bytes::from_static(br#"{"event":"one"}{"event":{"k":"two"}}"#);
+        let events =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].raw, "one");
+        assert_eq!(events[1].raw, r#"{"k":"two"}"#);
+    }
+
+    #[test]
+    fn rejects_blank_event() {
+        let body = Bytes::from_static(br#"{"event":""}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 13);
+    }
+
+    #[test]
+    fn rejects_nested_fields() {
+        let body = Bytes::from_static(br#"{"event":"x","fields":{"nested":{"x":1}}}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 15);
+    }
+
+    #[test]
+    fn rejects_missing_event() {
+        let body = Bytes::from_static(br#"{"host":"h"}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 12);
+    }
+
+    #[test]
+    fn rejects_null_event() {
+        let body = Bytes::from_static(br#"{"event":null}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 12);
+    }
+
+    #[test]
+    fn rejects_trailing_garbage() {
+        let body = Bytes::from_static(br#"{"event":"ok"}xyz"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 6);
+        assert_eq!(outcome.invalid_event_number, Some(1));
+    }
+
+    #[test]
+    fn rejects_event_count_over_limit() {
+        let body = Bytes::from_static(br#"{"event":"one"}{"event":"two"}"#);
+        let outcome =
+            parse_event_body(&body, 1, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 9);
+    }
+}
