@@ -4,7 +4,7 @@ HECpoc is a fresh Rust implementation effort for a small, testable HTTP Event Co
 
 The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every test. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
 
-The document starts with implementation guardrails, then moves through scope, protocol, sinks, validation, Rust structure, reuse of prior code, open work, and references.
+The document starts with implementation guardrails, then moves through scope, protocol, sinks, validation, Rust structure, mainstay infrastructure, open work, and references.
 
 ---
 
@@ -12,11 +12,11 @@ The document starts with implementation guardrails, then moves through scope, pr
 
 These guardrails constrain the first implementation. They are here to reduce ambiguity, dependency creep, and inherited architecture debt.
 
-### 1.1 Scope and reuse
+### 1.1 Scope
 
 The initial scope is HEC ingest, local capture, inspection, and validation. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them.
 
-Both prior Rust implementation threads are abandoned by default. Code from `spank-rs` or `spank-rs/perf` may be lifted only after review of behavior, requirements fit, naming, file layout, dependency use, and edge cases.
+Prior attempts are not part of the active design. They are cataloged in `History.md` only as evidence for narrow questions.
 
 ### 1.2 Naming and layout
 
@@ -30,7 +30,7 @@ Minimize dependencies. Add crates only when need and behavior are clear.
 
 Initial posture:
 
-- HTTP stack: choose during implementation; favor observable request behavior over framework convenience.
+- HTTP stack: use Tokio plus Axum, with Axum kept at the adapter boundary.
 - Metrics: simple counters or structured run output first; Prometheus later if metrics become an external interface.
 - Middleware: avoid Tower-style hidden layers until repeated cross-cutting behavior exists.
 - Locks: standard locking first; the PoC is not initially a high-concurrency design exercise.
@@ -292,69 +292,93 @@ A crate split is justified only when the candidate crate is internally complete 
 
 A trait is justified only after separate implementations prove a real boundary. Limit generic boilerplate.
 
-### 6.3 Errors and dependencies
+### 6.3 Mainstay Infrastructure
 
-For errors, separate the faces rather than over-designing hierarchy: HEC protocol outcome for HTTP clients, internal error for logs/debugging, sink error for accepted-versus-not-accepted semantics, and test assertion error for developer feedback. A simple `HecError` or `HecOutcome` can map to HTTP responses. Internal shape can evolve without call-site churn.
+The implementation should converge on stable infrastructure rather than local one-off mechanisms.
 
-Likely early crates are `serde`, `serde_json`, gzip support, and maybe `tempfile` for tests. CLI, HTTP, metrics, middleware, database, and benchmarking dependencies should be added only when the current capability bundle needs them.
+Configuration:
 
-For the HTTP stack, start with `tokio` plus `axum` unless the first protocol matrix proves that direct Hyper control is cleaner. If Axum is used, it should terminate at an adapter layer that converts HTTP requests into HECpoc request objects and HECpoc outcomes back into HTTP responses. The protocol, event, sink, and validation logic should not depend on Axum extractors.
+- `clap` for CLI parsing, help, version output, and completions;
+- `serde` typed structs for the configuration model;
+- `figment` for provider layering: defaults, TOML, CLI, environment;
+- TOML as the persistent operator-facing file format;
+- frozen startup configuration for the foreseeable future;
+- validation after merge and before bind, using explicit validation methods or `validator` where it remains readable.
+
+Errors and outcomes:
+
+- HEC protocol outcomes are centralized definitions of text, result code, HTTP status, and public response body;
+- internal errors are typed enough to classify configuration, startup, auth, body, decode, parse, queue, sink, and shutdown failures;
+- handlers should call named constructors rather than hand-writing strings or status mappings;
+- sink results explicitly distinguish accepted, queued, captured, flushed, and durable states.
+
+Logging and status:
+
+- startup logs include effective redacted configuration, listener address, runtime shape, selected sink, selected parser/splitter, and binary/build metadata;
+- request logs and counters use canonical names plus original evidence fields where needed;
+- shutdown logs include reason, uptime, and final counters;
+- notification is initially process exit status, structured logs, stats endpoint, and benchmark ledger output.
+
+Timing and performance:
+
+- record timings by stage rather than one aggregate request duration;
+- benchmark ledgers capture config, corpus, tool, version, host, CPU, OS, bytes/sec, events/sec, errors, and latency where available;
+- optimization work must name the stage it improves: body read, gzip decode, framing, JSON parse, enqueue, sink write, flush, or durable commit.
+
+Dependencies:
+
+- mainstay early crates are `tokio`, `axum`, `serde`, `serde_json`, `toml`, `figment`, `clap`, gzip support, and test support;
+- metrics, Prometheus, direct Hyper, database crates, and optimized parsers are added only when the active capability bundle needs them;
+- a crate split is justified only when a component is internally complete and separately useful.
+
+For the HTTP stack, start with `tokio` plus `axum`. Axum terminates at an adapter layer that converts HTTP requests into HECpoc request objects and HECpoc outcomes back into HTTP responses. The protocol, event, sink, configuration, and validation logic should not depend on Axum extractors.
 
 Concurrency model:
 
 - one Tokio runtime for network and coordination;
 - bounded request-to-sink handoff for normal mode;
 - optional direct synchronous sink only for tiny fixture mode;
-- no blocking filesystem calls in async handlers unless they are isolated and measured;
-- CPU-heavy future parser/index work goes behind explicit worker boundaries, not casual `tokio::spawn`.
+- no blocking filesystem calls in async handlers unless isolated and measured;
+- CPU-heavy parser/index work moves behind explicit worker boundaries, not casual `tokio::spawn`.
 
 ---
 
-## 7. Existing Code Reuse Policy
+## 7. Reference Boundaries
 
-The old `spank-hec` shape is the split under `/Users/walter/Work/Spank/spank-rs/crates/spank-hec/src`: authenticator, token store, processor, outcome, receiver, and sender. It is informative, not binding.
+The controlling design documents for this repo are this file, `Config.md`, and `Stack.md`. They describe what we are building. Prior attempts and older code are not implementation plans.
 
-Before lifting any module, ask whether it implements a selected HECpoc bundle, matches naming/layout standards, covers invalid inputs, justifies its dependencies, avoids hidden runtime/sink assumptions, and remains understandable outside old `spank-rs`.
+Prior material may still be useful as evidence when it answers a specific question, but it must not drive naming, layout, configuration, error handling, concurrency, sink semantics, or validation behavior. Historical notes live in `History.md` and are non-authoritative.
 
-Candidate notes:
+Code or ideas from older repos can enter HECpoc only through a current design decision:
 
-| Source | Possible value | Caution |
-|--------|----------------|---------|
-| `spank-hec/src/processor.rs` | JSON parser, gzip decode, null/absent handling | raw policy, comments, time precision, fields behavior need review |
-| `spank-hec/src/outcome.rs` | HEC response shape | compare with Splunk and desired error groups |
-| `spank-hec/src/receiver.rs` | phase ordering, queue backpressure example | axum/tokio/metrics may be premature |
-| `spank-hec/src/authenticator.rs` | token credential shape | timing/security and malformed auth need review |
-| `spank-hec/src/sender.rs` | file writing example | `Sender` name and source grouping are likely wrong here |
-| `perf/src/parsers.rs` | memchr/scalar parser examples | parser optimization comes after HEC preservation |
-| `perf/src/store.rs` | null/raw/SQLite benchmark patterns | benchmark input, not first product schema |
+1. name the requirement or capability it satisfies;
+2. restate it in HECpoc vocabulary;
+3. add tests for valid, invalid, edge, overload, and hostile cases;
+4. verify dependencies and runtime assumptions;
+5. record benchmark evidence if performance is the reason;
+6. update current docs instead of reviving old status notes.
 
 ---
 
 ## 8. Initial Work Sequence
 
-The first sequence should support decisions and clarity. Code and tests can be co-designed, but tests should not narrow attention to only happy-path central cases.
+The first sequence should build mainstay infrastructure while preserving protocol evidence.
 
-1. Filter HECpoc rows from `Features.csv` into a small local requirement table.
-2. Implement the smallest collector skeleton with JSON event ingest and capture file sink.
-3. Define invalid-input behavior for JSON, auth, gzip, raw newline, and backpressure before expanding features.
-4. Add unit tests for parser/body/auth/sink and process tests for curl-like flows.
-5. Add minimal inspection over capture files.
-6. Run curl validation locally and compare selected cases with Splunk Enterprise.
-7. Add Vector validation once capture and inspection are stable.
-8. Revisit durable store, metrics, route aliases, and ACK after the first evidence loop works.
+1. Replace configuration loading with `clap` + `figment`, implement `--config`, `--show-config`, and `--check-config`.
+2. Centralize protocol outcome text, result codes, HTTP status mappings, config field names, policy names, and metric labels.
+3. Add structured startup errors and request-path error classification for auth, body, gzip, parse, queue, and sink failures.
+4. Add explicit `LineSplitter` behavior and tests for LF, CRLF, NUL, control bytes, non-ASCII, invalid UTF-8, long lines, and no-final-newline.
+5. Create request fixtures and process tests for JSON event, raw, gzip, malformed auth, malformed JSON, bad gzip, oversize bodies, and no-data bodies.
+6. Define capture sink states and then insert bounded enqueue/dequeue between request handling and sink writing.
+7. Add benchmark ledger output for single-stream and concurrent curl/`oha`/`wrk` runs with bytes/sec and events/sec.
+8. Compare selected cases with local Splunk Enterprise and Vector after the local behavior is stable enough to reproduce.
 
 First target:
 
 ```text
-send JSON HEC event with token
-  -> collector accepts request
-  -> event is normalized
-  -> capture sink writes event
-  -> inspection reads event
-  -> test or command verifies _raw and metadata
+merge config -> validate -> bind -> accept HEC JSON/raw -> classify errors -> capture event -> inspect capture -> record run evidence
 ```
 
----
 
 ## 9. Open Work, Gaps, and Decisions
 
@@ -415,40 +439,28 @@ This register keeps the unresolved work visible without forcing everything into 
 
 | Area | Gap or question | Near-term action |
 |------|-----------------|------------------|
-| HTTP stack | Framework choice is open | Select the smallest stack that supports observable HEC behavior |
-| Error structure | Singular project error versus HEC-specific errors is unresolved | Keep call sites stable: protocol outcome, internal error, sink error |
+| HTTP stack | Tokio plus Axum is the selected starting stack | Keep Axum at the adapter boundary and preserve direct request/body visibility |
+| Error structure | Central definitions are required for protocol outcomes, internal errors, sink states, and config errors | Implement named constructors and avoid scattered message/status literals |
 | Traits | Generic interfaces can proliferate too early | Add traits only after two implementations prove the boundary |
 | Crate split | Multiple crates are not justified yet | Start one crate with `src/hec_receiver/` |
 | Locking | Concurrency needs are modest initially | Use standard locks or no locks until measured need appears |
-| Dependency audit | Existing `spank-rs` dependencies should not be inherited automatically | Add dependencies only by bundle need |
-| Naming | Old `Row`, `Sender`, and `Record` names may carry wrong assumptions | Prefer event/sink vocabulary unless reuse justifies otherwise |
+| Dependency audit | Dependency additions must match active capability bundles | Add crates through the current design, not inherited lists |
+| Naming | Ambiguous names hide data direction and state | Prefer event/source/context/sink/commit vocabulary |
 | CPU work in async | Heavy parser/index work can starve Tokio workers | Keep initial parse small; move heavy work to explicit workers when measured |
 | HTTP framework | Axum is likely sufficient but can hide body/extractor behavior | Use Axum as adapter; keep Hyper direct as escape hatch |
-
-### 9.6 Existing-code review
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| `processor.rs` | Good parser ideas but raw, comments, fields, and time behavior need review | Lift only after protocol matrix passes |
-| `outcome.rs` | Useful wire shape but error coverage may be incomplete | Compare to Splunk/Vector cases |
-| `receiver.rs` | Shows queue/backpressure ordering but imports runtime/framework assumptions | Reuse concepts before code |
-| `sender.rs` | File writing exists but name and grouping are suspect | Rewrite as capture sink unless review proves lift is cheaper |
-| `perf/src` | Useful benchmark patterns but not first product code | Keep for later benchmark phase |
 
 ---
 
 ## 10. References
 
-The new repo should reuse earlier work without importing the whole previous document system.
+References are split into current controlling documents and external comparison points. Historical project material is cataloged separately in `History.md` and is not authoritative for this repo.
 
-### 10.1 Local project inputs
+### 10.1 Current project documents
 
-1. `/Users/walter/Work/Spank/spank-rs/docs/HECst.md` — protocol facts, Splunk behavior notes, current-code gaps.
-2. `/Users/walter/Work/Spank/spank-rs/perf/Capsules.md §2` — HEC CI Fixture product promise.
-3. `/Users/walter/Work/Spank/spank-rs/perf/Features.csv` and `/Users/walter/Work/Spank/spank-rs/perf/Features.md §8` — requirement IDs and prose to filter into HECpoc.
-4. `/Users/walter/Work/Spank/spank-rs/perf/Tools.md` — validation tools, corpora, curl, Vector, Splunk Enterprise, tutorial-log, and ledger procedures.
-5. `/Users/walter/Work/Spank/spank-rs/perf/SpankMax.md §2` — scalar reference path, bounded staging, sink separation.
-6. `/Users/walter/Work/Spank/spank-py/HEC.md` — historical requirements and design notes, used as evidence rather than spec.
+1. `/Users/walter/Work/Spank/HECpoc/Config.md` — configuration surface, merge order, validation, status logging, timing, benchmark recording, and centralized definitions.
+2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — HTTP/Tokio/Axum stack, byte processing stages, raw splitting, backpressure, buffering, security, and performance considerations.
+3. `/Users/walter/Work/Spank/HECpoc/PerfIntake.md` — performance-oriented intake notes that should influence benchmark design without becoming product architecture.
+4. `/Users/walter/Work/Spank/HECpoc/History.md` — non-authoritative catalog of prior attempts and abandoned approaches.
 
 ### 10.2 External comparison points
 
