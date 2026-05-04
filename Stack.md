@@ -767,9 +767,9 @@ These decisions belong in tests once answered. The Stack decision is only useful
 
 ## 25. Current Configurability Surface
 
-The compact configuration authority is `/Users/walter/Work/Spank/HECpoc/Config.md`. This section remains as context for why these knobs matter to the HTTP stack.
+The infrastructure target for configuration is `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §7`. This section remains as an HTTP-stack ledger for which knobs affect ingress, body handling, buffering, and overload behavior.
 
-Current implementation loads configuration in this order: compiled defaults, optional TOML file from `HEC_CONFIG`, then environment overrides. This follows earlier project direction in `/Users/walter/Work/Spank/spank-rs/docs/Sparst.md` and `/Users/walter/Work/Spank/spank-rs/research/Infrust.md`: TOML is the operator-facing file format; environment overrides are for launch scripts, test harnesses, and containers. CLI flags remain deliberately absent until the surface stabilizes.
+Current implementation still loads configuration in this order: compiled defaults, optional TOML file from `HEC_CONFIG`, then environment overrides. The target implementation replaces that with the `InfraHEC.md §7.2` source chain: defaults, TOML, CLI, then environment.
 
 ### 25.1 Externally Configurable Parameters
 

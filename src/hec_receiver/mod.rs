@@ -13,4 +13,4 @@ mod sink;
 mod stats;
 
 pub use app::{router, AppState};
-pub use config::RuntimeConfig;
+pub use config::{ConfigAction, RuntimeConfig};

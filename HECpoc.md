@@ -4,60 +4,24 @@ HECpoc is a fresh Rust implementation effort for a small, testable HTTP Event Co
 
 The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every test. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
 
-The document starts with implementation guardrails, then moves through scope, protocol, sinks, validation, Rust structure, mainstay infrastructure, open work, and references.
+The document defines the product slice, HEC protocol behavior, event/sink semantics, and open product decisions. Cross-cutting infrastructure is concentrated in `InfraHEC.md`; network/Tokio/HTTP mechanics are concentrated in `Stack.md`.
 
 ---
 
-## 1. Implementation Guardrails
-
-These guardrails constrain the first implementation. They are here to reduce ambiguity, dependency creep, and inherited architecture debt.
+## 1. Product Guardrails
 
 ### 1.1 Scope
 
 The initial scope is HEC ingest, local capture, inspection, and validation. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them.
 
-Prior attempts are not part of the active design. They are cataloged in `History.md` only as evidence for narrow questions.
+Prior attempts are not part of the active design. They are cataloged in `docs/History.md` only as evidence for narrow questions.
 
-### 1.2 Naming and layout
+### 1.2 Product Vocabulary
 
 Names should match the domain and data direction. Prefer `Event`, `HecEvent`, `Collector`, `EventSink`, `CaptureSink`, `SinkCommit`, and `InspectQuery`. Avoid `Row` and `Sender` in ingest code unless the role is truly generic and direction-free.
 
 Rename directories, files, and implementation primitives when the current names obscure function, compatibility, or review. Regularity is a feature here because the repo must be understandable by a small team.
 
-### 1.3 Dependencies and errors
-
-Minimize dependencies. Add crates only when need and behavior are clear.
-
-Initial posture:
-
-- HTTP stack: use Tokio plus Axum, with Axum kept at the adapter boundary.
-- Metrics: simple counters or structured run output first; Prometheus later if metrics become an external interface.
-- Middleware: avoid Tower-style hidden layers until repeated cross-cutting behavior exists.
-- Locks: standard locking first; the PoC is not initially a high-concurrency design exercise.
-- Storage: generic event sink boundary, concrete file capture first; no early SQLite tuning.
-- Errors: keep HEC protocol outcomes distinct from internal implementation errors at call sites.
-- Runtime: use Tokio; prefer Axum as a thin HTTP adapter over a framework-free collector core, with Hyper direct remaining the escape hatch if exact protocol control requires it.
-
-### 1.4 Performance and resilience posture
-
-Performance matters from the start, but the first goal is measured simplicity rather than clever machinery. The PoC should make CPU, memory, concurrency, and failure behavior visible before optimizing them.
-
-Initial posture:
-
-- CPU: parse in straightforward code first; keep CPU-heavy parsing, tokenization, indexing, compression expansion, and future regex work out of ordinary request-handler critical sections when they become measurable.
-- Memory: enforce request body limits, decoded body limits, line limits, and bounded queues; avoid unbounded buffering per connection or per request.
-- Concurrency: use Tokio for network concurrency, bounded channels for handoff, and explicit worker boundaries for sink writes; avoid shared mutable state unless ownership through message passing is worse.
-- Backpressure: reject overload at admission or queue handoff with an explicit retryable response rather than awaiting indefinitely.
-- Resilience: define accepted, queued, captured, flushed, and durable as separate states; do not let a success response imply a stronger state than the implementation actually achieved.
-- Degradation: when sink failures or queue saturation persist, expose that through health/run output before adding a full phase machine.
-
-### 1.5 Tests and documentation
-
-Unit tests live with the unit or crate they test. Integration and system tests live where they exercise real process, socket, file, and tool boundaries.
-
-Code comments should explain local invariants, protocol quirks, and non-obvious decisions. Issue IDs, task history, and intermediate status belong in workbench documents and run ledgers, not product code.
-
----
 
 ## 2. Scope, Wants, and Capability Bundles
 
@@ -212,91 +176,11 @@ Initial rules:
 
 ---
 
-## 5. Validation Strategy
+## 5. Reference Boundaries
 
-Validation starts from wants and needs, then checks compatibility and capability. Tests fit under that structure.
+This file defines the HEC product slice and protocol-facing decisions. `InfraHEC.md` defines cross-cutting implementation infrastructure. `Stack.md` records detailed network ingress, Tokio/Axum/Hyper, buffering, body-processing, and kernel/runtime mechanics.
 
-| Level | Question | Evidence |
-|-------|----------|----------|
-| Wants and needs | Does this catch real HEC integration mistakes? | local run with inspectable output |
-| Compatibility | Does selected behavior match Splunk or known clients? | curl/Vector/Splunk comparison |
-| Protocol | Are phases and edge cases deliberate? | unit and handler tests |
-| Sink | Do accepted events match stored evidence? | capture inspection |
-| Resource use | Are CPU, memory, and queue limits enforced? | limit tests and run counters |
-| Resilience | Are rejected, accepted, captured, and failed states distinguishable? | slow/failing sink tests |
-| Usability | Can a developer run it without reading source? | README command sequence |
-| Prioritization | Does each feature activate the first workflow? | capability bundle table |
-
-Validation layers are unit tests, handler tests, process tests with curl, Vector shipper tests, Splunk Enterprise comparison, tutorial-log corpus runs, and later benchmarks.
-
-Performance validation starts modestly: report request count, accepted event count, rejected count, bytes in, decoded bytes, max-body rejection, queue-full count, sink write failures, and elapsed time. CPU and RSS measurements can be coarse at first, but each benchmark run should record enough machine and config context to avoid comparing ghosts.
-
-Artifacts stay small:
-
-```text
-fixtures/
-  requests/        curl bodies and expected response snippets
-  scripts/         thin wrappers for curl, Vector, and inspection
-  configs/         small Spank, Vector, and Splunk notes/config fragments
-  logs/            tiny copied fixtures only
-results/
-  README.md        ledger schema and dated run summaries
-```
-
-Large logs remain under `/Users/walter/Work/Spank/Logs`.
-
----
-
-## 6. Rust Implementation Shape
-
-Rust structure should follow capability and protocol boundaries. Avoid fine-chopping crates before internal completeness, consistency, external reuse, or planned mix-and-match justify the split.
-
-Use Tokio for the server runtime. The default starting shape is Axum as a thin adapter over framework-free collector functions. Hyper direct remains a later option if Axum makes body control, graceful shutdown, or protocol conformance harder to prove.
-
-### 6.1 Initial layout
-
-Start as one small crate with `hec_receiver/` under `src/`:
-
-```text
-src/
-  main.rs
-  config.rs
-  error.rs
-  hec_receiver/
-    mod.rs
-    protocol.rs      endpoint paths, request phases, response mapping
-    body.rs          size policy and gzip/identity decode
-    auth.rs          auth header parsing and token validation
-    event.rs         JSON envelope and HEC event normalization
-    raw.rs           raw endpoint framing and newline policy
-    sink.rs          capture sink and minimal sink boundary
-    inspect.rs       simple readback over capture files
-    limits.rs        resource limits and admission constants/config
-
-tests/
-  hec_protocol.rs
-  hec_process.rs
-
-fixtures/
-  requests/
-  scripts/
-  configs/
-  logs/
-```
-
-Avoid redundant `spank-` prefixes inside this repo.
-
-### 6.2 Crate and trait guidance
-
-A crate split is justified only when the candidate crate is internally complete and separately useful: reusable collector, protocol parser, store, or benchmark harness. Until then, modules are cheaper than crates.
-
-A trait is justified only after separate implementations prove a real boundary. Limit generic boilerplate.
-
-## 7. Reference Boundaries
-
-The controlling design documents for this repo are this file, `Config.md`, and `Stack.md`. They describe what we are building. Prior attempts and older code are not implementation plans.
-
-Prior material may still be useful as evidence when it answers a specific question, but it must not drive naming, layout, configuration, error handling, concurrency, sink semantics, or validation behavior. Historical notes live in `History.md` and are non-authoritative.
+Prior material may still be useful as evidence when it answers a specific question, but it must not drive naming, layout, configuration, error handling, concurrency, sink semantics, or validation behavior. Historical notes live in `docs/History.md` and are non-authoritative.
 
 Code or ideas from older repos can enter HECpoc only through a current design decision:
 
@@ -309,18 +193,18 @@ Code or ideas from older repos can enter HECpoc only through a current design de
 
 ---
 
-## 8. Initial Work Sequence
+## 6. Initial Work Sequence
 
-The first sequence should build mainstay infrastructure while preserving protocol evidence.
+The first sequence keeps product behavior and implementation infrastructure aligned without duplicating the infrastructure spec here.
 
-1. Replace configuration loading with `clap` + `figment`, implement `--config`, `--show-config`, and `--check-config`.
-2. Centralize protocol outcome text, result codes, HTTP status mappings, config field names, policy names, and metric labels.
-3. Add structured startup errors and request-path error classification for auth, body, gzip, parse, queue, and sink failures.
-4. Add explicit `LineSplitter` behavior and tests for LF, CRLF, NUL, control bytes, non-ASCII, invalid UTF-8, long lines, and no-final-newline.
-5. Create request fixtures and process tests for JSON event, raw, gzip, malformed auth, malformed JSON, bad gzip, oversize bodies, and no-data bodies.
-6. Define capture sink states and then insert bounded enqueue/dequeue between request handling and sink writing.
-7. Add benchmark ledger output for single-stream and concurrent curl/`oha`/`wrk` runs with bytes/sec and events/sec.
-8. Compare selected cases with local Splunk Enterprise and Vector after the local behavior is stable enough to reproduce.
+1. Implement configuration and startup infrastructure from `InfraHEC.md §§7, 11, 20`.
+2. Centralize HEC outcomes and request error mapping from `InfraHEC.md §§8, 10, 20`.
+3. Lock raw/event protocol behavior for auth, body, gzip, JSON envelopes, raw line framing, and no-data cases.
+4. Create request fixtures for JSON event, raw, gzip, malformed auth, malformed JSON, bad gzip, oversize bodies, and no-data bodies.
+5. Implement capture sink states enough to distinguish accepted, queued, captured, flushed, and durable claims.
+6. Add bounded handoff between request processing and sink writing once direct capture behavior is stable.
+7. Run local curl/process tests, then selected Splunk Enterprise and Vector comparisons.
+8. Record benchmark and validation evidence using `InfraHEC.md §§17–18`.
 
 First target:
 
@@ -329,11 +213,11 @@ merge config -> validate -> bind -> accept HEC JSON/raw -> classify errors -> ca
 ```
 
 
-## 9. Open Work, Gaps, and Decisions
+## 7. Open Product Work, Gaps, and Decisions
 
 This register keeps the unresolved work visible without forcing everything into one artificial component or decision ID chain. Items here are not a replacement for tests or implementation; they are the current map of what must be settled to make the PoC coherent.
 
-### 9.1 Product and scope
+### 7.1 Product And Scope
 
 | Area | Gap or question | Near-term action |
 |------|-----------------|------------------|
@@ -343,7 +227,7 @@ This register keeps the unresolved work visible without forcing everything into 
 | Requirement subset | HECpoc still needs its own filtered matrix | Create local HEC-only requirement table from `Features.csv` |
 | Bundling | Capability bundles A-G are draft groupings | Validate by mapping each to one runnable user workflow |
 
-### 9.2 Protocol behavior
+### 7.2 Protocol Behavior
 
 | Area | Gap or question | Near-term action |
 |------|-----------------|------------------|
@@ -357,7 +241,7 @@ This register keeps the unresolved work visible without forcing everything into 
 | ACK disabled | The response for `/ack` before ACK support is unsettled | Compare Splunk with ACK disabled and Vector behavior |
 | Channel handling | Header, empty header, query channel, UUID validation, and ACK interaction are unsettled | Implement non-ACK channel only after response behavior is documented |
 
-### 9.3 Event, sink, and inspection
+### 7.3 Event, Sink, And Inspection
 
 | Area | Gap or question | Near-term action |
 |------|-----------------|------------------|
@@ -367,51 +251,22 @@ This register keeps the unresolved work visible without forcing everything into 
 | Sink failure | A sink may fail after request acceptance | Decide whether failure changes health, phase, metrics, or only run ledger |
 | Inspection API | Term/time inspection is needed, but exact command/interface is unsettled | Start with one readback helper over capture files |
 | Index namespace | `index` is logical first, physical later | Store as event field; defer partitioning |
-| Metrics | Counters are useful, but Prometheus is likely premature | Emit simple counters/run summaries first |
-| CPU budget | Parser, gzip, and sink work may dominate before HTTP does | Measure parse/decode/write time separately before optimizing framework choice |
-| Memory budget | Large request bodies, gzip expansion, and per-request event vectors can grow quickly | Define max body, decoded body, event count, and raw event size limits |
-| Concurrency | Slow clients and slow sinks can consume runtime capacity differently | Separate network concurrency from sink write concurrency with bounded handoff |
 | Resilience state | Success response, file append, flush, fsync, and ACK durability are distinct | Name the strongest state actually reached by each mode |
-
-### 9.4 Validation and fixtures
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| Golden request set | Positive and negative request bodies need to exist as files | Create `fixtures/requests/` with JSON, raw, gzip, and malformed cases |
-| Splunk comparison | Vendor docs are insufficient for edges | Run selected cases against local Splunk Enterprise and record differences |
-| Vector validation | Vector may exercise batching, retries, compression, and channel behavior differently than curl | Add Vector only after curl/capture path works |
-| Corpus scope | Tutorial and production logs are large and varied | Keep tiny fixtures local; reference large corpora by path |
-| Ledger format | Results need enough context to reproduce | Record command, config, git revision, input, expected count, accepted count, response codes, sink path |
-| Test layering | Unit, integration, and process tests need clear homes | Keep unit tests near modules; use `tests/` for process/socket/file validation |
-
-### 9.5 Rust implementation
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| HTTP stack | Tokio plus Axum is the selected starting stack | Keep Axum at the adapter boundary and preserve direct request/body visibility |
-| Error structure | Central definitions are required for protocol outcomes, internal errors, sink states, and config errors | Implement named constructors and avoid scattered message/status literals |
-| Traits | Generic interfaces can proliferate too early | Add traits only after two implementations prove the boundary |
-| Crate split | Multiple crates are not justified yet | Start one crate with `src/hec_receiver/` |
-| Locking | Concurrency needs are modest initially | Use standard locks or no locks until measured need appears |
-| Dependency audit | Dependency additions must match active capability bundles | Add crates through the current design, not inherited lists |
-| Naming | Ambiguous names hide data direction and state | Prefer event/source/context/sink/commit vocabulary |
-| CPU work in async | Heavy parser/index work can starve Tokio workers | Keep initial parse small; move heavy work to explicit workers when measured |
-| HTTP framework | Axum is likely sufficient but can hide body/extractor behavior | Use Axum as adapter; keep Hyper direct as escape hatch |
 
 ---
 
-## 10. References
+## 8. References
 
-References are split into current project documents and external comparison points. Historical project material is cataloged separately in `History.md` and is not authoritative for this repo.
+References are split into current project documents and external comparison points. Historical project material is cataloged separately in `docs/History.md` and is not authoritative for this repo.
 
-### 10.1 Current project documents
+### 8.1 Current Project Documents
 
-1. `/Users/walter/Work/Spank/HECpoc/InfraHEC.md` — implementation spine; especially §7 config, §8 errors/outcomes/messages, §9 logs, §10 counters, §11 lifecycle, §13 HTTP pipeline, §17 validation, §18 benchmarks, §20 sequence.
-2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — detailed HTTP/Tokio/Axum stack and request-processing research, especially where exact crate behavior or source references matter.
-3. `/Users/walter/Work/Spank/HECpoc/PerfIntake.md` — performance intake notes for benchmark design and optimization admission.
-4. `/Users/walter/Work/Spank/HECpoc/History.md` — non-authoritative catalog of prior attempts and abandoned approaches.
+1. `/Users/walter/Work/Spank/HECpoc/InfraHEC.md` — infrastructure implementation spine; specific current anchors are §7 config, §8 errors/outcomes/reporting, §11 lifecycle, §17 validation, §18 benchmarks, and §20 sequence.
+2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — network ingress and request-processing ledger; specific current anchors are §§6–12 Tokio/Axum/auth/gzip/body/timeouts, §28 accept/receive paths, §30 kernel/runtime knobs, §§35–36 buffering and raw splitting.
+3. `/Users/walter/Work/Spank/HECpoc/docs/PerfIntake.md` — performance intake notes for benchmark design and optimization admission.
+4. `/Users/walter/Work/Spank/HECpoc/docs/History.md` — non-authoritative catalog of prior attempts and abandoned approaches.
 
-### 10.2 External comparison points
+### 8.2 External Comparison Points
 
 1. [Splunk: Format events for HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector) — JSON envelope and metadata examples.
 2. [Splunk: Troubleshoot HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/TroubleshootHTTPEventCollector) — error/status behavior.

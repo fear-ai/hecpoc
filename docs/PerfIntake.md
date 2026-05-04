@@ -1,5 +1,7 @@
 # PerfIntake — What To Move Or Distill From spank-rs/perf
 
+Status: historical/supporting artifact under `docs/`. This file is not an active design authority; use it only for benchmark ideas, performance cautions, and migration reminders that have not yet been incorporated into current HECpoc specs.
+
 Focus: plan. This note reviews `/Users/walter/Work/Spank/spank-rs/perf` as input to the standalone HEC PoC repository at `/Users/walter/Work/Spank/HECpoc`. It recommends what to move, what to distill, and what to leave behind. It does not copy the full contents of the perf documents, and it does not modify `spank-rs`.
 
 Update this note when `HECpoc` gets its own requirements, validation, design, benchmark, or fixture files. Once those files exist, this note should become a migration checklist rather than a standing design document.

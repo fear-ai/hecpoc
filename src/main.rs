@@ -1,12 +1,25 @@
 mod hec_receiver;
 
-use hec_receiver::{AppState, RuntimeConfig};
+use hec_receiver::{AppState, ConfigAction, RuntimeConfig};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = RuntimeConfig::load()?;
+    let loaded = RuntimeConfig::load()?;
+    match loaded.action {
+        ConfigAction::ShowConfig => {
+            print!("{}", loaded.config.redacted_toml()?);
+            return Ok(());
+        }
+        ConfigAction::CheckConfig => {
+            eprintln!("hec configuration ok");
+            return Ok(());
+        }
+        ConfigAction::Run => {}
+    }
+
+    let config = loaded.config;
     let addr = config.addr;
     let state = Arc::new(
         match config.capture_path {
@@ -19,14 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind(addr).await?;
 
     eprintln!("hec receiver listening on http://{addr}");
-    eprintln!("hec config file: set HEC_CONFIG=/path/hec.toml; environment overrides file values");
-    eprintln!("hec token source: HEC_TOKEN or SPANK_HEC_TOKEN; default is dev-token");
-    eprintln!("hec capture: set HEC_CAPTURE=/path/events.jsonl to write accepted events");
-    eprintln!("hec limits: HEC_MAX_BYTES, HEC_MAX_DECODED_BYTES, HEC_MAX_EVENTS override defaults");
-    eprintln!(
-        "hec timing/buffer: HEC_IDLE_TIMEOUT, HEC_TOTAL_TIMEOUT, HEC_GZIP_BUFFER_BYTES override defaults"
-    );
-    eprintln!("hec protocol: HEC_SUCCESS, HEC_TOKEN_REQUIRED, and related overrides are available");
+    eprintln!("hec config precedence: defaults < TOML < CLI < environment");
+    eprintln!("hec config tools: --config, --show-config, --check-config");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

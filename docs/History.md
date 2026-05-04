@@ -1,6 +1,6 @@
 # History — Non-Authoritative Prior Work Notes
 
-This file keeps prior attempts visible without letting them steer the current HECpoc design. The controlling documents are `HECpoc.md`, `Config.md`, and `Stack.md`.
+This file keeps prior attempts visible without letting them steer the current HECpoc design. The controlling documents are `HECpoc.md`, `InfraHEC.md`, and `Stack.md`.
 
 ## Status
 
