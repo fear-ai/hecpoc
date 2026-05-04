@@ -2,7 +2,7 @@
 
 Status: design decision and implementation reference.
 
-Scope: focused Splunk HEC-compatible receiver in Rust, using Tokio and Axum while deliberately avoiding direct use of Tower middleware for protocol-critical behavior. This document covers stack shape, request phases, implementation requirements, fallback options, and validation strategy.
+Scope: focused Splunk HEC-compatible receiver in Rust, using Tokio and Axum while deliberately avoiding direct use of Tower middleware for protocol-critical behavior. This document records HTTP stack, buffering, and request-processing details that are more specific than the infrastructure-wide design.
 
 ## 1. Decision
 

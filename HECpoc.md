@@ -292,57 +292,6 @@ A crate split is justified only when the candidate crate is internally complete 
 
 A trait is justified only after separate implementations prove a real boundary. Limit generic boilerplate.
 
-### 6.3 Mainstay Infrastructure
-
-The implementation should converge on stable infrastructure rather than local one-off mechanisms.
-
-Configuration:
-
-- `clap` for CLI parsing, help, version output, and completions;
-- `serde` typed structs for the configuration model;
-- `figment` for provider layering: defaults, TOML, CLI, environment;
-- TOML as the persistent operator-facing file format;
-- frozen startup configuration for the foreseeable future;
-- validation after merge and before bind, using explicit validation methods or `validator` where it remains readable.
-
-Errors and outcomes:
-
-- HEC protocol outcomes are centralized definitions of text, result code, HTTP status, and public response body;
-- internal errors are typed enough to classify configuration, startup, auth, body, decode, parse, queue, sink, and shutdown failures;
-- handlers should call named constructors rather than hand-writing strings or status mappings;
-- sink results explicitly distinguish accepted, queued, captured, flushed, and durable states.
-
-Logging and status:
-
-- startup logs include effective redacted configuration, listener address, runtime shape, selected sink, selected parser/splitter, and binary/build metadata;
-- request logs and counters use canonical names plus original evidence fields where needed;
-- shutdown logs include reason, uptime, and final counters;
-- notification is initially process exit status, structured logs, stats endpoint, and benchmark ledger output.
-
-Timing and performance:
-
-- record timings by stage rather than one aggregate request duration;
-- benchmark ledgers capture config, corpus, tool, version, host, CPU, OS, bytes/sec, events/sec, errors, and latency where available;
-- optimization work must name the stage it improves: body read, gzip decode, framing, JSON parse, enqueue, sink write, flush, or durable commit.
-
-Dependencies:
-
-- mainstay early crates are `tokio`, `axum`, `serde`, `serde_json`, `toml`, `figment`, `clap`, gzip support, and test support;
-- metrics, Prometheus, direct Hyper, database crates, and optimized parsers are added only when the active capability bundle needs them;
-- a crate split is justified only when a component is internally complete and separately useful.
-
-For the HTTP stack, start with `tokio` plus `axum`. Axum terminates at an adapter layer that converts HTTP requests into HECpoc request objects and HECpoc outcomes back into HTTP responses. The protocol, event, sink, configuration, and validation logic should not depend on Axum extractors.
-
-Concurrency model:
-
-- one Tokio runtime for network and coordination;
-- bounded request-to-sink handoff for normal mode;
-- optional direct synchronous sink only for tiny fixture mode;
-- no blocking filesystem calls in async handlers unless isolated and measured;
-- CPU-heavy parser/index work moves behind explicit worker boundaries, not casual `tokio::spawn`.
-
----
-
 ## 7. Reference Boundaries
 
 The controlling design documents for this repo are this file, `Config.md`, and `Stack.md`. They describe what we are building. Prior attempts and older code are not implementation plans.
@@ -453,13 +402,13 @@ This register keeps the unresolved work visible without forcing everything into 
 
 ## 10. References
 
-References are split into current controlling documents and external comparison points. Historical project material is cataloged separately in `History.md` and is not authoritative for this repo.
+References are split into current project documents and external comparison points. Historical project material is cataloged separately in `History.md` and is not authoritative for this repo.
 
 ### 10.1 Current project documents
 
-1. `/Users/walter/Work/Spank/HECpoc/Config.md` — configuration surface, merge order, validation, status logging, timing, benchmark recording, and centralized definitions.
-2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — HTTP/Tokio/Axum stack, byte processing stages, raw splitting, backpressure, buffering, security, and performance considerations.
-3. `/Users/walter/Work/Spank/HECpoc/PerfIntake.md` — performance-oriented intake notes that should influence benchmark design without becoming product architecture.
+1. `/Users/walter/Work/Spank/HECpoc/InfraHEC.md` — implementation spine; especially §7 config, §8 errors/outcomes/messages, §9 logs, §10 counters, §11 lifecycle, §13 HTTP pipeline, §17 validation, §18 benchmarks, §20 sequence.
+2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — detailed HTTP/Tokio/Axum stack and request-processing research, especially where exact crate behavior or source references matter.
+3. `/Users/walter/Work/Spank/HECpoc/PerfIntake.md` — performance intake notes for benchmark design and optimization admission.
 4. `/Users/walter/Work/Spank/HECpoc/History.md` — non-authoritative catalog of prior attempts and abandoned approaches.
 
 ### 10.2 External comparison points

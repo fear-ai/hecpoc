@@ -1,6 +1,6 @@
 # Config — HEC Receiver Configuration Contract
 
-This file defines the production configuration surface for the HEC receiver. It describes the intended configuration system, validation rules, operational reporting, and test expectations. `Stack.md` may explain why a setting exists; this file defines what the setting is and how it is accepted.
+This file defines the detailed production configuration surface for the HEC receiver.
 
 ## Strategy
 
@@ -239,7 +239,7 @@ Startup fails before binding sockets when validation fails. `--check-config` run
 
 ## Error Detection, Logging, And Notification
 
-This area is not fully resolved at implementation level yet; the production direction is fixed enough to prevent ad hoc behavior.
+The focused subsystem spec is `/Users/walter/Work/Spank/HECpoc/ErrorMessaging.md`. This section summarizes the configuration-facing contract.
 
 Central model:
 
@@ -284,7 +284,7 @@ Benchmark output should be append-only JSONL or CSV with enough fields to reprod
 
 ## Central Definitions And Message Text
 
-Protocol result definitions, HTTP status mappings, user-facing message text, policy names, and config key names should be centralized where suitable.
+Protocol result definitions, HTTP status mappings, user-facing message text, policy names, and config key names are centralized by `/Users/walter/Work/Spank/HECpoc/ErrorMessaging.md`.
 
 Target call-site style:
 
