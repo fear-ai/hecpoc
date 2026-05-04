@@ -376,7 +376,7 @@ Benefits:
 src/hec_receiver/
   error.rs        internal startup/config/runtime error types
   outcome.rs      HEC client-visible outcomes and response conversion
-  report.rs       report definitions, report records, redaction, routing
+  report.rs       Reporter pipeline, redaction, routing, rendering backends
   public_text.rs  optional home for public text if outcome/report types need it
   stats.rs        counters and snapshots
 ```
@@ -385,10 +385,10 @@ Semantic boundary:
 
 - `error.rs` classifies failures;
 - `outcome.rs` defines client responses;
-- `report.rs` defines occurrence/report vocabulary and output routing;
+- `report.rs` implements the Reporter pipeline and consumes domain-owned submitted facts;
 - `public_text.rs` is added only if public text needs a separate module;
 - HTTP handlers convert errors to outcomes at the adapter edge;
-- stats/logging happen through report definitions and outcome mappings, not direct handler updates.
+- stats/logging happen through domain submitted facts and outcome mappings, not direct handler updates.
 
 ### 8.3 Error Classes
 
@@ -435,6 +435,8 @@ pub struct HecOutcome {
     pub metadata: Option<HecOutcomeMetadata>,
 }
 ```
+
+Naming note: current code uses `HecOutcome`. As the generic reporting vocabulary settles, prefer `Outcome` for accepted/rejected/failed/skipped/throttled/recovered operation disposition and `HecResponse` for the client-visible HEC response body/status/code.
 
 Initial constructors:
 
@@ -490,7 +492,7 @@ Example policy:
 | queue full | `server_busy()` | `queue_full` | `warn` |
 | sink unavailable before acceptance | `server_busy()` | `sink_unavailable` | `error` |
 
-Every mapped outcome has a central reason, HEC response mapping, counter effect, and report definition. The route code should not independently update stats and logs for the same occurrence.
+Every mapped outcome has a central reason, HEC response mapping, counter effect, and submitted fact name/fields. The route code should not independently update stats and logs for the same fact.
 
 ### 8.6 Central Definitions And Call Sites
 
@@ -513,8 +515,9 @@ Preferred call-site style:
 ```rust
 return Err(AuthError::malformed_header(AuthHeaderProblem::NonText));
 return Err(ParseError::event_field_required().with_event_index(index));
-let outcome = outcomes::invalid_authorization().with_reason(AuthReason::MalformedHeader);
-report.emit(HEC_AUTH_HEADER_MALFORMED.at(&ctx).field("problem", AuthHeaderProblem::NonText));
+let outcome = Outcome::Rejected;
+let response = HecResponse::invalid_authorization().with_reason(AuthReason::MalformedHeader);
+report.submit(&ctx, auth::HEADER_MALFORMED, fields![field::auth_problem(AuthHeaderProblem::NonText)]);
 ```
 
 Avoid:
@@ -552,183 +555,131 @@ Allowed:
 
 ## 9. Reporting, Logging, And Observability
 
-### 9.1 Communication Vocabulary
+### 9.1 Communication Layers
 
-Avoid using `message` as the root concept. In this project it can mean a HEC protocol response, an internal error string, a structured log record, a metric update, a CLI response, or a future notification. Those are related, but not the same object.
+Avoid using `message` as the root concept. In this project it can mean a HEC protocol response, an internal error string, a structured log record, a metric update, console text, a benchmark row, or a future notification. Those are related, but they belong to different layers.
 
-Use this vocabulary:
+Use layers, not another family of `Report*` or `Occurrence*` abstractions:
 
-| Term | Meaning | Example |
-| --- | --- | --- |
-| occurrence | Something meaningful happened inside the system | request arrived, token invalid, body decoded, sink commit failed |
-| report definition | Code-owned schema and policy for one occurrence type | `HEC_AUTH_TOKEN_INVALID` |
-| report record | One runtime instance of a report definition plus fields | token invalid for request id `42` |
-| outcome | Protocol-facing or operation-facing result | HEC code `4`, HTTP `401`, queue full, sink commit failed |
-| error | Internal typed failure object | `AuthError::MalformedHeader`, `SinkError::WriteFailed` |
-| output sink | Where rendered information goes | stderr, stdout, file, stats counters, benchmark ledger |
-| renderer/backend | How a report record becomes bytes or counter updates | compact log, JSON log, `tracing`, stats update |
-| public text | Human/client-visible text chosen by policy | `Invalid token`, `hec configuration ok` |
+| Layer | Owned by | Examples | Notes |
+| --- | --- | --- | --- |
+| Domain state/result | Auth, body, parser, queue, sink, lifecycle modules | token invalid, body decoded, queue full, sink commit failed | Specific semantics live here, not in Reporter. |
+| Outcome | Protocol/operation mapping | accepted, rejected, failed, skipped, throttled, recovered | Use `Outcome`; if HEC client response needs a type, prefer `HecResponse` over overloading `Outcome`. |
+| Submission | Call site plus Reporter input adapter | domain fact name, context, fields, duration, outcome | A structured fact handed to Reporter. It should be light and auditable. |
+| Reporter pipeline | Reporting subsystem | filter, redact, route, transform, fan out | End-to-end subsystem from submission to persistence/display. |
+| Output products | Output adapters | log entry, console line, metric update, benchmark row, status record | Multiple products may be derived from one submitted fact. |
+| Backends | Libraries/devices/files | `tracing`, stdout/stderr, JSONL file, stats counters | `tracing` is useful but not exclusive. |
 
-Call-site communication should usually start from an occurrence or typed error, not from output text. Output text is a rendering result.
+`HEC_AUTH_TOKEN_INVALID` is therefore not a Reporter concept. It is an auth/protocol fact name or domain status. Its allowed fields, HEC response mapping, metrics labels, and reporting use should be bounded by auth/protocol design, while Reporter treats it as a structured submission to filter, redact, route, and render.
 
-### 9.2 Design Principle
+### 9.2 Reporter Subsystem
 
-Call sites report a named functional occurrence with structured context. They should not decide whether that occurrence becomes a log line, counter, terminal/stderr message, benchmark record, trace span, or future external notification.
+Reporter is the end-to-end subsystem from call-site initiation to persistence and/or display. It owns:
 
-The goal is not to replace forty scattered call-site shapes with five arbitrary call-site shapes. The goal is one regular reporting model with typed definitions, runtime routing, and enough structured fields to support logs, status, counters, performance records, and later analysis.
+- runtime filtering by component/source, severity, outcome, and output;
+- redaction and field allow/deny policy enforcement;
+- transformation from submitted facts into output-specific products;
+- routing to logs, console, counters, status output, benchmark ledgers, and future notification sinks;
+- backend adapters, including but not limited to `tracing`.
 
-Avoid all three failure modes:
+Reporter must not own HEC-specific semantics such as "invalid token means HEC code 4" or "queue full maps to server busy". Those belong in protocol/outcome modules. Reporter may receive those values as fields.
 
-- do not scatter backend-specific `tracing::info!`, `tracing::warn!`, metrics updates, stderr writes, and ledger writes through ordinary handlers;
-- do not hide all behavior behind a vague `msg(subsystem, level, ...)` function that loses domain meaning;
-- do not invent separate verb families for every surface result, such as `reject`, `fail`, `measure`, `terminal`, and then let those families drift.
-
-Preferred call-site shape:
+Preferred call-site style:
 
 ```rust
-report.emit(HEC_AUTH_TOKEN_INVALID
-    .at(&ctx)
-    .field("auth_scheme", parsed.scheme())
-    .field("token_present", parsed.token_present())
-    .duration("auth_us", started.elapsed()));
+let outcome = Outcome::Rejected;
+let response = HecResponse::invalid_token();
 
-report.emit(HEC_BODY_DECODED
-    .at(&ctx)
-    .bytes("wire_bytes", wire_len)
-    .bytes("decoded_bytes", decoded_len)
-    .duration("decode_us", started.elapsed()));
+report.submit(
+    &ctx,
+    auth::TOKEN_INVALID,
+    fields![
+        field::outcome(outcome),
+        field::auth_scheme(parsed.scheme()),
+        field::token_present(parsed.token_present()),
+        field::hec_code(response.code()),
+        field::auth_len(parsed.token_len()),
+        field::elapsed_us(started.elapsed()),
+    ],
+);
 
-report.emit(HEC_SINK_COMMIT_FAILED
-    .at(&ctx)
-    .state("sink_state", SinkState::CommitAttempted)
-    .error_class(error.class())
-    .field("sink_kind", sink.kind()));
+return response.into_response();
 ```
 
-Here `HEC_AUTH_TOKEN_INVALID`, `HEC_BODY_DECODED`, and `HEC_SINK_COMMIT_FAILED` are static report definitions. A definition owns the stable name, phase, component, step, default severity, outcome class, default output routing, counter updates, and allowed/redacted fields. The call site supplies runtime values.
-
-For unexpected or investigation-specific diagnostics, keep the same shape but allow a dynamic diagnostic definition:
+For diagnostics:
 
 ```rust
-if report.enabled(HEC_BODY_SPLITTER_DETAIL) {
-    report.emit(HEC_BODY_SPLITTER_DETAIL
-        .at(&ctx)
-        .field("line_breaker", splitter.kind())
-        .field("byte_class", byte_class)
-        .offset("byte_offset", offset));
-}
+report.submit_lazy(&ctx, body::SPLITTER_DETAIL, || {
+    fields![
+        field::line_breaker(splitter.kind()),
+        field::input_class(input_class),
+        field::input_offset(offset),
+    ]
+});
 ```
 
-Diagnostic coverage cannot be complete at design time. The design requirement is that diagnostics still use the same source, phase, component, severity, redaction, and output-routing machinery rather than becoming ad hoc `println!` or backend calls.
+The exact Rust representation may be plain structs, constants, macros, or generated tables. The stable point is the layer boundary: domain modules name and bound their statuses/results; Reporter receives structured submissions and handles output.
 
-The reporting component fans out to configured outputs without changing the call site:
+`submit_lazy` is for expensive or highly verbose diagnostic paths. The fact name appears once, and field construction is skipped when the fact is disabled.
 
-```text
-report definition + runtime fields
-  -> logs/tracing
-  -> counters
-  -> stderr/stdout/file output where configured
-  -> benchmark/performance ledger where configured
-  -> future external notification where configured
-```
-
-Terminal output is not a special reporting concept merely because it is a terminal. It is another file descriptor or output sink. It becomes a separate concern only for interactive command responses, paging, prompts, TTY detection, color, or human-oriented command rendering.
-
-### 9.3 Backend Stack
-
-Use `tracing` and `tracing-subscriber` as the first logging/tracing backend, not as the application-level observability API.
-
-Initial backend support:
-
-- compact or JSON stderr output;
-- runtime-configured default severity;
-- runtime-configured source/component filters;
-- redaction policy applied before sensitive values reach backend fields;
-- no per-event backend log calls on hot ingest paths unless explicitly enabled.
-
-Compile-time log filtering is not the design center. The interesting tuning must happen at runtime and per deployment/debugging situation. Release-build compile-time filters may be considered later only as an optimization after the reporting API is stable.
-
-### 9.4 Report Definitions
-
-A report definition is the stable, code-owned description of one meaningful occurrence.
-
-Minimum definition fields:
-
-| Field | Purpose |
-| --- | --- |
-| `name` | Stable dotted name, such as `hec.auth.token_invalid`. |
-| `phase` | Broad lifecycle area: startup, ingress, decode, parse, queue, sink, shutdown. |
-| `component` | Owning implementation component, such as auth, body, gzip, queue, sink. |
-| `step` | Functional step inside the phase/component. |
-| `default_severity` | Runtime-overridable severity. |
-| `kind` | Arrival, condition, state transition, outcome, diagnostic, performance sample. |
-| `outcome_class` | Accepted, rejected, failed, skipped, throttled, recovered, informational, or not applicable. |
-| `counter_effect` | Optional counter increments and labels. |
-| `output_policy` | Default routing to log, status output, benchmark ledger, metrics, or none. |
-| `redaction_policy` | Allowed fields, redacted fields, and raw-value prohibition. |
-
-Example definitions:
+Fact constants should not construct a heap object at runtime. Use either a small copyable id into a static registry or a reference to static metadata:
 
 ```rust
-pub const HEC_REQUEST_ARRIVED: ReportDef = ReportDef::new("hec.request.arrived")
-    .phase(Phase::Ingress)
-    .component(Component::Receiver)
-    .step(Step::RequestArrived)
-    .kind(ReportKind::Arrival)
-    .default_severity(Severity::Debug);
+pub const TOKEN_INVALID: FactId = FactId(17);
 
-pub const HEC_AUTH_TOKEN_INVALID: ReportDef = ReportDef::new("hec.auth.token_invalid")
-    .phase(Phase::Ingress)
-    .component(Component::Auth)
-    .step(Step::Authorize)
-    .kind(ReportKind::Outcome)
-    .outcome_class(OutcomeClass::Rejected)
-    .default_severity(Severity::Warn)
-    .counter("requests_rejected_total", "reason", "invalid_token");
-
-pub const HEC_SINK_COMMIT_FAILED: ReportDef = ReportDef::new("hec.sink.commit_failed")
-    .phase(Phase::Sink)
-    .component(Component::Sink)
-    .step(Step::Commit)
-    .kind(ReportKind::Outcome)
-    .outcome_class(OutcomeClass::Failed)
-    .default_severity(Severity::Error)
-    .counter("sink_failures_total", "reason", "commit_failed");
+pub static FACTS: &[FactSpec] = &[
+    FactSpec {
+        id: TOKEN_INVALID,
+        name: "hec.auth.token_invalid",
+        phase: Phase::Ingress,
+        component: Component::Auth,
+        step: Step::Authorize,
+        level: Severity::Warn,
+        outputs: outputs::LOG | outputs::CONSOLE | outputs::STATS,
+        counters: &[counter::REQUESTS_REJECTED_TOTAL.with_reason(reason::INVALID_TOKEN)],
+        fields: &[field::OUTCOME, field::AUTH_SCHEME, field::TOKEN_PRESENT, field::HEC_CODE, field::AUTH_LEN, field::ELAPSED_US],
+    },
+];
 ```
 
-The exact Rust construction syntax may change if `const` initialization or field storage pushes toward plain struct literals, macros, or generated tables. The stable requirement is the call-site contract: named definition plus typed runtime fields, with routing/redaction/counter policy centralized.
+The call site passes `FactId` plus typed field values. Reporter uses the registry for metadata, routing, allowed fields, default outputs, and counter mapping.
 
-`Rejected` and `Failed` are not separate messaging functions. They are outcome classes on one report record model:
+### 9.3 Fan-Out Semantics
 
-- rejected means the receiver intentionally refuses or stops processing due to input, auth, policy, limit, or compatibility handling; this is often client-visible and expected under hostile input;
-- failed means the receiver tried to perform an intended operation and could not complete it due to internal error, dependency failure, resource exhaustion, or a violated invariant;
-- both can become logs, counters, HEC responses, status records, and test assertions through the same reporting and outcome mapping.
-
-### 9.5 Sources, Severity, And Filtering
-
-Application source is not the same thing as a `tracing` target. Source is the product/component origin of an occurrence; target is the backend routing string.
-
-Initial components/sources:
+One submitted fact can produce several output products:
 
 ```text
-hec
-hec.config
-hec.runtime
-hec.auth
-hec.body
-hec.gzip
-hec.event_parser
-hec.raw_parser
-hec.queue
-hec.sink
-hec.stats
+auth token invalid submission
+  -> structured log entry
+  -> requests_rejected_total counter update
+  -> console warning when enabled
+  -> benchmark/security ledger row when enabled
 ```
 
-Initial severities:
+That is one submission and multiple rendered/output records. It is not four separate submissions.
+
+Separate submissions are appropriate when separate facts are observed at different points:
 
 ```text
-trace, debug, info, warn, error
+request arrived
+body decoded
+auth token invalid
+request completed
 ```
+
+These may share request id, peer address, route alias, and timing context, but they are distinct submissions because they correspond to different processing steps.
+
+### 9.4 Backends And Outputs
+
+Use `tracing` and `tracing-subscriber` as the first structured logging/tracing backend because they are the Rust ecosystem's standard substrate for levels, structured fields, spans, subscribers, compact output, and JSON output. This is an implementation backend choice, not the reporting model.
+
+Initial output support:
+
+- `tracing` compact or JSON logs;
+- console output to stdout or stderr;
+- in-process counters/stats;
+- status output for direct commands such as `--show-config` and `--check-config`;
+- benchmark/performance JSONL ledger when enabled.
 
 Config shape:
 
@@ -746,43 +697,62 @@ hec.queue = "warn"
 hec.sink = "debug"
 
 [observe.outputs]
-logs = true
+tracing = true
+console = true
 stats = true
 status = true
 benchmark_ledger = false
+
+[observe.console]
+stream = "stderr"
+format = "compact"
+color = "auto"
+interactive = false
 ```
 
-The reporter maps source and severity to backend `tracing::event!` calls internally. Ordinary call sites should not hand-type backend targets or log-level macros for product-significant events.
+Console output is an output option, not a special call-site API. It becomes a separate interactive subsystem only if prompts, paging, refresh, terminal capabilities, or user sessions are introduced.
 
-### 9.6 Startup Occurrences
+Initial library choices and adapter syntax:
 
-Fields:
+| Output | Library / mechanism | Adapter call, not product call site |
+| --- | --- | --- |
+| tracing log | `tracing`, `tracing-subscriber` | `tracing::event!(target: fact.target(), level, name = fact.name(), request_id = %ctx.request_id(), fields = %record.redacted_json())` |
+| console | `std::io::{stdout, stderr}` initially; `anstream` only if color portability is needed | `writeln!(console.stream(), "{}", render_console(record))` |
+| stats counters | current `Stats` with `AtomicU64`; `metrics`/Prometheus later | `stats.increment(counter_id, labels)` from fact counter mapping |
+| status command output | `std::io` plus existing TOML/JSON renderers | `output.write(CommandResponse::EffectiveConfig(config.redacted()))` |
+| benchmark ledger | `serde`, `serde_json`, file writer or background Tokio writer | `serde_json::to_writer(&mut ledger, &BenchmarkRow::from(record))` |
 
-- `event="startup"`;
-- `version`;
-- `git_revision` when available;
-- `profile`;
-- `addr`;
-- `config_sources`;
-- `sink_kind`;
-- `line_splitter`;
-- `tokio_workers`;
-- redacted effective config summary.
+The product call site remains `report.submit(...)`; output adapters are internal Reporter implementation.
 
-Ready event:
+Example translation for `auth::TOKEN_INVALID`:
 
 ```text
-config parsed -> tracing ready -> runtime built -> listener bound -> routes installed -> startup_ready
+call site:
+  report.submit(ctx, auth::TOKEN_INVALID, [outcome=Rejected, hec_code=4, auth_scheme=Splunk])
+
+registry lookup:
+  name=hec.auth.token_invalid
+  component=Auth
+  step=Authorize
+  severity=Warn
+  outputs=LOG|CONSOLE|STATS
+  counters=requests_rejected_total{reason=invalid_token}
+
+Reporter fan-out:
+  tracing: event target="hec.auth" level=WARN name="hec.auth.token_invalid" hec_code=4 auth_scheme="Splunk"
+  console: "WARN hec.auth token_invalid request=<id> peer=<addr> code=4"
+  stats: increment requests_rejected_total with reason=invalid_token
+  ledger: no row unless benchmark/security ledger output enabled
 ```
 
-### 9.7 Request And Processing Occurrences
+### 9.5 Fields, Context, And Domain Fact Names
 
-Request outcome records need enough structure for user logs, tests, counters, and post-processing:
+Common fields should be bounded and typed. Prefer specialized field constructors over generic string-key fields:
 
-- `name`, such as `hec.request.completed` or `hec.auth.token_invalid`;
+- `name`, such as `hec.auth.token_invalid`;
 - `phase`, `component`, and `step`;
-- `kind`, such as arrival, condition, state transition, outcome, diagnostic, or performance sample;
-- `outcome_class`, when applicable;
+- `outcome`, such as accepted, rejected, failed, skipped, throttled, recovered, informational;
+- `severity`;
 - `request_id` when available;
 - `peer_addr`;
 - `method`;
@@ -790,107 +760,92 @@ Request outcome records need enough structure for user logs, tests, counters, an
 - `endpoint_kind`;
 - `status`;
 - `hec_code`;
-- `outcome_kind`;
 - `reason`;
-- `wire_bytes`;
-- `decoded_bytes`;
+- `wire_len`;
+- `decoded_len`;
 - `event_count`;
-- `duration_us`;
+- `elapsed_us`;
+- `state_from` and `state_to` for true state transitions;
 - `sink_commit_state` when reached.
 
-Performance and duration records must be structured rather than text-only:
+Field primitive type, interpretation, serialization, and formatting are not decided at each call site:
 
-- durations use explicit units in field names or typed fields, such as `decode_us`, `auth_us`, `sink_commit_us`;
-- byte and event counts use typed integer fields;
-- state records identify `state_from`, `state_to`, and reason where a true transition exists;
-- hot-path detailed diagnostics require `report.enabled(definition)` guards before expensive field construction.
+| Layer | Responsibility |
+| --- | --- |
+| `field::*` constructor | Converts a Rust value into a typed `FieldValue`. |
+| field registry | Defines field id, name, primitive type, unit, redaction policy, and display hint. |
+| Reporter validation | Verifies the fact permits the field and redacts forbidden values. |
+| output adapter | Serializes and formats the field for tracing, console, JSONL, stats, or benchmark output. |
 
-### 9.8 Shutdown Occurrences
-
-Fields:
-
-- `event="shutdown"`;
-- `reason`;
-- `uptime_ms`;
-- final counters;
-- worker join status;
-- flush status.
-
-### 9.9 Command Output And Human Display
-
-Stdout, stderr, terminals, files, and future local sockets are output sinks. A terminal is not special for routine reporting.
-
-Command output is separate only when the program is answering a direct CLI command such as `--show-config` or `--check-config`. That path should share redaction, formatting, and message text definitions with reporting, but it should not create one-off terminal methods per command:
+Example field definitions:
 
 ```rust
-output.write(CommandResponse::EffectiveConfig(config.redacted()));
-output.write(CommandResponse::ConfigCheckOk);
-output.write(CommandResponse::StartupFailure(error.to_public()));
+pub const WIRE_LEN: FieldSpec = FieldSpec::u64("wire_len").unit(Unit::Bytes);
+pub const DECODED_LEN: FieldSpec = FieldSpec::u64("decoded_len").unit(Unit::Bytes);
+pub const EVENT_COUNT: FieldSpec = FieldSpec::u64("event_count").unit(Unit::Count);
+pub const ELAPSED_US: FieldSpec = FieldSpec::duration_us("elapsed_us");
+pub const INPUT_OFFSET: FieldSpec = FieldSpec::u64("input_offset").unit(Unit::Bytes);
+pub const INPUT_CLASS: FieldSpec = FieldSpec::enum_("input_class", &["lf", "crlf", "nul", "control", "non_ascii", "invalid_utf8"]);
 ```
 
-If the project later adds interactive operation, that is a larger UI/session concern: TTY detection, color, paging, prompts, refresh, confirmation, interruption, and possibly separate human-readable views. The output file descriptor is the trivial part.
+Example field constructors:
 
-### 9.10 Call-Site Contract
+```rust
+field::wire_len(wire.len())
+field::decoded_len(decoded.len())
+field::event_count(events.len())
+field::elapsed_us(started.elapsed())
+field::input_class(InputClass::Nul)
+field::input_offset(offset)
+```
+
+`input_class` replaces the vague `byte_class`. It classifies a notable input/framing condition for diagnostics. Initial values should be explicit and finite: `Lf`, `Crlf`, `Nul`, `Control`, `NonAscii`, `InvalidUtf8`, `Oversize`, and `Other`.
+
+`ReportContext` should be explicit, not nebulous. Initial request context fields:
+
+- `request_id`;
+- `peer_addr`;
+- `method`;
+- `route_alias`;
+- `endpoint_kind`;
+- `started_at`;
+- `token_id` or token hash later, never raw token;
+- worker/thread id later if it becomes measurable and useful.
+
+Phase, component, step, default severity, default outputs, and default field policy should be attached to the domain fact constant, not repeated at every call site:
+
+```rust
+pub const TOKEN_INVALID: FactId = FactId(17);
+```
+
+Function-specific values such as `splitter.kind()` are acceptable as domain fields. They are supplied by the raw/body subsystem and rendered generically by Reporter.
+
+Performance and duration data must remain structured rather than text-only. Hot-path diagnostics should use `submit_lazy` before expensive field construction.
+
+### 9.6 Call-Site Contract
 
 Call sites should be easy to audit:
 
-- report product-significant occurrences with `report.emit(def.at(&ctx)...);`
-- build expensive diagnostic fields only after `report.enabled(def)`;
-- return typed errors or outcomes separately from report rendering;
+- submit product-significant facts through `report.submit(&ctx, domain::FACT, fields![...])`;
+- use domain-owned names/constants such as `auth::TOKEN_INVALID`;
+- return typed errors or HEC responses separately from report rendering;
 - avoid raw public text at protocol and infrastructure call sites;
-- avoid direct output writes except at the final command-output adapter;
-- avoid direct counter updates when the occurrence already has a report definition with counter effects.
+- avoid direct output writes except at final command-output adapters;
+- avoid direct counter updates when the submitted fact already has a counter effect;
+- do not call `tracing::info!`, `println!`, `eprintln!`, or benchmark writers directly for product-significant facts.
 
-Good:
-
-```rust
-let outcome = outcomes::invalid_token();
-report.emit(HEC_AUTH_TOKEN_INVALID
-    .at(&ctx)
-    .field("auth_scheme", parsed.scheme())
-    .outcome(&outcome));
-return outcome.into_response();
-```
-
-Acceptable for diagnostics:
-
-```rust
-if report.enabled(HEC_BODY_SPLITTER_DETAIL) {
-    report.emit(HEC_BODY_SPLITTER_DETAIL
-        .at(&ctx)
-        .offset("byte_offset", offset)
-        .field("byte_class", byte_class));
-}
-```
-
-Avoid:
-
-```rust
-tracing::warn!("invalid token");
-stats.auth_errors_total.fetch_add(1, Ordering::Relaxed);
-eprintln!("Invalid token");
-```
-
-### 9.11 Implementation Direction
+### 9.7 Implementation Direction
 
 Likely implementation steps:
 
-1. Define `Phase`, `Component`, `Step`, `ReportKind`, `OutcomeClass`, `Severity`, and `ReportDef`.
-2. Define `ReportRecord` as a borrowed static definition plus typed runtime fields.
-3. Define `Reporter::emit(record)` and `Reporter::enabled(definition)`.
-4. Map report definitions to `tracing` internally; do not expose `tracing::info!` at product call sites.
-5. Add output sinks for compact log, JSON log, stats counters, and benchmark/performance ledger.
-6. Add command-output rendering for `--show-config`, `--check-config`, and startup failure without one method per CLI command.
-7. Add tests for definition names, redaction, outcome class mapping, counter effects, output routing, and disabled hot-path diagnostics.
+1. Define `Reporter`, `ReportContext`, `FactId`, `FactSpec`, `FieldSpec`, `FieldValue`, `Phase`, `Component`, `Step`, `Outcome`, and `Severity`.
+2. Keep fact constants near owning modules: auth, body, gzip, parser, queue, sink, lifecycle.
+3. Rename or separate HEC client response terminology so generic `Outcome` is not confused with protocol response bodies.
+4. Add Reporter output adapters for `tracing`, console, stats counters, command/status output, and benchmark ledger.
+5. Add runtime-configured source filters, output toggles, and redaction.
+6. Add tests for redaction, output fan-out, disabled diagnostics, output routing, typed fields, and outcome-to-HEC-response mapping.
 
-Critique to preserve:
-
-- a single `emit` shape can become too generic if definitions are weak; definitions must carry phase/component/step/kind/outcome metadata;
-- a large enum of every possible event can become rigid; keep stable definitions for product-significant occurrences and allow controlled diagnostics;
-- benchmark/performance records are related but may need a separate output sink and schema for post-processing;
-- user-visible HEC responses remain protocol outcomes, not log messages, even when they are derived from the same cause/reason definitions.
-
-### 9.10 Health And Readiness
+### 9.8 Health And Readiness
 
 Initial same-port stats route exists. Production direction separates observability from data plane when needed.
 
@@ -1325,16 +1280,17 @@ Smoke results are not capacity claims. They only prove the receiver starts, acce
 
 ### Phase 2 — Reporting, Error, And Outcome Spine
 
-- Add `report.rs` with `Reporter`, `ReportDef`, `ReportRecord`, `Phase`, `Component`, `Step`, `ReportKind`, `OutcomeClass`, `Severity`, and redaction policy.
-- Add static report definitions for startup, config, request arrival, auth outcomes, body/gzip outcomes, parser outcomes, queue outcomes, sink outcomes, shutdown, and selected performance records.
+- Add `report.rs` with `Reporter`, output routing, redaction, filters, and backend/rendering adapters.
+- Add `ReportContext`, `FactId`, `FactSpec`, `FieldSpec`, `FieldValue`, `Phase`, `Component`, `Step`, `Outcome`, and `Severity`.
+- Keep fact constants in owning modules for startup, config, request arrival, auth, body/gzip, parser, queue, sink, shutdown, and selected performance records.
 - Add controlled dynamic diagnostic support for investigation-specific records that still use source, phase, component, severity, redaction, and output routing.
 - Avoid a generic `messages.rs` dumping ground. Add `public_text.rs`, `render.rs`, or `output.rs` only if public text and command-output rendering need a separate home after report/outcome types exist.
-- Tighten `outcome.rs` constructors.
+- Tighten `outcome.rs` constructors; prefer `HecResponse` naming for client-visible protocol responses when code is next refactored.
 - Add `error.rs` classes for config/startup/request/sink.
-- Route handler early returns through central outcome mapping and `Reporter::emit(...)` records.
+- Route handler early returns through central outcome mapping and `Reporter::submit(...)`.
 - Add outcome serialization and mapping tests.
-- Add report definition, redaction, counter-effect, routing, and disabled-diagnostic tests.
-- Add runtime-configured reporting source filters and compact/json backend output.
+- Add fact submission, redaction, counter-effect, routing, fan-out, console output, and disabled-diagnostic tests.
+- Add runtime-configured reporting source filters and compact/json/console backend output.
 
 ### Phase 3 — Raw Framing And Hostile Input
 
@@ -1373,8 +1329,8 @@ The first infrastructure phase is accepted when:
 - `--show-config` redacts secrets;
 - `--check-config` uses the same validation path;
 - handlers no longer scatter HEC response text/code;
-- product-significant call sites use static report definitions and `Reporter::emit(...)` rather than direct backend logging calls;
-- rejected and failed outcomes are represented as outcome classes, not separate messaging APIs;
+- product-significant call sites use domain-owned fact constants and `Reporter::submit(...)` rather than direct backend logging calls;
+- rejected and failed outcomes are represented as `Outcome` values, not separate messaging APIs;
 - request rejection classes have central outcomes, counters, and reporting fields;
 - raw splitter behavior is explicit and tested;
 - benchmark and validation runs can be recorded with reproducible metadata.
