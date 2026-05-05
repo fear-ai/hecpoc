@@ -6,13 +6,7 @@ use axum::{
     Json,
 };
 use serde_json::json;
-use std::{
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
-    },
-    time::Instant,
-};
+use std::{sync::Arc, time::Instant};
 
 use super::{
     app::AppState,
@@ -21,9 +15,10 @@ use super::{
         Encoding,
     },
     event::Endpoint,
-    outcome::{HecError, HecOutcome},
+    outcome::{HecError, HecResponse},
     parse_event::parse_event_body,
     parse_raw::parse_raw_body,
+    report::{facts, field, Outcome, ReportContext},
 };
 
 pub async fn post_event(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
@@ -52,49 +47,84 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
 }
 
 pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
-    Json(state.stats.snapshot()).into_response()
+    Json(state.reporter.stats_snapshot()).into_response()
 }
 
 async fn handle_hec(state: Arc<AppState>, request: Request<Body>, endpoint: Endpoint) -> Response {
     let started = Instant::now();
-    state.stats.requests_total.fetch_add(1, Ordering::Relaxed);
+    let ctx = ReportContext::request();
+    let route_alias = request.uri().path().to_string();
+    state.reporter.submit(
+        &ctx,
+        facts::REQUEST_RECEIVED,
+        vec![
+            field::endpoint_kind(endpoint),
+            field::route_alias(route_alias.clone()),
+        ],
+    );
 
-    let result = handle_hec_inner(&state, request, endpoint).await;
+    let result = handle_hec_inner(&state, &ctx, request, endpoint).await;
     let response = match result {
         Ok(outcome) => {
-            state.stats.requests_ok.fetch_add(1, Ordering::Relaxed);
+            state.reporter.submit(
+                &ctx,
+                facts::REQUEST_SUCCEEDED,
+                vec![
+                    field::outcome(Outcome::Accepted),
+                    field::endpoint_kind(endpoint),
+                    field::route_alias(route_alias),
+                    field::hec_code(outcome.code),
+                    field::http_status(outcome.status.as_u16()),
+                    field::elapsed_us(started.elapsed()),
+                ],
+            );
             outcome.into_response()
         }
         Err(outcome) => {
-            state.stats.requests_failed.fetch_add(1, Ordering::Relaxed);
-            record_error_outcome(&state, &outcome);
+            state.reporter.submit(
+                &ctx,
+                facts::REQUEST_FAILED,
+                vec![
+                    field::outcome(outcome_from_response(&outcome)),
+                    field::endpoint_kind(endpoint),
+                    field::route_alias(route_alias),
+                    field::hec_code(outcome.code),
+                    field::http_status(outcome.status.as_u16()),
+                    field::elapsed_us(started.elapsed()),
+                ],
+            );
             outcome.into_response()
         }
     };
 
-    state.stats.record_latency(started.elapsed());
     response
 }
 
 async fn handle_hec_inner(
     state: &Arc<AppState>,
+    ctx: &ReportContext,
     request: Request<Body>,
     endpoint: Endpoint,
-) -> Result<HecOutcome, HecOutcome> {
+) -> Result<HecResponse, HecResponse> {
     if !state.health.current().admits_work() {
         return Err(HecError::ServerBusy.outcome(&state.protocol));
     }
 
     let (parts, body) = request.into_parts();
-    state
-        .tokens
-        .authenticate(&parts.headers)
-        .map_err(|error| error.outcome(&state.protocol))?;
+    state.tokens.authenticate(&parts.headers).map_err(|error| {
+        let outcome = error.outcome(&state.protocol);
+        report_auth_error(state, ctx, error, &outcome);
+        outcome
+    })?;
 
     let encoding =
         parse_content_encoding(&parts.headers).map_err(|error| error.outcome(&state.protocol))?;
     if encoding == Encoding::Gzip {
-        state.stats.gzip_requests.fetch_add(1, Ordering::Relaxed);
+        state.reporter.submit(
+            ctx,
+            facts::GZIP_REQUEST,
+            vec![field::outcome(Outcome::Accepted)],
+        );
     }
 
     reject_advertised_oversize(&parts.headers, state.limits.max_content_length)
@@ -107,12 +137,18 @@ async fn handle_hec_inner(
         state.limits.body_total_timeout,
     )
     .await
-    .map_err(|error| error.outcome(&state.protocol))?;
-    state
-        .stats
-        .wire_bytes
-        .fetch_add(wire.len() as u64, Ordering::Relaxed);
+    .map_err(|error| {
+        let outcome = error.outcome(&state.protocol);
+        report_body_error(state, ctx, error, &outcome);
+        outcome
+    })?;
+    state.reporter.submit(
+        ctx,
+        facts::WIRE_BODY_READ,
+        vec![field::wire_len(wire.len())],
+    );
 
+    let wire_len = wire.len();
     let decoded = decode_limited(
         wire,
         encoding,
@@ -120,15 +156,15 @@ async fn handle_hec_inner(
         state.limits.gzip_buffer_bytes,
     )
     .map_err(|error| {
-        if encoding == Encoding::Gzip {
-            state.stats.gzip_failures.fetch_add(1, Ordering::Relaxed);
-        }
-        error.outcome(&state.protocol)
+        let outcome = error.outcome(&state.protocol);
+        report_decode_error(state, ctx, error, encoding, wire_len, &outcome);
+        outcome
     })?;
-    state
-        .stats
-        .decoded_bytes
-        .fetch_add(decoded.len() as u64, Ordering::Relaxed);
+    state.reporter.submit(
+        ctx,
+        facts::BODY_DECODED,
+        vec![field::decoded_len(decoded.len())],
+    );
 
     let events = match endpoint {
         Endpoint::Event => parse_event_body(
@@ -137,60 +173,141 @@ async fn handle_hec_inner(
             &state.protocol,
         )
         .map_err(|outcome| {
-            state.stats.parse_failures.fetch_add(1, Ordering::Relaxed);
+            state.reporter.submit(
+                ctx,
+                facts::PARSE_FAILED,
+                vec![
+                    field::outcome(outcome_from_response(&outcome)),
+                    field::hec_code(outcome.code),
+                    field::http_status(outcome.status.as_u16()),
+                    field::endpoint_kind(endpoint),
+                ],
+            );
             outcome
         })?,
         Endpoint::Raw => {
             parse_raw_body(&decoded, state.limits.max_events_per_request).map_err(|error| {
                 if matches!(error, HecError::InvalidDataFormat | HecError::NoData) {
-                    state.stats.parse_failures.fetch_add(1, Ordering::Relaxed);
+                    state.reporter.submit(
+                        ctx,
+                        facts::PARSE_FAILED,
+                        vec![
+                            field::outcome(Outcome::Rejected),
+                            field::endpoint_kind(endpoint),
+                        ],
+                    );
                 }
                 error.outcome(&state.protocol)
             })?
         }
     };
 
-    let event_count = events.len() as u64;
-    state
-        .stats
-        .events_observed
-        .fetch_add(event_count, Ordering::Relaxed);
+    state.reporter.submit(
+        ctx,
+        facts::EVENTS_PARSED,
+        vec![field::event_count(events.len())],
+    );
 
     let sink_report = state.sink.submit_batch(&events).await.map_err(|_| {
-        state.stats.sink_failures.fetch_add(1, Ordering::Relaxed);
+        state.reporter.submit(
+            ctx,
+            facts::SINK_FAILED,
+            vec![field::outcome(Outcome::Failed)],
+        );
         HecError::ServerBusy.outcome(&state.protocol)
     })?;
-    state
-        .stats
-        .events_drop_sink
-        .fetch_add(sink_report.dropped as u64, Ordering::Relaxed);
-    state
-        .stats
-        .events_written
-        .fetch_add(sink_report.written as u64, Ordering::Relaxed);
+    state.reporter.submit(
+        ctx,
+        facts::SINK_COMPLETED,
+        vec![
+            field::event_count(events.len()),
+            field::drop_count(sink_report.dropped),
+            field::written_count(sink_report.written),
+        ],
+    );
 
-    Ok(HecOutcome::success(&state.protocol))
+    Ok(HecResponse::success(&state.protocol))
 }
 
-fn record_error_outcome(state: &AppState, outcome: &HecOutcome) {
-    if matches!(
-        outcome.code,
-        code if code == state.protocol.token_required
-            || code == state.protocol.invalid_authorization
-            || code == state.protocol.invalid_token
-    ) {
-        inc(&state.stats.auth_failures);
-    } else if outcome.status == axum::http::StatusCode::PAYLOAD_TOO_LARGE {
-        inc(&state.stats.body_too_large);
-    } else if outcome.code == state.protocol.invalid_data_format {
-        inc(&state.stats.parse_failures);
-    } else if outcome.status == axum::http::StatusCode::REQUEST_TIMEOUT {
-        inc(&state.stats.timeouts);
+fn report_auth_error(
+    state: &AppState,
+    ctx: &ReportContext,
+    error: HecError,
+    outcome: &HecResponse,
+) {
+    let fact = match error {
+        HecError::TokenRequired => facts::AUTH_TOKEN_REQUIRED,
+        HecError::InvalidAuthorization => facts::AUTH_INVALID_AUTHORIZATION,
+        HecError::InvalidToken => facts::AUTH_TOKEN_INVALID,
+        _ => return,
+    };
+    state.reporter.submit(
+        ctx,
+        fact,
+        vec![
+            field::outcome(Outcome::Rejected),
+            field::token_present(!matches!(error, HecError::TokenRequired)),
+            field::hec_code(outcome.code),
+            field::http_status(outcome.status.as_u16()),
+        ],
+    );
+}
+
+fn report_body_error(
+    state: &AppState,
+    ctx: &ReportContext,
+    error: HecError,
+    outcome: &HecResponse,
+) {
+    let fact = match error {
+        HecError::BodyTooLarge => facts::BODY_TOO_LARGE,
+        HecError::Timeout => facts::BODY_TIMEOUT,
+        _ => return,
+    };
+    state.reporter.submit(
+        ctx,
+        fact,
+        vec![
+            field::outcome(Outcome::Rejected),
+            field::hec_code(outcome.code),
+            field::http_status(outcome.status.as_u16()),
+        ],
+    );
+}
+
+fn report_decode_error(
+    state: &AppState,
+    ctx: &ReportContext,
+    error: HecError,
+    encoding: Encoding,
+    wire_len: usize,
+    outcome: &HecResponse,
+) {
+    let fact = match (encoding, error) {
+        (Encoding::Gzip, HecError::InvalidDataFormat) => facts::GZIP_FAILED,
+        (_, HecError::BodyTooLarge) => facts::BODY_TOO_LARGE,
+        _ => return,
+    };
+    state.reporter.submit(
+        ctx,
+        fact,
+        vec![
+            field::outcome(Outcome::Rejected),
+            field::wire_len(wire_len),
+            field::hec_code(outcome.code),
+            field::http_status(outcome.status.as_u16()),
+        ],
+    );
+}
+
+fn outcome_from_response(outcome: &HecResponse) -> Outcome {
+    if outcome.status.is_success() {
+        Outcome::Accepted
+    } else if outcome.status == axum::http::StatusCode::SERVICE_UNAVAILABLE {
+        Outcome::Throttled
+    } else {
+        Outcome::Rejected
     }
-}
-
-fn inc(counter: &AtomicU64) {
-    counter.fetch_add(1, Ordering::Relaxed);
 }
 
 #[cfg(test)]

@@ -4,7 +4,7 @@ use serde_json::Value;
 
 use super::{
     event::{Endpoint, Event},
-    outcome::{HecError, HecOutcome},
+    outcome::{HecError, HecResponse},
     protocol::Protocol,
 };
 
@@ -23,7 +23,7 @@ pub fn parse_event_body(
     body: &Bytes,
     max_events: usize,
     protocol: &Protocol,
-) -> Result<Vec<Event>, HecOutcome> {
+) -> Result<Vec<Event>, HecResponse> {
     if body.is_empty() {
         return Err(HecError::NoData.outcome(protocol));
     }
@@ -93,7 +93,7 @@ fn validate_fields(fields: Option<Value>) -> Result<Option<Value>, ()> {
     Ok(Some(fields))
 }
 
-fn event_error(error: HecError, index: usize, protocol: &Protocol) -> HecOutcome {
+fn event_error(error: HecError, index: usize, protocol: &Protocol) -> HecResponse {
     error.outcome(protocol).with_invalid_event_number(index)
 }
 

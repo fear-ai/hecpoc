@@ -261,6 +261,18 @@ Avoid:
 | Body total timeout | `limits.total_timeout` | `HEC_TOTAL_TIMEOUT` | `--total-timeout` | `30s` | `>= idle_timeout` |
 | Gzip buffer bytes | `limits.gzip_buffer_bytes` | `HEC_GZIP_BUFFER_BYTES` | `--gzip-buffer-bytes` | `8_192` | bounded bytes |
 
+Observation and reporting settings are first-class configuration, not hard-coded debug switches:
+
+| Parameter | TOML key | Env var | CLI flag | Default | Validation |
+| --- | --- | --- | --- | --- | --- |
+| Observe level/filter | `observe.level` | `HEC_OBSERVE_LEVEL` | `--observe-level` | `info` | valid `tracing-subscriber` filter syntax |
+| Observe format | `observe.format` | `HEC_OBSERVE_FORMAT` | `--observe-format` | `compact` | `compact` or `json` |
+| Redaction mode | `observe.redaction_mode` | `HEC_OBSERVE_REDACTION_MODE` | `--observe-redaction-mode` | `redact` | `redact` or `passthrough` |
+| Redaction text | `observe.redaction_text` | `HEC_OBSERVE_REDACTION_TEXT` | `--observe-redaction-text` | `<redacted>` | non-empty |
+| Tracing output | `observe.tracing` | `HEC_OBSERVE_TRACING` | `--observe-tracing <bool>` | `true` | boolean |
+| Console output | `observe.console` | `HEC_OBSERVE_CONSOLE` | `--observe-console <bool>` | `false` | boolean |
+| Stats output | `observe.stats` | `HEC_OBSERVE_STATS` | `--observe-stats <bool>` | `true` | boolean |
+
 Protocol result settings remain configurable but centralized through outcome definitions:
 
 | Outcome | TOML key | Env var | CLI flag | Default code |
@@ -351,7 +363,16 @@ Acceptance:
 
 - every field has default, TOML override, CLI override, env override, validation test, `--show-config` coverage, and `--check-config` coverage;
 - diagnostics include canonical field name and original source name;
-- secrets are redacted.
+- secrets are redacted by default; explicit `observe.redaction_mode = "passthrough"` is an operator/debugging override and must be visible in the effective config output.
+
+Configuration prompt guardrail:
+
+```text
+When adding any new runtime behavior, add its typed config field, TOML key,
+CLI flag, env var, compiled default, validation rule, redacted show-config
+behavior, and precedence test in the same change. Do not add hidden constants
+or one-off environment reads in domain modules.
+```
 
 ---
 
@@ -425,18 +446,19 @@ The actual enum may start smaller, but subsystem boundaries should not collapse 
 
 ### 8.4 HEC Outcomes
 
-Central type:
+Central client-visible type:
 
 ```rust
-pub struct HecOutcome {
+pub struct HecResponse {
     pub status: StatusCode,
     pub text: &'static str,
     pub code: u16,
-    pub metadata: Option<HecOutcomeMetadata>,
+    pub ack_id: Option<u64>,
+    pub invalid_event_number: Option<usize>,
 }
 ```
 
-Naming note: current code uses `HecOutcome`. As the generic reporting vocabulary settles, prefer `Outcome` for accepted/rejected/failed/skipped/throttled/recovered operation disposition and `HecResponse` for the client-visible HEC response body/status/code.
+Naming decision: use `Outcome` for accepted/rejected/failed/skipped/throttled/recovered operation disposition and `HecResponse` for the client-visible HEC response body/status/code. Do not introduce `HecOutcome` in new code; it conflates protocol response with operation disposition.
 
 Initial constructors:
 
@@ -471,13 +493,15 @@ Client-visible text is fixed. Never include parser exceptions, token values, fil
 Mapping happens once at the HTTP adapter edge:
 
 ```text
-AuthError -> HecOutcome
-BodyError -> HecOutcome
-DecodeError -> HecOutcome
-ParseError -> HecOutcome
-QueueError -> HecOutcome
-SinkError + SinkCommitState -> HecOutcome
+AuthError -> HecResponse
+BodyError -> HecResponse
+DecodeError -> HecResponse
+ParseError -> HecResponse
+QueueError -> HecResponse
+SinkError + SinkCommitState -> HecResponse
 ```
+
+Target spelling is `HecResponse` in code and documentation. Any remaining `HecOutcome` reference is historical wording to remove, not a type to copy.
 
 Example policy:
 
@@ -493,6 +517,15 @@ Example policy:
 | sink unavailable before acceptance | `server_busy()` | `sink_unavailable` | `error` |
 
 Every mapped outcome has a central reason, HEC response mapping, counter effect, and submitted fact name/fields. The route code should not independently update stats and logs for the same fact.
+
+Error-handling prompt guardrail:
+
+```text
+For every new failure path, name the internal error, public HEC response,
+operation Outcome, report fact, allowed fields, counter effect, severity,
+and validation test. Do not let the Reporter infer HEC behavior, peer data,
+protocol codes, or counter reasons from generic context.
+```
 
 ### 8.6 Central Definitions And Call Sites
 
@@ -724,6 +757,14 @@ Initial library choices and adapter syntax:
 
 The product call site remains `report.submit(...)`; output adapters are internal Reporter implementation.
 
+Current implementation state:
+
+- `RuntimeConfig.observe` carries level, format, redaction mode/text, and output booleans.
+- `main.rs` initializes `tracing-subscriber` after configuration load and before socket bind.
+- `AppState` constructs `Reporter` from configured output booleans.
+- `Reporter` routes each submitted fact to enabled tracing, console, and stats outputs according to registry defaults and runtime output toggles.
+- `ReportContext` currently carries only a request id; route aliases, endpoint kind, HEC code, HTTP status, byte lengths, and elapsed duration are explicit submitted fields.
+
 Example translation for `auth::TOKEN_INVALID`:
 
 ```text
@@ -740,7 +781,7 @@ registry lookup:
 
 Reporter fan-out:
   tracing: event target="hec.auth" level=WARN name="hec.auth.token_invalid" hec_code=4 auth_scheme="Splunk"
-  console: "WARN hec.auth token_invalid request=<id> peer=<addr> code=4"
+  console: "WARN hec.auth.token_invalid phase=ingress component=auth step=authorize request=<id> fields={...}"
   stats: increment requests_rejected_total with reason=invalid_token
   ledger: no row unless benchmark/security ledger output enabled
 ```
@@ -804,13 +845,35 @@ field::input_offset(offset)
 `ReportContext` should be explicit, not nebulous. Initial request context fields:
 
 - `request_id`;
-- `peer_addr`;
-- `method`;
-- `route_alias`;
-- `endpoint_kind`;
-- `started_at`;
-- `token_id` or token hash later, never raw token;
-- worker/thread id later if it becomes measurable and useful.
+- optional domain/adapter fields explicitly submitted by HEC/HTTP code, such as route alias or endpoint kind;
+- token id or token hash later, never raw token;
+- worker/thread id later only if a subsystem measures and submits it.
+
+Do not let generic Reporter code look up network-specific fields such as peer address, method, endpoint kind, route alias, host, or path. If an output needs those values, the HTTP/HEC adapter submits them as typed fields.
+
+`Instant` decision:
+
+- use `std::time::Instant` for local elapsed-time measurement because it is monotonic and not affected by wall-clock jumps;
+- do not store `Instant` in `ReportContext`, persisted records, ledgers, or public output;
+- submit elapsed durations as typed fields, such as `field::elapsed_us(started.elapsed())`, only from the subsystem that measured the interval;
+- use wall-clock timestamps only for logs/ledgers that need event time, and obtain them at the Reporter/output layer or as an explicit submitted field;
+- apply this consistently to request handling, body read/decode, parser timing, sink timing, startup steps, and benchmarks.
+
+Instant pros:
+
+- correct for elapsed latency and timeout measurement because it is monotonic;
+- cheap and local;
+- immune to NTP, manual clock changes, daylight savings, and wall-clock jumps;
+- expresses "how long did this step take" without implying event time.
+
+Instant cons:
+
+- not serializable in a meaningful way;
+- not comparable across processes, restarts, hosts, or benchmark runs;
+- not suitable for event timestamps, file timestamps, ledger timestamps, or protocol time;
+- easy to misuse if hidden inside generic context and later rendered as if it were wall time.
+
+Universal rule: store `Instant` only in the measuring scope, convert to `Duration` at the boundary, and submit/output an explicit unit-bearing field such as `elapsed_us`. Use wall-clock time only for "when did this happen" records.
 
 Phase, component, step, default severity, default outputs, and default field policy should be attached to the domain fact constant, not repeated at every call site:
 
@@ -834,6 +897,19 @@ Call sites should be easy to audit:
 - avoid direct counter updates when the submitted fact already has a counter effect;
 - do not call `tracing::info!`, `println!`, `eprintln!`, or benchmark writers directly for product-significant facts.
 
+Prompt guardrail for future design and implementation:
+
+```text
+Design generic reporting infrastructure with no built-in knowledge of HTTP, HEC,
+auth, peer addresses, endpoints, paths, request timing, protocol codes, or counters.
+For every proposed Reporter API, mark each symbol as one of:
+generic reporting, HEC domain, HTTP adapter, stats subsystem, output backend.
+Reject the design if generic reporting references symbols outside its layer.
+Domain modules pass all domain/context fields explicitly.
+Reporter filters, redacts, serializes, routes, and dispatches only from submitted
+fields and registered output bindings.
+```
+
 ### 9.7 Implementation Direction
 
 Likely implementation steps:
@@ -844,6 +920,16 @@ Likely implementation steps:
 4. Add Reporter output adapters for `tracing`, console, stats counters, command/status output, and benchmark ledger.
 5. Add runtime-configured source filters, output toggles, and redaction.
 6. Add tests for redaction, output fan-out, disabled diagnostics, output routing, typed fields, and outcome-to-HEC-response mapping.
+
+Cross-cutting infrastructure review rule:
+
+```text
+Before implementing a new component, write its boundary in the same vocabulary:
+config knobs, internal errors, public response if any, operation Outcome,
+report facts, typed fields, counter effects, redaction behavior, validation
+cases, and benchmark/ledger fields if timing or throughput is claimed.
+Then implement the smallest code path that exercises those definitions.
+```
 
 ### 9.8 Health And Readiness
 
@@ -995,7 +1081,7 @@ Boundary contract:
 Request phase contract:
 
 ```text
-route alias -> endpoint kind -> auth -> bounded body -> optional decode -> endpoint parse/framing -> EventBatch -> sink/queue -> HecOutcome
+route alias -> endpoint kind -> auth -> bounded body -> optional decode -> endpoint parse/framing -> EventBatch -> sink/queue -> HecResponse
 ```
 
 `InfraHEC.md` should not duplicate crate-source findings, kernel details, copy/buffer analysis, or accept-loop research. Those remain in `Stack.md`.
@@ -1248,6 +1334,7 @@ The implementation can proceed in phases without defining every production detai
 - Done: implement `--config`, `--show-config`, `--check-config`.
 - Done: add validation and redacted config output.
 - Done: add config precedence tests.
+- Done: add observe/reporting config for tracing, console, stats, format, level/filter, and redaction text/mode.
 
 Implemented configuration state:
 
@@ -1256,6 +1343,7 @@ Implemented configuration state:
 - `--show-config` prints redacted effective TOML;
 - `--check-config` runs the same validation path without starting the receiver;
 - validation covers token, bind address, byte/event limits, duration bounds, gzip buffer range, and environment parse failures.
+- observation config covers tracing/console/stats toggles, compact/json tracing format, filter syntax, and configurable redaction text.
 
 Relevant files:
 
@@ -1269,7 +1357,10 @@ Validation evidence saved under `/Users/walter/Work/Spank/HECpoc/results/`:
 
 - `test-list-20260504T021751Z.txt` — 34 tests listed;
 - `test-output-20260504T021751Z.txt` — 34 tests passed;
+- `test-output-20260504T232623Z.txt` — 40 tests passed after observe/reporting config and `HecResponse` alignment;
+- `test-output-20260504T232708Z.txt` — 40 tests passed after warning cleanup;
 - `check-config-20260504T021804Z.log` — `--check-config` output;
+- `check-config-20260504T232708Z.log` — warning-free `--check-config` output after observe/reporting config;
 - `show-config-20260504T021804Z.log` — redacted `--show-config` output;
 - `startup-20260504T021804Z.log` — startup status output;
 - `bench-ab-single-20260504T021828Z.txt` — local `ab -n 1000 -c 1` smoke output;
@@ -1280,17 +1371,20 @@ Smoke results are not capacity claims. They only prove the receiver starts, acce
 
 ### Phase 2 — Reporting, Error, And Outcome Spine
 
-- Add `report.rs` with `Reporter`, output routing, redaction, filters, and backend/rendering adapters.
-- Add `ReportContext`, `FactId`, `FactSpec`, `FieldSpec`, `FieldValue`, `Phase`, `Component`, `Step`, `Outcome`, and `Severity`.
-- Keep fact constants in owning modules for startup, config, request arrival, auth, body/gzip, parser, queue, sink, shutdown, and selected performance records.
+- Done initial: add `report.rs` with `Reporter`, `ReportContext`, `FactId`, `FactSpec`, typed `FieldValue`, `Outcome`, `Severity`, output routing, and stats/tracing/console adapters.
+- Done initial: route existing request counters through Reporter-owned stats sink rather than direct handler counter writes.
+- Done initial: add fact registry and typed fields for request, auth, body, parser, and sink paths.
+- Done initial: apply `Instant` rule by keeping `Instant` local to request handling and submitting `elapsed_us` to Reporter.
+- Done initial: rename the concrete client-visible response type to `HecResponse`.
+- Done initial: wire runtime observe config into `tracing-subscriber`, `Reporter` output toggles, and redacted effective config output.
+- Continue: move fact constants closer to owning modules once module boundaries are stable.
 - Add controlled dynamic diagnostic support for investigation-specific records that still use source, phase, component, severity, redaction, and output routing.
 - Avoid a generic `messages.rs` dumping ground. Add `public_text.rs`, `render.rs`, or `output.rs` only if public text and command-output rendering need a separate home after report/outcome types exist.
-- Tighten `outcome.rs` constructors; prefer `HecResponse` naming for client-visible protocol responses when code is next refactored.
-- Add `error.rs` classes for config/startup/request/sink.
-- Route handler early returns through central outcome mapping and `Reporter::submit(...)`.
-- Add outcome serialization and mapping tests.
-- Add fact submission, redaction, counter-effect, routing, fan-out, console output, and disabled-diagnostic tests.
-- Add runtime-configured reporting source filters and compact/json/console backend output.
+- Continue: remove stale `HecOutcome` wording from historical notes when those files are edited for other reasons.
+- Continue: add `error.rs` classes for config/startup/request/sink beyond current `HecError`.
+- Continue: add outcome serialization and mapping tests.
+- Continue: add redaction, routing, fan-out, console output, and output-rendering tests beyond current stats and disabled-diagnostic tests.
+- Continue: add per-source/component filters after the initial global observe filter proves insufficient.
 
 ### Phase 3 — Raw Framing And Hostile Input
 
@@ -1328,6 +1422,7 @@ The first infrastructure phase is accepted when:
 - config validation fails before bind;
 - `--show-config` redacts secrets;
 - `--check-config` uses the same validation path;
+- observe/logging/reporting output toggles are configured by defaults, TOML, CLI, and env;
 - handlers no longer scatter HEC response text/code;
 - product-significant call sites use domain-owned fact constants and `Reporter::submit(...)` rather than direct backend logging calls;
 - rejected and failed outcomes are represented as `Outcome` values, not separate messaging APIs;

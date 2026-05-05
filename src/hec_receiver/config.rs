@@ -4,10 +4,10 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
 
-use super::{app::Limits, protocol::Protocol};
+use super::{app::Limits, protocol::Protocol, report::ReportOutputs};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:18088";
 const DEFAULT_TOKEN: &str = "dev-token";
@@ -31,6 +31,17 @@ const ENV_MAX_EVENTS: &str = "HEC_MAX_EVENTS";
 const ENV_IDLE_TIMEOUT: &str = "HEC_IDLE_TIMEOUT";
 const ENV_TOTAL_TIMEOUT: &str = "HEC_TOTAL_TIMEOUT";
 const ENV_GZIP_BUFFER_BYTES: &str = "HEC_GZIP_BUFFER_BYTES";
+const ENV_OBSERVE_LEVEL: &str = "HEC_OBSERVE_LEVEL";
+const ENV_OBSERVE_FORMAT: &str = "HEC_OBSERVE_FORMAT";
+const ENV_OBSERVE_REDACTION_MODE: &str = "HEC_OBSERVE_REDACTION_MODE";
+const ENV_OBSERVE_REDACTION_TEXT: &str = "HEC_OBSERVE_REDACTION_TEXT";
+const ENV_OBSERVE_TRACING: &str = "HEC_OBSERVE_TRACING";
+const ENV_OBSERVE_CONSOLE: &str = "HEC_OBSERVE_CONSOLE";
+const ENV_OBSERVE_STATS: &str = "HEC_OBSERVE_STATS";
+const DEFAULT_OBSERVE_LEVEL: &str = "info";
+const DEFAULT_OBSERVE_FORMAT: &str = "compact";
+const DEFAULT_REDACTION_MODE: &str = "redact";
+const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
 
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
@@ -39,6 +50,58 @@ pub struct RuntimeConfig {
     pub capture_path: Option<String>,
     pub limits: Limits,
     pub protocol: Protocol,
+    pub observe: ObserveConfig,
+}
+
+#[derive(Debug, Clone)]
+pub struct ObserveConfig {
+    pub level: String,
+    pub format: ObserveFormat,
+    pub redaction_mode: RedactionMode,
+    pub redaction_text: String,
+    pub tracing: bool,
+    pub console: bool,
+    pub stats: bool,
+}
+
+impl ObserveConfig {
+    pub(crate) fn report_outputs(&self) -> ReportOutputs {
+        ReportOutputs {
+            tracing: self.tracing,
+            console: self.console,
+            stats: self.stats,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ObserveFormat {
+    Compact,
+    Json,
+}
+
+impl ObserveFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Compact => "compact",
+            Self::Json => "json",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedactionMode {
+    Redact,
+    Passthrough,
+}
+
+impl RedactionMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Redact => "redact",
+            Self::Passthrough => "passthrough",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +203,27 @@ pub struct Cli {
 
     #[arg(long)]
     pub protocol_health: Option<u16>,
+
+    #[arg(long)]
+    pub observe_level: Option<String>,
+
+    #[arg(long)]
+    pub observe_format: Option<String>,
+
+    #[arg(long)]
+    pub observe_redaction_mode: Option<String>,
+
+    #[arg(long)]
+    pub observe_redaction_text: Option<String>,
+
+    #[arg(long)]
+    pub observe_tracing: Option<bool>,
+
+    #[arg(long)]
+    pub observe_console: Option<bool>,
+
+    #[arg(long)]
+    pub observe_stats: Option<bool>,
 }
 
 impl RuntimeConfig {
@@ -170,7 +254,8 @@ impl RuntimeConfig {
 
     pub fn redacted_toml(&self) -> Result<String, ConfigError> {
         Ok(toml::to_string_pretty(&ConfigDoc::from_runtime(
-            self, true,
+            self,
+            self.observe.redaction_mode == RedactionMode::Redact,
         ))?)
     }
 }
@@ -221,6 +306,16 @@ impl Cli {
                 health: self.protocol_health,
             })
             .filter(has_protocol_values),
+            observe: Some(ObserveDoc {
+                level: self.observe_level.clone(),
+                format: self.observe_format.clone(),
+                redaction_mode: self.observe_redaction_mode.clone(),
+                redaction_text: self.observe_redaction_text.clone(),
+                tracing: self.observe_tracing,
+                console: self.observe_console,
+                stats: self.observe_stats,
+            })
+            .filter(has_observe_values),
         }
     }
 }
@@ -234,6 +329,8 @@ struct ConfigDoc {
     limits: Option<LimitsDoc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     protocol: Option<ProtocolDoc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observe: Option<ObserveDoc>,
 }
 
 impl ConfigDoc {
@@ -253,6 +350,15 @@ impl ConfigDoc {
                 gzip_buffer_bytes: Some(DEFAULT_GZIP_BUFFER_BYTES),
             }),
             protocol: Some(ProtocolDoc::defaults()),
+            observe: Some(ObserveDoc {
+                level: Some(DEFAULT_OBSERVE_LEVEL.to_string()),
+                format: Some(DEFAULT_OBSERVE_FORMAT.to_string()),
+                redaction_mode: Some(DEFAULT_REDACTION_MODE.to_string()),
+                redaction_text: Some(DEFAULT_REDACTION_TEXT.to_string()),
+                tracing: Some(true),
+                console: Some(false),
+                stats: Some(true),
+            }),
         }
     }
 
@@ -302,6 +408,16 @@ impl ConfigDoc {
                 health: env_parse("HEC_HEALTH", "protocol.health")?,
             })
             .filter(has_protocol_values),
+            observe: Some(ObserveDoc {
+                level: env_string(ENV_OBSERVE_LEVEL),
+                format: env_string(ENV_OBSERVE_FORMAT),
+                redaction_mode: env_string(ENV_OBSERVE_REDACTION_MODE),
+                redaction_text: env_string(ENV_OBSERVE_REDACTION_TEXT),
+                tracing: env_parse(ENV_OBSERVE_TRACING, "observe.tracing")?,
+                console: env_parse(ENV_OBSERVE_CONSOLE, "observe.console")?,
+                stats: env_parse(ENV_OBSERVE_STATS, "observe.stats")?,
+            })
+            .filter(has_observe_values),
         })
     }
 
@@ -310,7 +426,7 @@ impl ConfigDoc {
             hec: Some(HecDoc {
                 addr: Some(config.addr.to_string()),
                 token: Some(if redact {
-                    "<redacted>".to_string()
+                    config.observe.redaction_text.clone()
                 } else {
                     config.token.clone()
                 }),
@@ -329,6 +445,7 @@ impl ConfigDoc {
                 gzip_buffer_bytes: Some(config.limits.gzip_buffer_bytes),
             }),
             protocol: Some(ProtocolDoc::from_protocol(&config.protocol)),
+            observe: Some(ObserveDoc::from_observe(&config.observe)),
         }
     }
 
@@ -336,6 +453,7 @@ impl ConfigDoc {
         let hec = self.hec.unwrap_or_default();
         let limits = self.limits.unwrap_or_default();
         let protocol = self.protocol.unwrap_or_default();
+        let observe = self.observe.unwrap_or_default();
 
         let addr_text = required(hec.addr, "hec.addr")?;
         let addr = addr_text
@@ -394,6 +512,7 @@ impl ConfigDoc {
                 "must be between 512 and 1048576 bytes",
             );
         }
+        let observe = observe.to_observe()?;
 
         Ok(RuntimeConfig {
             addr,
@@ -409,6 +528,7 @@ impl ConfigDoc {
                 gzip_buffer_bytes,
             },
             protocol: protocol.to_protocol(),
+            observe,
         })
     }
 }
@@ -466,6 +586,74 @@ struct ProtocolDoc {
     handling_indexed_fields: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     health: Option<u16>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserveDoc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    format: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tracing: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    console: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stats: Option<bool>,
+}
+
+impl ObserveDoc {
+    fn from_observe(observe: &ObserveConfig) -> Self {
+        Self {
+            level: Some(observe.level.clone()),
+            format: Some(observe.format.as_str().to_string()),
+            redaction_mode: Some(observe.redaction_mode.as_str().to_string()),
+            redaction_text: Some(observe.redaction_text.clone()),
+            tracing: Some(observe.tracing),
+            console: Some(observe.console),
+            stats: Some(observe.stats),
+        }
+    }
+
+    fn to_observe(self) -> Result<ObserveConfig, ConfigError> {
+        let level = required(self.level, "observe.level")?;
+        validate_observe_level(&level)?;
+        let format = match required(self.format, "observe.format")?.as_str() {
+            "compact" => ObserveFormat::Compact,
+            "json" => ObserveFormat::Json,
+            _ => return invalid("observe.format", "must be one of: compact, json"),
+        };
+        let redaction_mode = match required(self.redaction_mode, "observe.redaction_mode")?.as_str()
+        {
+            "redact" => RedactionMode::Redact,
+            "passthrough" => RedactionMode::Passthrough,
+            _ => {
+                return invalid(
+                    "observe.redaction_mode",
+                    "must be one of: redact, passthrough",
+                );
+            }
+        };
+        let redaction_text = required(self.redaction_text, "observe.redaction_text")?;
+        if redaction_text.is_empty() {
+            return invalid("observe.redaction_text", "cannot be empty");
+        }
+
+        Ok(ObserveConfig {
+            level,
+            format,
+            redaction_mode,
+            redaction_text,
+            tracing: required(self.tracing, "observe.tracing")?,
+            console: required(self.console, "observe.console")?,
+            stats: required(self.stats, "observe.stats")?,
+        })
+    }
 }
 
 impl ProtocolDoc {
@@ -545,6 +733,16 @@ fn has_protocol_values(value: &ProtocolDoc) -> bool {
         || value.health.is_some()
 }
 
+fn has_observe_values(value: &ObserveDoc) -> bool {
+    value.level.is_some()
+        || value.format.is_some()
+        || value.redaction_mode.is_some()
+        || value.redaction_text.is_some()
+        || value.tracing.is_some()
+        || value.console.is_some()
+        || value.stats.is_some()
+}
+
 fn required<T>(value: Option<T>, field: &'static str) -> Result<T, ConfigError> {
     value.ok_or_else(|| ConfigError::Invalid {
         field,
@@ -574,6 +772,18 @@ fn validate_token(token: &str) -> Result<(), ConfigError> {
         return invalid("hec.token", "token cannot contain ASCII control characters");
     }
     Ok(())
+}
+
+fn validate_observe_level(level: &str) -> Result<(), ConfigError> {
+    if level.trim().is_empty() {
+        return invalid("observe.level", "cannot be empty");
+    }
+    tracing_subscriber::filter::Targets::from_str(level)
+        .map(|_| ())
+        .map_err(|error| ConfigError::Invalid {
+            field: "observe.level",
+            message: error.to_string(),
+        })
 }
 
 fn env_string(name: &str) -> Option<String> {
@@ -618,6 +828,13 @@ mod tests {
         "HEC_IDLE_TIMEOUT",
         "HEC_TOTAL_TIMEOUT",
         "HEC_GZIP_BUFFER_BYTES",
+        "HEC_OBSERVE_LEVEL",
+        "HEC_OBSERVE_FORMAT",
+        "HEC_OBSERVE_REDACTION_MODE",
+        "HEC_OBSERVE_REDACTION_TEXT",
+        "HEC_OBSERVE_TRACING",
+        "HEC_OBSERVE_CONSOLE",
+        "HEC_OBSERVE_STATS",
         "HEC_SUCCESS",
         "HEC_TOKEN_REQUIRED",
         "HEC_INVALID_AUTHORIZATION",
@@ -652,6 +869,15 @@ gzip_buffer_bytes = 4096
 [protocol]
 token_required = 202
 invalid_token = 204
+
+[observe]
+level = "hec_receiver=debug"
+format = "json"
+redaction_mode = "redact"
+redaction_text = "[hidden]"
+tracing = true
+console = true
+stats = true
 "#,
         );
 
@@ -677,6 +903,12 @@ invalid_token = 204
         assert_eq!(config.limits.gzip_buffer_bytes, 4096);
         assert_eq!(config.protocol.token_required, 202);
         assert_eq!(config.protocol.invalid_token, 204);
+        assert_eq!(config.observe.level, "hec_receiver=debug");
+        assert_eq!(config.observe.format, super::ObserveFormat::Json);
+        assert_eq!(config.observe.redaction_text, "[hidden]");
+        assert!(config.observe.tracing);
+        assert!(config.observe.console);
+        assert!(config.observe.stats);
     }
 
     #[test]
@@ -696,6 +928,7 @@ max_events = 10
         );
         env::set_var("HEC_TOKEN", "env-token");
         env::set_var("HEC_MAX_EVENTS", "30");
+        env::set_var("HEC_OBSERVE_CONSOLE", "true");
 
         let loaded = RuntimeConfig::load_with_cli(Cli {
             config: Some(config_path),
@@ -710,6 +943,7 @@ max_events = 10
         assert_eq!(loaded.config.token, "env-token");
         assert_eq!(loaded.config.limits.max_content_length, 1000);
         assert_eq!(loaded.config.limits.max_events_per_request, 30);
+        assert!(loaded.config.observe.console);
     }
 
     #[test]
@@ -752,6 +986,37 @@ token = "env-file-token"
         let rendered = loaded.config.redacted_toml().expect("render config");
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("secret-token"));
+    }
+
+    #[test]
+    fn show_config_uses_configured_redaction_text() {
+        let _guard = env_guard();
+        let loaded = RuntimeConfig::load_with_cli(Cli {
+            show_config: true,
+            token: Some("secret-token".to_string()),
+            observe_redaction_text: Some("[secret]".to_string()),
+            ..Cli::default()
+        })
+        .expect("load config");
+
+        let rendered = loaded.config.redacted_toml().expect("render config");
+        assert!(rendered.contains("[secret]"));
+        assert!(!rendered.contains("secret-token"));
+    }
+
+    #[test]
+    fn show_config_can_explicitly_pass_through_secret_values() {
+        let _guard = env_guard();
+        let loaded = RuntimeConfig::load_with_cli(Cli {
+            show_config: true,
+            token: Some("secret-token".to_string()),
+            observe_redaction_mode: Some("passthrough".to_string()),
+            ..Cli::default()
+        })
+        .expect("load config");
+
+        let rendered = loaded.config.redacted_toml().expect("render config");
+        assert!(rendered.contains("secret-token"));
     }
 
     #[test]

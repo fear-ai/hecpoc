@@ -24,60 +24,60 @@ pub enum HecError {
 }
 
 impl HecError {
-    pub fn outcome(self, protocol: &Protocol) -> HecOutcome {
+    pub fn outcome(self, protocol: &Protocol) -> HecResponse {
         match self {
-            Self::TokenRequired => HecOutcome::new(
+            Self::TokenRequired => HecResponse::new(
                 StatusCode::UNAUTHORIZED,
                 "Token is required",
                 protocol.token_required,
             ),
-            Self::InvalidAuthorization => HecOutcome::new(
+            Self::InvalidAuthorization => HecResponse::new(
                 StatusCode::UNAUTHORIZED,
                 "Invalid authorization",
                 protocol.invalid_authorization,
             ),
-            Self::InvalidToken => HecOutcome::new(
+            Self::InvalidToken => HecResponse::new(
                 StatusCode::FORBIDDEN,
                 "Invalid token",
                 protocol.invalid_token,
             ),
-            Self::NoData => HecOutcome::new(StatusCode::BAD_REQUEST, "No data", protocol.no_data),
-            Self::InvalidDataFormat => HecOutcome::new(
+            Self::NoData => HecResponse::new(StatusCode::BAD_REQUEST, "No data", protocol.no_data),
+            Self::InvalidDataFormat => HecResponse::new(
                 StatusCode::BAD_REQUEST,
                 "Invalid data format",
                 protocol.invalid_data_format,
             ),
-            Self::ServerBusy => HecOutcome::new(
+            Self::ServerBusy => HecResponse::new(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Server is busy",
                 protocol.server_busy,
             ),
-            Self::EventFieldRequired => HecOutcome::new(
+            Self::EventFieldRequired => HecResponse::new(
                 StatusCode::BAD_REQUEST,
                 "Event field is required",
                 protocol.event_field_required,
             ),
-            Self::EventFieldBlank => HecOutcome::new(
+            Self::EventFieldBlank => HecResponse::new(
                 StatusCode::BAD_REQUEST,
                 "Event field cannot be blank",
                 protocol.event_field_blank,
             ),
-            Self::HandlingIndexedFields => HecOutcome::new(
+            Self::HandlingIndexedFields => HecResponse::new(
                 StatusCode::BAD_REQUEST,
                 "Error in handling indexed fields",
                 protocol.handling_indexed_fields,
             ),
-            Self::UnsupportedEncoding => HecOutcome::new(
+            Self::UnsupportedEncoding => HecResponse::new(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 "Invalid data format",
                 protocol.invalid_data_format,
             ),
-            Self::BodyTooLarge => HecOutcome::new(
+            Self::BodyTooLarge => HecResponse::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Request entity too large",
                 protocol.invalid_data_format,
             ),
-            Self::Timeout => HecOutcome::new(
+            Self::Timeout => HecResponse::new(
                 StatusCode::REQUEST_TIMEOUT,
                 "Server is busy",
                 protocol.server_busy,
@@ -87,7 +87,7 @@ impl HecError {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct HecOutcome {
+pub struct HecResponse {
     #[serde(skip)]
     pub status: StatusCode,
     pub text: &'static str,
@@ -101,7 +101,7 @@ pub struct HecOutcome {
     pub invalid_event_number: Option<usize>,
 }
 
-impl HecOutcome {
+impl HecResponse {
     pub fn new(status: StatusCode, text: &'static str, code: u16) -> Self {
         Self {
             status,
@@ -122,7 +122,7 @@ impl HecOutcome {
     }
 }
 
-impl IntoResponse for HecOutcome {
+impl IntoResponse for HecResponse {
     fn into_response(self) -> Response {
         let status = self.status;
         (status, Json(self)).into_response()

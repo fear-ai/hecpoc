@@ -375,18 +375,19 @@ Initial behavior:
 
 Avoid generic `ConcurrencyLimitLayer` or `LoadShedLayer` initially because they reject at a generic service level. HEC needs queue-aware responses, and queue capacity is part of the HEC health story.
 
-## 14. Request Outcomes
+## 14. Request Responses
 
-Define HEC outcomes in one place.
+Define HEC client-visible responses in one place. Use `Outcome` separately for operation disposition such as accepted, rejected, failed, skipped, throttled, or recovered.
 
-Initial outcome fields:
+Initial response fields:
 
 ```rust
-struct HecOutcome {
+struct HecResponse {
     status: StatusCode,
     text: &'static str,
     code: u16,
-    metadata: Option<HecOutcomeMetadata>,
+    ack_id: Option<u64>,
+    invalid_event_number: Option<usize>,
 }
 ```
 
@@ -769,7 +770,11 @@ These decisions belong in tests once answered. The Stack decision is only useful
 
 The infrastructure target for configuration is `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §7`. This section remains as an HTTP-stack ledger for which knobs affect ingress, body handling, buffering, and overload behavior.
 
-Current implementation still loads configuration in this order: compiled defaults, optional TOML file from `HEC_CONFIG`, then environment overrides. The target implementation replaces that with the `InfraHEC.md §7.2` source chain: defaults, TOML, CLI, then environment.
+Current implementation loads configuration through the `InfraHEC.md §7.2` source chain:
+
+```text
+compiled defaults < TOML file < command line < environment
+```
 
 ### 25.1 Externally Configurable Parameters
 
@@ -785,6 +790,13 @@ Current implementation still loads configuration in this order: compiled default
 | Idle body timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `5s` | Maximum time waiting for a body frame. |
 | Total body timeout | `limits.total_timeout` | `HEC_TOTAL_TIMEOUT` | `30s` | Maximum wall time to read the request body. |
 | Gzip buffer bytes | `limits.gzip_buffer_bytes` | `HEC_GZIP_BUFFER_BYTES` | `8_192` | Scratch buffer used while decoding gzip. |
+| Observe level/filter | `observe.level` | `HEC_OBSERVE_LEVEL` | `info` | Global tracing-subscriber filter expression for the current implementation. |
+| Observe format | `observe.format` | `HEC_OBSERVE_FORMAT` | `compact` | Tracing output format: `compact` or `json`. |
+| Redaction mode | `observe.redaction_mode` | `HEC_OBSERVE_REDACTION_MODE` | `redact` | Redact secrets by default; `passthrough` is explicit debugging override. |
+| Redaction text | `observe.redaction_text` | `HEC_OBSERVE_REDACTION_TEXT` | `<redacted>` | Replacement text for redacted values in effective config and later output adapters. |
+| Tracing output | `observe.tracing` | `HEC_OBSERVE_TRACING` | `true` | Enables tracing backend output from Reporter fan-out. |
+| Console output | `observe.console` | `HEC_OBSERVE_CONSOLE` | `false` | Enables direct console backend output from Reporter fan-out. |
+| Stats output | `observe.stats` | `HEC_OBSERVE_STATS` | `true` | Enables stats counter effects from Reporter fan-out. |
 | Success code | `protocol.success` | `HEC_SUCCESS` | `0` | HEC success response code. |
 | Token required code | `protocol.token_required` | `HEC_TOKEN_REQUIRED` | `2` | Missing auth token. |
 | Invalid authorization code | `protocol.invalid_authorization` | `HEC_INVALID_AUTHORIZATION` | `3` | Malformed authorization header. |
@@ -816,6 +828,54 @@ Current implementation still loads configuration in this order: compiled default
 | Listener backlog | OS/Tokio bind default path | Current code uses `TcpListener::bind`, not `TcpSocket::listen(backlog)`. | Add explicit `HEC_LISTEN_BACKLOG`. |
 | Socket receive/send buffers | OS default | Current code does not construct sockets through `socket2` or `TcpSocket`. | Add `HEC_TCP_RECV_BUFFER`, `HEC_TCP_SEND_BUFFER`. |
 | Keepalive/nodelay/reuseport | OS/default library behavior | Current code does not own per-socket tuning. | Add booleans/options once manual listener setup exists. |
+
+### 25.4 Per-Component Observation Filters
+
+Current implementation has one configured `observe.level` filter applied to `tracing-subscriber`, and Reporter emits fact metadata fields: `phase`, `component`, `step`, `fact`, `request_id`, and typed payload fields. That is enough for compact and JSON output and for post-processing, but not yet enough for efficient runtime per-component filtering.
+
+Why fields alone are insufficient:
+
+- `tracing-subscriber`'s common `EnvFilter` path filters naturally by target/module and level.
+- Filtering by arbitrary dynamic fields such as `component="auth"` generally requires a custom `Layer` or post-processing.
+- If every event uses target `hec_receiver`, `observe.level = "hec_receiver=debug"` can raise or lower the whole receiver, but not only auth/body/parser/sink.
+
+Preferred next implementation:
+
+```toml
+[observe.sources]
+hec.auth = "debug"
+hec.body = "info"
+hec.parser = "warn"
+hec.sink = "debug"
+```
+
+Reporter maps the fact registry's component to a tracing target:
+
+| Fact component | Tracing target | Example directive |
+| --- | --- | --- |
+| `Component::Hec` | `hec.receiver` | `hec.receiver=info` |
+| `Component::Auth` | `hec.auth` | `hec.auth=debug` |
+| `Component::Body` | `hec.body` | `hec.body=info` |
+| `Component::Parser` | `hec.parser` | `hec.parser=warn` |
+| `Component::Sink` | `hec.sink` | `hec.sink=debug` |
+
+This preserves the intended distinction: component/source is not "the message subsystem"; it is the origin of the reported fact. The Reporter remains the output pipeline, while `Component` and `Step` remain fact metadata owned by the processing design.
+
+Filter examples:
+
+```sh
+HEC_OBSERVE_LEVEL='info,hec.auth=debug,hec.sink=debug'
+HEC_OBSERVE_LEVEL='warn,hec.body=trace'
+HEC_OBSERVE_LEVEL='hec.receiver=info,hec.parser=debug'
+```
+
+Fallback if target-level filtering proves too coarse:
+
+- keep target-level source filtering for the hot path;
+- add a Reporter-side runtime filter table keyed by `(phase, component, step, fact)` for console, stats, benchmark ledger, and future custom outputs;
+- add custom `tracing_subscriber::Layer` field filtering only if real use cases need field-level routing inside tracing itself.
+
+Do not create separate call-site APIs such as `auth_log`, `tcp_log`, or `queue_log`. Product call sites continue to submit facts once; filtering, redaction, and routing remain Reporter/backend behavior.
 
 ## 26. Socket and Load Observation Script
 
@@ -893,7 +953,7 @@ Local validation data remains primary for ingest behavior:
 6. bounded gzip decode when requested;
 7. event/raw parse;
 8. sink submit;
-9. stats update and HEC outcome response.
+9. stats update and HEC response.
 
 ### 28.2 Tokio Accept Path
 
@@ -1464,7 +1524,7 @@ SourceContext
 EventBatch
 EventSink
 SinkCommit
-HecOutcome
+HecResponse
 ```
 
 Do not create separate handlers, parser types, sink paths, or metrics labels for each alias unless testing alias behavior itself. Route alias is metadata; endpoint kind is behavior.

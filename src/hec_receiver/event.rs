@@ -21,6 +21,15 @@ pub enum Endpoint {
     Raw,
 }
 
+impl Endpoint {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Raw => "raw",
+        }
+    }
+}
+
 impl Event {
     pub fn from_raw_line(raw: String, endpoint: Endpoint) -> Self {
         let raw_bytes_len = raw.len();
