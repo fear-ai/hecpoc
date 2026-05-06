@@ -31,8 +31,12 @@ impl Endpoint {
 }
 
 impl Event {
+    #[allow(dead_code)]
     pub fn from_raw_line(raw: String, endpoint: Endpoint) -> Self {
-        let raw_bytes_len = raw.len();
+        Self::from_raw_line_with_len(raw.len(), raw, endpoint)
+    }
+
+    pub fn from_raw_line_with_len(raw_bytes_len: usize, raw: String, endpoint: Endpoint) -> Self {
         Self {
             raw,
             raw_bytes_len,

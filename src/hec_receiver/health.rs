@@ -19,6 +19,12 @@ impl HealthState {
             .map(|phase| *phase)
             .unwrap_or(Phase::Stopping)
     }
+
+    pub fn set_phase(&self, phase: Phase) {
+        if let Ok(mut current) = self.phase.write() {
+            *current = phase;
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

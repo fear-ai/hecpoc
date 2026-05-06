@@ -64,7 +64,7 @@ fn init_tracing(observe: &ObserveConfig) {
     }
 
     let filter =
-        EnvFilter::try_new(&observe.level).unwrap_or_else(|_| EnvFilter::new("hec_receiver=info"));
+        EnvFilter::try_new(&observe.level).unwrap_or_else(|_| EnvFilter::new("hec.receiver=info"));
     let result = match observe.format {
         ObserveFormat::Compact => tracing_subscriber::fmt()
             .with_env_filter(filter)

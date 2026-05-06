@@ -94,6 +94,7 @@ Examples:
 - Raw line splitting does not decide tokenization/search semantics.
 - Gzip decode reports decode facts and limits; HEC outcome mapping decides client response.
 - Sink commit state reports what happened; response policy decides whether success means queued, captured, flushed, or durable.
+- Tokio provides socket/runtime primitives; Axum currently owns the server accept loop; Hyper owns HTTP parsing. Detailed accept/read mechanics remain in `Stack.md`, not in generic infrastructure.
 
 ---
 
@@ -1107,7 +1108,8 @@ Interface rules:
 - Direct capture is acceptable for fixture mode.
 - Bounded queue is required before advertising backpressure behavior beyond request/body rejection.
 - Inspection starts from capture evidence, not from a search/index abstraction.
-- Durable storage and ACK wait until `durable` has a real implementation and tests.
+- ACK is request/batch scoped and must name its selected commit boundary. `enqueue` is acceptable for explicit benchmark mode; production ACK should wait for `durable` or a similarly tested DB/file commit boundary.
+- Durable storage and production ACK wait until `durable` has a real implementation and tests.
 
 Detailed file format, buffering, sink backpressure, and future store mechanics belong in `Stack.md §§33, 35` or a future focused store document.
 
@@ -1267,8 +1269,15 @@ Run metadata:
 - bytes/sec;
 - events/sec;
 - latency percentiles;
-- error counts;
-- host observation snapshots when available.
+- error counts split by auth, body-read, body-size, timeout, gzip, parse, sink, and queue classes;
+- process CPU, RSS, virtual size, thread count, descriptor count, and elapsed time samples;
+- system CPU/load, VM, network socket, and IO snapshots when available.
+
+Current scripts:
+
+- `/Users/walter/Work/Spank/HECpoc/scripts/bench_hec_ab.sh` runs repeatable AB stages with HEC stats snapshots.
+- `/Users/walter/Work/Spank/HECpoc/scripts/capture_system_stats.sh` samples process and host statistics during long runs.
+- `/Users/walter/Work/Spank/HECpoc/scripts/analyze_bench_run.py` derives request/sec, MiB/sec, event/sec, and failure summaries from a result directory.
 
 Ledger format:
 

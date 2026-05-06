@@ -465,10 +465,10 @@ Keep these design hooks:
 - reject missing channel when ACK is enabled;
 - validate channel format when ACK mode requires it;
 - reserve response metadata for `ackId`;
-- define a commit boundary before implementing ACK;
-- keep sink result capable of returning committed IDs or failure.
+- define a request/batch commit boundary before implementing ACK;
+- keep sink result capable of returning committed request/batch IDs or failure.
 
-Do not fake ACK durability. Returning `ackId` before a defined local commit boundary is worse than not supporting ACK.
+Do not fake ACK durability. Returning `ackId` before a defined local commit boundary is worse than not supporting ACK, except in an explicitly labeled benchmark mode such as ACK-on-enqueue.
 
 ## 19. Observability and Secret Handling
 
@@ -831,15 +831,15 @@ compiled defaults < TOML file < command line < environment
 
 ### 25.4 Per-Component Observation Filters
 
-Current implementation has one configured `observe.level` filter applied to `tracing-subscriber`, and Reporter emits fact metadata fields: `phase`, `component`, `step`, `fact`, `request_id`, and typed payload fields. That is enough for compact and JSON output and for post-processing, but not yet enough for efficient runtime per-component filtering.
+Current implementation has one configured `observe.level` filter applied to `tracing-subscriber`. Reporter emits fact metadata fields: `phase`, `component`, `step`, `fact`, `request_id`, and typed payload fields. Reporter also maps each `Component` to a fixed tracing target, so runtime per-component filtering is available through `observe.level` expressions.
 
 Why fields alone are insufficient:
 
 - `tracing-subscriber`'s common `EnvFilter` path filters naturally by target/module and level.
 - Filtering by arbitrary dynamic fields such as `component="auth"` generally requires a custom `Layer` or post-processing.
-- If every event uses target `hec_receiver`, `observe.level = "hec_receiver=debug"` can raise or lower the whole receiver, but not only auth/body/parser/sink.
+- If every event uses one target, a filter can raise or lower the whole receiver, but not only auth/body/parser/sink.
 
-Preferred next implementation:
+Convenience TOML still to add:
 
 ```toml
 [observe.sources]
@@ -849,7 +849,7 @@ hec.parser = "warn"
 hec.sink = "debug"
 ```
 
-Reporter maps the fact registry's component to a tracing target:
+Implemented Reporter target map:
 
 | Fact component | Tracing target | Example directive |
 | --- | --- | --- |
@@ -868,6 +868,8 @@ HEC_OBSERVE_LEVEL='info,hec.auth=debug,hec.sink=debug'
 HEC_OBSERVE_LEVEL='warn,hec.body=trace'
 HEC_OBSERVE_LEVEL='hec.receiver=info,hec.parser=debug'
 ```
+
+Implementation note: `tracing` macro callsites require literal targets, so the current code branches by `Component` and emits with literal targets such as `target: "hec.auth"` rather than passing a dynamic string.
 
 Fallback if target-level filtering proves too coarse:
 
@@ -942,6 +944,35 @@ Local validation data remains primary for ingest behavior:
 ### 28.1 Current HEC Receiver
 
 `/Users/walter/Work/Spank/HECpoc/src/main.rs` currently binds with `tokio::net::TcpListener::bind(addr).await?` and then calls `axum::serve(listener, app)`. That means the application does not own the explicit accept loop today. It owns HEC request phases after Axum/Hyper have accepted a connection and produced a request.
+
+Layer ownership today:
+
+```text
+Tokio runtime threads
+  -> Tokio TcpListener bind
+  -> Axum serve loop
+  -> Tokio async accept
+  -> Hyper HTTP parse/read
+  -> Axum route match
+  -> HEC handler auth/body/parse/sink
+```
+
+The apparent "Tokio then Axum then Tokio" layering is real but not circular. Tokio provides the async socket primitive. Axum owns the server loop, calls `listener.accept().await`, connects each accepted stream to Hyper, and routes parsed HTTP requests to handlers. Tokio still performs the actual readiness-based accept under that Axum-owned loop.
+
+Without Axum, HECpoc would need to own this glue:
+
+```rust
+loop {
+    let (stream, peer) = listener.accept().await?;
+    tokio::spawn(async move {
+        // serve Hyper on stream
+        // route HTTP path/method
+        // convert request/response bodies
+    });
+}
+```
+
+That fallback is useful later, but the current Axum layer avoids hand-written HTTP serving while protocol-critical HEC behavior remains in our handler code.
 
 `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` owns the application receive pipeline:
 
@@ -1547,3 +1578,289 @@ HEC parser -> bounded EventBatch -> queue -> sink worker -> capture/hot bucket -
 ```
 
 That is the bridge from current correctness-focused receiver to later high-throughput parsing and indexing.
+
+---
+
+## 39. HTTP Limits, Header Handling, And Timeout Policy
+
+This section records the current Axum/Hyper boundary and what must move into our own accept loop later.
+
+### 39.1 Axum 404 Challenge
+
+`axum::serve` routes only registered paths through our handlers. Unknown routes are answered by Axum's fallback behavior, not by `HecResponse`. That means today an incorrect `/services/collector/...` path can return a framework-shaped `404` with no HEC code, no HEC JSON body, and no HEC-specific metric.
+
+Incorrect HEC paths are paths that look like Splunk HEC traffic but do not match the registered route set. Examples:
+
+- `/services/collector/rawx`
+- `/services/collector/ack`
+- `/services/collector/event/2.0`
+- `/services/collector/foo`
+- `/services/collector/raw/extra`
+
+Decision for now: keep Axum default `404` until Splunk verification shows whether incorrect HEC paths should produce HEC JSON or only HTTP status. If compatibility or observability requires it, add an explicit fallback route under `/services/collector/*path` that returns a controlled response and records an incorrect-path counter.
+
+### 39.2 Axum And Hyper Limits Compared With Current HEC Limits
+
+Current HECpoc request body policy is implemented inside the HEC handler:
+
+| Layer | Current method | Current/default value | Why it exists |
+|-------|----------------|-----------------------|---------------|
+| Advertised body | `Content-Length` parse and cap | `HEC_MAX_BYTES=1_048_576` | reject before reading known oversized bodies |
+| Wire body | bounded accumulation while polling body frames | `HEC_MAX_BYTES=1_048_576` | stop unknown-length/chunked bodies from growing unbounded |
+| Decoded body | identity/gzip decoded cap | `HEC_MAX_DECODED_BYTES=4_194_304` | stop gzip expansion attacks |
+| Event count | parser count cap | `HEC_MAX_EVENTS=100_000` | stop tiny-event amplification |
+| Body idle timeout | timeout around each body frame | `HEC_IDLE_TIMEOUT=5s` | stop stalled body senders |
+| Body total timeout | timeout around full body read | `HEC_TOTAL_TIMEOUT=30s` | stop indefinitely slow large requests |
+
+Axum's `serve` is intentionally simple and does not expose connection/server configuration knobs. Hyper direct HTTP/1 serving exposes useful controls such as `max_headers`, `header_read_timeout`, `max_buf_size`, `keep_alive`, and malformed-header behavior. Tower HTTP's `RequestBodyLimitLayer` can generate `413` before a handler runs when `Content-Length` is too large, and can wrap unknown-length bodies with a limiting body.
+
+Recommendation: keep HEC-owned body limits for now. They produce HEC-shaped JSON outcomes, distinguish advertised/wire/decoded limits, and keep gzip policy explicit. Do not replace them with generic Tower body limits until Splunk status/code mapping is decided. Move to owned Hyper/hyper-util serving when header timeout, header count, socket backlog, peer accounting, or connection culling become P0 requirements.
+
+### 39.3 Timeout Classes
+
+Several timeouts are needed because they defend against different failures and attacks:
+
+| Timeout | Current status | Failure mode | Suggested default posture |
+|---------|----------------|--------------|----------------------------|
+| TCP accept visibility/culling | not owned | connection flood, peer accounting blind spot | future owned accept loop; no current HEC config |
+| Header read timeout | not configurable through current Axum path | slowloris before handler starts | future Hyper direct; start from `30s` or Apache-style `20-40s` with min-rate equivalent if implemented |
+| Header count/size bound | not configurable through current Axum path | header memory pressure or parser rejection before HEC metrics | future Hyper direct; expose max headers and max header bytes/list size |
+| Body idle timeout | implemented | client stalls between chunks/frames | keep `5s` for local PoC; tune after slow-client tests |
+| Body total timeout | implemented | slow upload occupies worker/memory too long | keep `30s`; require larger configured value for huge accepted bodies |
+| Minimum body rate | not implemented | attacker sends just under idle timeout forever | add after body tests; Apache `MinRate` pattern is the model |
+| Request processing timeout | not implemented as one wrapper | parser/sink hang after full body | add around parse+sink when sink queue exists |
+| Enqueue timeout | not implemented | bounded queue near full, brief backpressure may recover | add with queue policy; default probably very small or zero for HEC retryability |
+| Sink write/flush timeout | not implemented | filesystem or DB stalls after acceptance | add with sink worker and commit-state policy |
+| Keep-alive idle timeout | not configured in app | idle connection slot retention | future Hyper direct or front proxy setting |
+| Graceful shutdown timeout | partially conceptual | process never exits due to in-flight work | add with lifecycle/shutdown design |
+
+Vendor patterns support separating these: Apache `mod_reqtimeout` distinguishes handshake/header/body and supports minimum data rate; its documented default is `header=20-40,MinRate=500 body=20,MinRate=500`. Hyper's HTTP/1 builder has a default header read timeout of 30 seconds when configured with a timer. HAProxy distinguishes HTTP request timeout, keep-alive timeout, client/server inactivity, connect, queue, and tunnel classes.
+
+Current timeout behavior by request stage:
+
+| Input state | Reaches HEC handler? | Current timeout owner | Current result |
+|-------------|----------------------|-----------------------|----------------|
+| partial TCP connection, no complete HTTP headers | no | Axum/Hyper/default socket behavior; no HEC-configured header timeout | may remain open until peer/proxy/OS/framework closes; no HEC JSON or counter |
+| complete headers, declared body, body never arrives | yes | HEC body idle timeout and total timeout | `408` with HEC code `9` after `5s` idle or `30s` total |
+| complete headers, chunked body stalls between chunks | yes | HEC body idle timeout and total timeout | `408` with HEC code `9` |
+| complete headers, slow drip under idle timeout | yes | HEC body total timeout only | `408` with HEC code `9` after `30s`; future min-rate should catch this earlier or more explicitly |
+| complete headers, no body and no `Content-Length` | yes | body stream ends normally | parser returns no-data `400/code5` |
+| complete headers, `Content-Length: 0` | yes | body stream ends normally | parser returns no-data `400/code5` |
+
+This is why a future owned Hyper/hyper-util accept path matters: it is the first point where HECpoc can make partial-header timeouts, header count/size, and per-connection accounting visible as configured behavior rather than framework/OS side effects.
+
+### 39.4 Header Parsing And Rejection Stages
+
+Some invalid requests never reach our HEC code:
+
+| Condition | Likely rejection owner today | HEC visibility today | Test stage |
+|-----------|------------------------------|----------------------|------------|
+| invalid request line | Hyper HTTP parser | no HEC response/counter | raw socket test later |
+| malformed header without colon | Hyper HTTP parser unless direct builder allows ignoring | no HEC response/counter | raw socket test later |
+| too many headers | Hyper HTTP parser/default limit | likely `431`, no HEC counter | direct Hyper/Axum socket test |
+| huge header bytes | Hyper buffer/header limits | no HEC counter | direct Hyper/Axum socket test |
+| non-text `Authorization` value that reaches handler | HEC auth parser | `401/code3` | unit test exists |
+| non-text `Content-Encoding` value that reaches handler | HEC body parser | `415/code6` current | add handler test |
+| duplicate headers | HTTP layer stores header map semantics; HEC code currently reads effective values | unclear | staged malicious-input test |
+| conflicting `Content-Length`/chunked | Hyper parser/body machinery | likely before HEC handler or body error | raw socket test later |
+
+Stage 1 tests should stay at handler level for values that can be represented by `Request::builder()`. Stage 2 should use `curl` and `nc`/small Python sockets against the running server for malformed wire input. Stage 3 should wait for owned Hyper accept loop if we need exact header timeout, max header, and malformed-header policy.
+
+### 39.5 Own Accept Loop Task
+
+Add a future implementation task: replace `axum::serve(listener, app)` with owned listener construction and per-connection serving when one of these becomes required:
+
+1. connection current/max counters;
+2. peer/IP admission and culling;
+3. configured listen backlog or socket receive buffer;
+4. configured Hyper `http1::Builder` values;
+5. header read timeout or max header count tests;
+6. deterministic shutdown/drain behavior beyond Axum's simple serving path.
+
+The likely route is `tokio::net::TcpSocket` for bind/listen/socket knobs, `hyper-util` for per-connection serving, and the existing Axum `Router` converted into a service. This should be a contained adapter change; HEC auth/body/parse/outcome code should not move.
+
+## 40. Index, ACK, Axum/Hyper Status, And Timeout Proposal
+
+This section records the protocol-facing decisions prompted by Splunk compatibility checks, shipper behavior, and the current code boundary.
+
+### 40.1 Splunk Index Policy
+
+Splunk treats `index` as event metadata, not as ordinary event text. The HEC event envelope can carry `time`, `host`, `source`, `sourcetype`, `index`, and `fields`; token configuration can also supply defaults and index restrictions. Splunk's current HEC status table assigns code `7` to `400 Incorrect index`, which means an HEC-compatible receiver needs an explicit policy before it can honestly emit code `7`.
+
+Practical policy for HECpoc:
+
+| Case | Initial behavior | Future compatibility behavior |
+|------|------------------|-------------------------------|
+| no `index` supplied | keep `event.index = None`; sink/store may apply a configured default later | per-token default index if configured; otherwise receiver default such as `main` only if product policy wants Splunk-like defaulting |
+| `index` supplied and no allow-list configured | accept and preserve the exact value | same, unless product mode requires strict known-index validation |
+| `index` supplied and allow-list configured | not implemented yet | accept only if exact/canonical index is allowed for the token; reject unknown/empty/disallowed values with `400/code7` |
+| index naming syntax | not validated yet | add conservative syntax and length bounds only after local Splunk verification; do not invent stricter names than Splunk unless explicitly running in Spank-strict mode |
+| physical storage routing | not tied to `index` yet | keep logical `index` separate from bucket/file layout; use it for metadata pruning and later sealed-bucket indexing, not as a mandatory ingest-time database split |
+
+External references:
+
+- [Splunk HEC troubleshooting codes](https://help.splunk.com/?resourceId=SplunkCloud_Data_TroubleshootHTTPEventCollector) define `7 Incorrect index`, `23 Server is shutting down`, and queue/ACK capacity codes.
+- [Splunk HEC event formatting](https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector) describes event envelope metadata and stacked event-object batching.
+- [Splunk Cloud HEC token management](https://docs.splunk.com/Documentation/SplunkCloud/latest/Config/ManageHECtokens) exposes token `allowedIndexes` and default-index configuration.
+- [Cribl Splunk HEC Source](https://docs-criblgov.build.cribl.io/edge/4.11/sources-splunk-hec/) exposes `Allowed Indexes` and documents invalid-index behavior in its HEC-compatible source.
+
+Implementation status:
+
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/event.rs` stores `index: Option<String>`.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_event.rs` parses event-envelope `index` but does not validate it.
+- Code `7` is not yet represented in `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` or `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs`.
+
+### 40.2 Shippers, Vendors, And What They Exercise
+
+Vendor behavior suggests what matters first: metadata preservation, stacked JSON objects, compression, retry/backpressure, ACK, and clear handling of invalid tokens/indexes.
+
+| Project/vendor | Useful signal | Local/reference anchor | Implication for HECpoc |
+|----------------|---------------|------------------------|-------------------------|
+| Vector sink | stable HEC logs sink, batches requests, supports HEC indexer ACK, sends `host/index/source/sourcetype`, and serializes HEC event envelopes as concatenated JSON objects rather than a JSON array | `/Users/walter/Work/Spank/sOSS/vector/src/sinks/splunk_hec/logs/encoder.rs`; [Vector `splunk_hec_logs`](https://vector.dev/docs/reference/configuration/sinks/splunk_hec_logs/) | test stacked objects, metadata fields, gzip, ACK-disabled server behavior, retries, and batch sizing |
+| Vector source | implements a Splunk HEC-compatible receiver with ACK channel limits, missing-channel checks, and ACK status polling | `/Users/walter/Work/Spank/sOSS/vector/src/sources/splunk_hec/mod.rs`; `/Users/walter/Work/Spank/sOSS/vector/src/sources/splunk_hec/acknowledgements.rs` | compare ACK semantics and capacity behavior, but do not copy its limited HEC status-code set blindly |
+| Fluent Bit | common lightweight log shipper; supports Splunk token, gzip, channel header, raw mode, and metadata such as host/source/sourcetype/index | [Fluent Bit Splunk output](https://docs.fluentbit.io/manual/pipeline/outputs/splunk) | test raw/event mode, gzip, metadata keys, response buffer behavior, and retry under 5xx/429 |
+| Cribl | HEC-compatible source with allowed-index policy, active request limit, invalid URL/path notes, and operational troubleshooting examples | [Cribl Splunk HEC Source](https://docs-criblgov.build.cribl.io/edge/4.11/sources-splunk-hec/) | test invalid index, active request saturation, trailing-slash/unknown-path behavior, and debug observability |
+| Splunk local install | normative behavioral oracle for undocumented edge cases | `/Users/walter/Work/Spank/HECpoc/scripts/verify_splunk_hec.sh` | verify actual status/body for raw blanks, malformed JSON, arrays, unsupported encoding, ACK disabled, health, and unknown path |
+
+The next test harness should therefore distinguish:
+
+1. Splunk-compatible behavior required by official docs.
+2. Shipper-compatibility behavior required by common senders.
+3. Spank-strict behavior chosen for safety, replayability, or performance.
+
+### 40.3 ACK Specification And Design Status
+
+Splunk HEC indexer acknowledgment is a request-level confirmation protocol layered on HEC. Official Splunk docs say ordinary successful HEC receipt returns before the event enters the full processing pipeline; ACK-enabled tokens instead return an `ackID`, and the client polls `/services/collector/ack` with the same channel to learn whether the request reached the indexed/replicated boundary Splunk defines.
+
+ACK granularity for HECpoc should be request/batch scoped, not event/row/line scoped. If one HTTP request contains 500 raw lines or 500 stacked JSON objects, the response should contain at most one `ackId` for that submitted request. Internally the ACK may depend on all events in the request reaching the selected commit boundary.
+
+Minimum compatible semantics:
+
+| Topic | Splunk behavior to emulate | HECpoc status |
+|-------|----------------------------|---------------|
+| token scope | ACK is enabled per token | no token metadata beyond valid token strings |
+| channel required | ACK-enabled requests must include `X-Splunk-Request-Channel` or `?channel=` | channel currently ignored |
+| missing channel | `400/code10 Data channel is missing` when ACK requires it | not implemented |
+| invalid channel | `400/code11 Invalid data channel` for bad channel state/format | not implemented |
+| ACK disabled | `/services/collector/ack` returns `400/code14 ACK is disabled` when ACK is unavailable | not implemented |
+| ACK response | ingest response includes `ackId` when ACK is active | response type has optional `ackId`; no producer |
+| ACK polling | `/services/collector/ack` returns object mapping requested IDs to booleans | no route |
+| capacity | queue/ACK warning and hard capacity use codes `24`-`27` in current Splunk docs | no queue or ACK capacity model |
+| expiration | Splunk caches ACK state in memory, deletes after true status is consumed, and has idle cleanup/limits | no ACK store |
+
+Design decision: ACK remains postponed until a commit boundary exists. A fake production `ackId` after in-memory parse would be worse than unsupported ACK because it would teach shippers that data reached a stronger durability state than it did.
+
+Configurable ACK boundary is acceptable if the mode name makes the guarantee obvious:
+
+| Boundary | Intended use | Meaning | Production posture |
+|----------|--------------|---------|--------------------|
+| `enqueue` | benchmark/load testing | request batch entered bounded in-memory queue | allowed only when explicitly configured; not a durability claim |
+| `write` | local capture and fixture testing | sink write returned | useful but still not crash-durable |
+| `flush` | stronger file capture | userspace writer flush returned | still not necessarily durable to media |
+| `fsync` / `db_commit` | production durability baseline | file fsync or database commit completed | first honest production ACK boundary |
+| `indexed` | future search-ready mode | durable write plus indexing/search-prep completion | later, after local store/index semantics exist |
+
+Suggested config name: `ack.boundary` or `ack.commit_level`. The code should not call every mode "indexer acknowledgment" without reporting the selected boundary in startup config, logs, stats, and validation output.
+
+ACK registry shape:
+
+```text
+AckRegistry
+  channels: channel_id -> ChannelState
+  limits: max_channels, max_pending_total, max_pending_per_channel
+  cleanup: idle_channel_ttl, consumed_ack_removal
+
+ChannelState
+  next_ack_id
+  pending: ack_id -> AckStatus
+  last_used_at
+
+AckStatus
+  Pending | Delivered | Failed | Expired
+```
+
+The registry backs two paths: ingest assigns an `ackId` to the request/batch and records pending state; `/services/collector/ack` looks up requested IDs by channel and returns their boolean/status view according to the Splunk-compatible response shape.
+
+First honest ACK design milestone:
+
+1. Define sink commit states: accepted, enqueued, written, flushed, fsynced, indexed.
+2. Select which commit state ACK means in HECpoc mode.
+3. Add per-token ACK flag and channel registry.
+4. Add bounded ACK status storage and idle cleanup.
+5. Add `/services/collector/ack` and status tests.
+6. Verify against Splunk and Vector ACK tests.
+
+Useful external and local references:
+
+- [Splunk HEC Indexer Acknowledgment](https://help.splunk.com/en/splunk-enterprise/get-started/get-data-in/9.0/get-data-with-http-event-collector/about-http-event-collector-indexer-acknowledgment) defines per-token enablement, channels, ACK polling, memory limits, and client polling/retry guidance.
+- `/Users/walter/Work/Spank/sOSS/vector/src/sources/splunk_hec/acknowledgements.rs` uses channel maps, per-channel pending limits, global pending limits, and idle cleanup.
+- `/Users/walter/Work/Spank/sOSS/vector/src/sources/splunk_hec/mod.rs` tests ACK success, repeat ACK query false-after-consumed behavior, missing channel, and channel-capacity failure.
+
+### 40.4 Health Code 23 Status
+
+Code `23` is now implemented at the handler phase boundary:
+
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` defines `server_shutting_down = 23`.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs` maps `HecError::ServerShuttingDown` to `503` and text `Server is shutting down`.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` maps `Phase::Stopping` to code `23` for health and new ingest requests.
+
+Remaining validation: a real-server graceful-shutdown test must prove that new requests receive `503/code23` while already accepted requests are drained to the chosen sink boundary.
+
+### 40.5 Axum And Hyper 404/Parser Checks
+
+Current code uses `tokio::net::TcpListener::bind` and `axum::serve(listener, app)`. That keeps the initial receiver compact and testable, but some responses are owned by Axum/Hyper before HEC code sees them.
+
+| Condition | Current likely owner | Expected status shape | What to verify |
+|-----------|----------------------|-----------------------|----------------|
+| unknown route | Axum fallback | framework `404`, probably no HEC JSON | compare local Splunk unknown path; decide whether to add explicit `/services/collector/*path` fallback |
+| wrong method on known route | Axum method router | likely `405 Method Not Allowed` with framework body/headers | curl `GET/PUT` against event/raw; decide whether Splunk-compatible HEC JSON matters |
+| bad request line | Hyper HTTP/1 parser | HTTP parser rejection, no HEC counter | raw socket malformed request |
+| bad header syntax | Hyper HTTP/1 parser | parser rejection before handler | raw socket malformed header |
+| too many headers | Hyper HTTP/1 parser/builder defaults | likely `431` or connection error depending path | direct Hyper test once max header policy matters |
+| huge headers | Hyper HTTP/1 read buffer/header handling | parser rejection or connection close | owned Hyper builder or raw socket test |
+| malformed body frame/chunk | Hyper body machinery or HEC body reader | body error converted to code `6` only if it reaches handler | chunked-transfer malformed input test |
+
+Do not overfit code until the local Splunk verification script records exact bodies and statuses. If incorrect URLs need Splunk-style metrics, add a narrow Axum fallback for `/services/collector/*path`; do not replace the whole stack just to own 404.
+
+### 40.6 Timeout Proposal
+
+Timeouts must be separated by failure mode. One global request timeout will either fail valid large uploads or let slowloris/slow-body attacks camp on resources.
+
+Recommended configuration set:
+
+| Setting | Proposed default | Current support | Justification |
+|---------|------------------|-----------------|---------------|
+| `http.header_read_timeout` | `30s` | future owned Hyper/hyper-util | matches Hyper's documented HTTP/1 builder default when timer is configured; compatible with slow clients but bounded |
+| `http.keepalive_idle_timeout` | `30s` | future owned Hyper/hyper-util or front proxy | bounds idle connection slots; short enough for ingest clients that reconnect/retry |
+| `http.max_headers` | `100` | future owned Hyper/hyper-util | keeps header memory bounded; revisit after Splunk/shipper tests |
+| `http.max_header_bytes` | `64 KiB` | future owned Hyper/hyper-util or custom read path | enough for normal auth/channel/proxy headers; rejects header-bloat DoS |
+| `body.idle_timeout` | `5s` | implemented as `limits.body_idle_timeout` | catches stalled chunks and dead clients without waiting for total timeout |
+| `body.total_timeout` | `30s` | implemented as `limits.body_total_timeout` | with current `1 MiB` cap, implies effective minimum throughput about `34 KiB/s` |
+| `body.min_rate` | disabled initially; future `32 KiB/s` after first `5s` grace | not implemented | catches clients that drip just under idle timeout; needs careful tests to avoid punishing WAN/proxy jitter |
+| `parse.total_timeout` | `5s` | not implemented | bounds CPU parse work after full body; useful once parser complexity grows |
+| `enqueue.timeout` | `0-50ms` depending queue policy | not implemented | HEC senders generally retry; prolonged admission waiting hides overload |
+| `sink.write_timeout` | `5s` for direct file; TBD for DB | not implemented | prevents sink stalls from holding request tasks forever |
+| `shutdown.grace_timeout` | `10s` PoC default | not implemented | supports code `23` while draining accepted work |
+
+Arithmetic checks:
+
+- Current max wire body is `1,048,576` bytes. With `30s` total timeout, the effective request-completion rate floor is `34,953 B/s`, about `34 KiB/s`, even without a separate min-rate check.
+- If `max_bytes` is raised to `30 MiB` while total timeout remains `30s`, the expected sender must sustain about `1 MiB/s`. The config validator should warn when `max_bytes / total_timeout` exceeds the intended low-end shipper throughput.
+- If total timeout is removed and only a `5s` idle timeout remains, an attacker can send one byte every `4.9s` forever. That is why idle and total timeouts are both required.
+- If body min-rate is set to `32 KiB/s`, a `30 MiB` body needs at least about `960s`; therefore min-rate cannot replace total timeout. It is a floor for slow-drip defense, not a transfer-size planner.
+
+Validation stages:
+
+1. Handler tests: body idle timeout, body total timeout, advertised oversize, wire oversize, gzip expansion oversize.
+2. Running-server curl tests: normal upload, `--max-time`, gzip, chunked transfer, unsupported encoding, wrong method, unknown path.
+3. Raw socket tests: slow header, malformed header, conflicting `Content-Length`, malformed chunk, connection close mid-body.
+4. Load tools: `oha`, `wrk`, `ab`, and Vector/Fluent Bit senders for single stream, many connections, gzip, retry, and 429/503 response handling.
+5. Malicious-input tools: `slowhttptest` for slowloris/slow body; custom Python sockets for exact malformed HTTP cases; large generated JSON/gzip bombs for memory limits.
+
+Implementation sequence:
+
+1. Keep current handler-owned body timeouts and limits.
+2. Add tests for current timeout and oversize outcomes.
+3. Add config fields for future header/keepalive limits but mark them inactive while using `axum::serve`.
+4. Move to owned `TcpSocket` + `hyper-util` accept loop only when connection/header metrics or parser controls become blocking.
+5. Add min-rate only after the raw socket harness can prove behavior under slow drip, proxy jitter, and normal shipper batching.

@@ -21,6 +21,7 @@ pub enum HecError {
     UnsupportedEncoding,
     BodyTooLarge,
     Timeout,
+    ServerShuttingDown,
 }
 
 impl HecError {
@@ -81,6 +82,11 @@ impl HecError {
                 StatusCode::REQUEST_TIMEOUT,
                 "Server is busy",
                 protocol.server_busy,
+            ),
+            Self::ServerShuttingDown => HecResponse::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Server is shutting down",
+                protocol.server_shutting_down,
             ),
         }
     }

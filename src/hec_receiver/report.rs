@@ -174,6 +174,7 @@ pub mod field {
     pub const ELAPSED_US: FieldId = FieldId::new("elapsed_us");
     pub const ENDPOINT_KIND: FieldId = FieldId::new("endpoint_kind");
     pub const ROUTE_ALIAS: FieldId = FieldId::new("route_alias");
+    pub const FAILURE_REASON: FieldId = FieldId::new("failure_reason");
     pub const INPUT_CLASS: FieldId = FieldId::new("input_class");
     pub const INPUT_OFFSET: FieldId = FieldId::new("input_offset");
 
@@ -248,6 +249,10 @@ pub mod field {
             id: ROUTE_ALIAS,
             value: FieldValue::String(value),
         }
+    }
+
+    pub fn failure_reason(value: &'static str) -> Field {
+        str_field(FAILURE_REASON, value)
     }
 
     #[allow(dead_code)]
@@ -424,52 +429,63 @@ impl Reporter {
 
     fn emit_tracing(&self, ctx: &ReportContext, spec: &FactSpec, fields: &[Field]) {
         let fields_json = fields_json(fields).to_string();
-        match spec.severity {
-            Severity::Trace => tracing::trace!(
-                target: "hec_receiver",
-                fact = spec.name,
-                phase = spec.phase.as_str(),
-                component = spec.component.as_str(),
-                step = spec.step.as_str(),
-                request_id = ctx.request_id(),
-                fields = %fields_json
-            ),
-            Severity::Debug => tracing::debug!(
-                target: "hec_receiver",
-                fact = spec.name,
-                phase = spec.phase.as_str(),
-                component = spec.component.as_str(),
-                step = spec.step.as_str(),
-                request_id = ctx.request_id(),
-                fields = %fields_json
-            ),
-            Severity::Info => tracing::info!(
-                target: "hec_receiver",
-                fact = spec.name,
-                phase = spec.phase.as_str(),
-                component = spec.component.as_str(),
-                step = spec.step.as_str(),
-                request_id = ctx.request_id(),
-                fields = %fields_json
-            ),
-            Severity::Warn => tracing::warn!(
-                target: "hec_receiver",
-                fact = spec.name,
-                phase = spec.phase.as_str(),
-                component = spec.component.as_str(),
-                step = spec.step.as_str(),
-                request_id = ctx.request_id(),
-                fields = %fields_json
-            ),
-            Severity::Error => tracing::error!(
-                target: "hec_receiver",
-                fact = spec.name,
-                phase = spec.phase.as_str(),
-                component = spec.component.as_str(),
-                step = spec.step.as_str(),
-                request_id = ctx.request_id(),
-                fields = %fields_json
-            ),
+        macro_rules! emit_for_target {
+            ($target:literal) => {
+                match spec.severity {
+                    Severity::Trace => tracing::trace!(
+                        target: $target,
+                        fact = spec.name,
+                        phase = spec.phase.as_str(),
+                        component = spec.component.as_str(),
+                        step = spec.step.as_str(),
+                        request_id = ctx.request_id(),
+                        fields = %fields_json
+                    ),
+                    Severity::Debug => tracing::debug!(
+                        target: $target,
+                        fact = spec.name,
+                        phase = spec.phase.as_str(),
+                        component = spec.component.as_str(),
+                        step = spec.step.as_str(),
+                        request_id = ctx.request_id(),
+                        fields = %fields_json
+                    ),
+                    Severity::Info => tracing::info!(
+                        target: $target,
+                        fact = spec.name,
+                        phase = spec.phase.as_str(),
+                        component = spec.component.as_str(),
+                        step = spec.step.as_str(),
+                        request_id = ctx.request_id(),
+                        fields = %fields_json
+                    ),
+                    Severity::Warn => tracing::warn!(
+                        target: $target,
+                        fact = spec.name,
+                        phase = spec.phase.as_str(),
+                        component = spec.component.as_str(),
+                        step = spec.step.as_str(),
+                        request_id = ctx.request_id(),
+                        fields = %fields_json
+                    ),
+                    Severity::Error => tracing::error!(
+                        target: $target,
+                        fact = spec.name,
+                        phase = spec.phase.as_str(),
+                        component = spec.component.as_str(),
+                        step = spec.step.as_str(),
+                        request_id = ctx.request_id(),
+                        fields = %fields_json
+                    ),
+                }
+            };
+        }
+        match spec.component {
+            Component::Hec => emit_for_target!("hec.receiver"),
+            Component::Auth => emit_for_target!("hec.auth"),
+            Component::Body => emit_for_target!("hec.body"),
+            Component::Parser => emit_for_target!("hec.parser"),
+            Component::Sink => emit_for_target!("hec.sink"),
         }
     }
 
@@ -554,6 +570,7 @@ pub mod facts {
     pub const BODY_TIMEOUT: FactId = FactId(23);
     pub const WIRE_BODY_READ: FactId = FactId(24);
     pub const BODY_DECODED: FactId = FactId(25);
+    pub const BODY_READ_FAILED: FactId = FactId(26);
     pub const PARSE_FAILED: FactId = FactId(30);
     pub const EVENTS_PARSED: FactId = FactId(31);
     pub const SINK_FAILED: FactId = FactId(40);
@@ -586,6 +603,8 @@ const GZIP_REQUEST_COUNTERS: &[CounterBinding] =
 const GZIP_FAILED_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::GzipFailures)];
 const BODY_TOO_LARGE_COUNTERS: &[CounterBinding] =
     &[CounterBinding::Increment(Counter::BodyTooLarge)];
+const BODY_READ_FAILED_COUNTERS: &[CounterBinding] =
+    &[CounterBinding::Increment(Counter::BodyReadErrors)];
 const BODY_TIMEOUT_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::Timeouts)];
 const WIRE_BODY_READ_COUNTERS: &[CounterBinding] = &[CounterBinding::AddField {
     counter: Counter::WireBytes,
@@ -620,6 +639,7 @@ const COMMON_REQUEST_FIELDS: &[FieldId] = &[
     field::ENDPOINT_KIND,
     field::ROUTE_ALIAS,
     field::ELAPSED_US,
+    field::FAILURE_REASON,
 ];
 
 const AUTH_FIELDS: &[FieldId] = &[
@@ -639,6 +659,7 @@ const BODY_FIELDS: &[FieldId] = &[
     field::DECODED_LEN,
     field::INPUT_CLASS,
     field::INPUT_OFFSET,
+    field::FAILURE_REASON,
 ];
 
 const EVENT_FIELDS: &[FieldId] = &[field::EVENT_COUNT, field::OUTCOME];
@@ -758,6 +779,17 @@ static FACTS: &[FactSpec] = &[
         severity: Severity::Warn,
         outputs: LOG_STATS,
         counters: BODY_TIMEOUT_COUNTERS,
+        fields: BODY_FIELDS,
+    },
+    FactSpec {
+        id: facts::BODY_READ_FAILED,
+        name: "hec.body.read_failed",
+        phase: Phase::Ingress,
+        component: Component::Body,
+        step: Step::ReadBody,
+        severity: Severity::Warn,
+        outputs: LOG_STATS,
+        counters: BODY_READ_FAILED_COUNTERS,
         fields: BODY_FIELDS,
     },
     FactSpec {

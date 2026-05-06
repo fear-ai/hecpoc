@@ -120,6 +120,17 @@ mod tests {
     }
 
     #[test]
+    fn parses_flat_scalar_fields() {
+        let body = Bytes::from_static(
+            br#"{"event":"x","fields":{"text":"v","n":7,"flag":true,"none":null}}"#,
+        );
+        let events =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(events[0].fields.is_some());
+    }
+
+    #[test]
     fn rejects_blank_event() {
         let body = Bytes::from_static(br#"{"event":""}"#);
         let outcome =
@@ -130,6 +141,22 @@ mod tests {
     #[test]
     fn rejects_nested_fields() {
         let body = Bytes::from_static(br#"{"event":"x","fields":{"nested":{"x":1}}}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 15);
+    }
+
+    #[test]
+    fn rejects_array_field_values() {
+        let body = Bytes::from_static(br#"{"event":"x","fields":{"roles":["admin"]}}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 15);
+    }
+
+    #[test]
+    fn rejects_fields_that_are_not_an_object() {
+        let body = Bytes::from_static(br#"{"event":"x","fields":["not","object"]}"#);
         let outcome =
             parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
         assert_eq!(outcome.code, 15);
@@ -158,6 +185,33 @@ mod tests {
             parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
         assert_eq!(outcome.code, 6);
         assert_eq!(outcome.invalid_event_number, Some(1));
+    }
+
+    #[test]
+    fn rejects_unclosed_json_object() {
+        let body = Bytes::from_static(br#"{"event":"x""#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 6);
+        assert_eq!(outcome.invalid_event_number, Some(0));
+    }
+
+    #[test]
+    fn rejects_unclosed_json_string() {
+        let body = Bytes::from_static(br#"{"event":"x}"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 6);
+        assert_eq!(outcome.invalid_event_number, Some(0));
+    }
+
+    #[test]
+    fn rejects_json_array_batch() {
+        let body = Bytes::from_static(br#"[{"event":"one"},{"event":"two"}]"#);
+        let outcome =
+            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        assert_eq!(outcome.code, 6);
+        assert_eq!(outcome.invalid_event_number, Some(0));
     }
 
     #[test]

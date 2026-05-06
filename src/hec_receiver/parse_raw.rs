@@ -19,8 +19,13 @@ pub fn parse_raw_body(body: &Bytes, max_events: usize) -> Result<Vec<Event>, Hec
         if line.is_empty() {
             continue;
         }
+        let raw_bytes_len = line.len();
         let raw = String::from_utf8_lossy(line).into_owned();
-        events.push(Event::from_raw_line(raw, Endpoint::Raw));
+        events.push(Event::from_raw_line_with_len(
+            raw_bytes_len,
+            raw,
+            Endpoint::Raw,
+        ));
     }
 
     if events.is_empty() {
@@ -49,9 +54,11 @@ mod tests {
 
     #[test]
     fn lossy_decodes_non_utf8_without_panic() {
-        let body = Bytes::from_static(b"\xff\n");
+        let body = Bytes::from_static(b"\xff\xff\n");
         let events = parse_raw_body(&body, 10).unwrap();
         assert_eq!(events.len(), 1);
+        assert_eq!(events[0].raw_bytes_len, 2);
+        assert!(events[0].raw.len() > events[0].raw_bytes_len);
     }
 
     #[test]

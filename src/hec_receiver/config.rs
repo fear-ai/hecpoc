@@ -38,7 +38,8 @@ const ENV_OBSERVE_REDACTION_TEXT: &str = "HEC_OBSERVE_REDACTION_TEXT";
 const ENV_OBSERVE_TRACING: &str = "HEC_OBSERVE_TRACING";
 const ENV_OBSERVE_CONSOLE: &str = "HEC_OBSERVE_CONSOLE";
 const ENV_OBSERVE_STATS: &str = "HEC_OBSERVE_STATS";
-const DEFAULT_OBSERVE_LEVEL: &str = "info";
+const DEFAULT_OBSERVE_LEVEL: &str =
+    "info,hec.receiver=info,hec.auth=warn,hec.body=warn,hec.parser=warn,hec.sink=warn";
 const DEFAULT_OBSERVE_FORMAT: &str = "compact";
 const DEFAULT_REDACTION_MODE: &str = "redact";
 const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
@@ -202,7 +203,13 @@ pub struct Cli {
     pub protocol_handling_indexed_fields: Option<u16>,
 
     #[arg(long)]
-    pub protocol_health: Option<u16>,
+    pub protocol_health_ok: Option<u16>,
+
+    #[arg(long)]
+    pub protocol_health_unhealthy: Option<u16>,
+
+    #[arg(long)]
+    pub protocol_server_shutting_down: Option<u16>,
 
     #[arg(long)]
     pub observe_level: Option<String>,
@@ -303,7 +310,9 @@ impl Cli {
                 event_field_required: self.protocol_event_field_required,
                 event_field_blank: self.protocol_event_field_blank,
                 handling_indexed_fields: self.protocol_handling_indexed_fields,
-                health: self.protocol_health,
+                health_ok: self.protocol_health_ok,
+                health_unhealthy: self.protocol_health_unhealthy,
+                server_shutting_down: self.protocol_server_shutting_down,
             })
             .filter(has_protocol_values),
             observe: Some(ObserveDoc {
@@ -405,7 +414,12 @@ impl ConfigDoc {
                     "HEC_HANDLING_INDEXED_FIELDS",
                     "protocol.handling_indexed_fields",
                 )?,
-                health: env_parse("HEC_HEALTH", "protocol.health")?,
+                health_ok: env_parse("HEC_HEALTH_OK", "protocol.health_ok")?,
+                health_unhealthy: env_parse("HEC_HEALTH_UNHEALTHY", "protocol.health_unhealthy")?,
+                server_shutting_down: env_parse(
+                    "HEC_SERVER_SHUTTING_DOWN",
+                    "protocol.server_shutting_down",
+                )?,
             })
             .filter(has_protocol_values),
             observe: Some(ObserveDoc {
@@ -585,7 +599,11 @@ struct ProtocolDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     handling_indexed_fields: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    health: Option<u16>,
+    health_ok: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    health_unhealthy: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_shutting_down: Option<u16>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -673,7 +691,9 @@ impl ProtocolDoc {
             event_field_required: Some(protocol.event_field_required),
             event_field_blank: Some(protocol.event_field_blank),
             handling_indexed_fields: Some(protocol.handling_indexed_fields),
-            health: Some(protocol.health),
+            health_ok: Some(protocol.health_ok),
+            health_unhealthy: Some(protocol.health_unhealthy),
+            server_shutting_down: Some(protocol.server_shutting_down),
         }
     }
 
@@ -701,7 +721,13 @@ impl ProtocolDoc {
             handling_indexed_fields: self
                 .handling_indexed_fields
                 .expect("default protocol handling_indexed_fields"),
-            health: self.health.expect("default protocol health"),
+            health_ok: self.health_ok.expect("default protocol health_ok"),
+            health_unhealthy: self
+                .health_unhealthy
+                .expect("default protocol health_unhealthy"),
+            server_shutting_down: self
+                .server_shutting_down
+                .expect("default protocol server_shutting_down"),
         }
     }
 }
@@ -730,7 +756,9 @@ fn has_protocol_values(value: &ProtocolDoc) -> bool {
         || value.event_field_required.is_some()
         || value.event_field_blank.is_some()
         || value.handling_indexed_fields.is_some()
-        || value.health.is_some()
+        || value.health_ok.is_some()
+        || value.health_unhealthy.is_some()
+        || value.server_shutting_down.is_some()
 }
 
 fn has_observe_values(value: &ObserveDoc) -> bool {
@@ -845,7 +873,9 @@ mod tests {
         "HEC_EVENT_FIELD_REQUIRED",
         "HEC_EVENT_FIELD_BLANK",
         "HEC_HANDLING_INDEXED_FIELDS",
-        "HEC_HEALTH",
+        "HEC_HEALTH_OK",
+        "HEC_HEALTH_UNHEALTHY",
+        "HEC_SERVER_SHUTTING_DOWN",
     ];
 
     #[test]
