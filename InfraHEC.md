@@ -1049,7 +1049,8 @@ Initial runtime may use `#[tokio::main]`; production direction is explicit `toki
 Runtime knobs:
 
 - `runtime.worker_threads`;
-- `runtime.max_blocking_threads` later;
+- `runtime.max_blocking_threads` for short blocking operations only;
+- optional `runtime.cpu_worker_threads` or separate CPU runtime size when parse/index work is moved off request tasks;
 - `runtime.thread_stack_size` only if measurement warrants;
 - thread name prefix such as `hec-worker`.
 
@@ -1058,11 +1059,30 @@ Concurrency design:
 ```text
 network concurrency: Tokio/Axum request tasks
 sink concurrency: bounded queue + one or more sink workers
-CPU-heavy parsing/indexing: explicit worker boundary later, not casual tokio::spawn
+CPU-heavy parsing/indexing: batch-sized explicit worker boundary later, not casual tokio::spawn
 blocking filesystem: isolated through sink workers or spawn_blocking/tokio::fs with measurement
 ```
 
+Scheduling policy:
+
+1. Keep network accept, HTTP body reads, auth, health, stats, and timeout handling on the I/O runtime.
+2. Permit bounded gzip/JSON/raw splitting on request tasks only while body limits are small and benchmark evidence shows no I/O starvation.
+3. Move parse, normalize, tokenize, index construction, compression expansion, and durable sink batching behind an explicit CPU or sink boundary when they exceed a measured per-request budget or affect health/latency under load.
+4. Do not use `spawn_blocking` as a generic CPU pool. Tokio documents `spawn_blocking` for blocking operations that finish; many CPU tasks need semaphores or a specialized executor, and started `spawn_blocking` tasks cannot be aborted.
+5. If a separate CPU Tokio runtime is used, size and name it explicitly and keep I/O work on the I/O runtime. DataFusion/InfluxDB experience shows this can work, but only when I/O is deliberately routed away from CPU-heavy pools.
+6. If Rayon or a dedicated pool is used, bridge results through bounded channels or oneshot replies and record queue depth, wait time, and cancellation semantics.
+7. Long-running CPU loops must be batch-granular and cancellation-aware. A loop that never yields or never checks cancellation can starve health, shutdown, and connection handling even when machine CPU utilization looks below saturation.
+
 No shared mutable state unless message passing is worse. Use `Arc` for shared immutable/config/state handles; use locks only for small stats/snapshots until contention is measured.
+
+References used for this policy:
+
+- Andrew Lamb, *Using Tokio for CPU-Bound Tasks (Works Really Well)*, Tokio Conf 2026 slides — DataFusion-style dataflow, batching, separate CPU runtime, and traps around mixed I/O/CPU pools.
+- Tokio docs, `tokio::task::spawn_blocking` — blocking thread pool behavior, large default cap, semaphore/specialized executor warning, and non-abortability.
+- Tokio issue `tokio-rs/tokio#8085` — request for better CPU/I/O prioritization, with production discussion of separate CPU and I/O runtimes.
+- Apache DataFusion issue `apache/datafusion#13692` — documents I/O starvation before visible resource exhaustion and explores moving or wrapping CPU work.
+- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/src/app.rs` — explicit multi-thread runtime builder, configurable worker count, named worker threads.
+- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/lib/vector-buffers/src/lib.rs` — buffer-full policy as a first-class backpressure decision: block, drop, or overflow.
 
 ---
 

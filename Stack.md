@@ -116,7 +116,28 @@ Tokio is kept as infrastructure:
 - `tokio::signal` for graceful shutdown.
 - `tokio::task::JoinSet` for owned task groups once there is more than one background task.
 
-Do not use Tokio as a place to hide CPU work. JSON parsing and gzip decompression happen on the request task initially because the PoC body sizes are bounded. If profiling shows gzip or parse dominating the async worker threads, move that specific function behind `spawn_blocking` or a dedicated worker pool.
+Do not use Tokio as a place to hide CPU work. JSON parsing and gzip decompression happen on the request task initially because the PoC body sizes are bounded. If profiling shows gzip, parse, normalization, tokenization, indexing, or durable write preparation dominating async worker threads, move that specific stage behind an explicit CPU/sink boundary.
+
+Recent Tokio/DataFusion review sharpens the rule:
+
+| Work class | Initial placement | Later placement | Requirement |
+|---|---|---|---|
+| Accept, HTTP parse, body frame read, auth, health, stats | I/O runtime | I/O runtime | must stay responsive under parser and sink load |
+| Small bounded gzip/JSON/raw splitting | request task | CPU runtime or dedicated pool if measured expensive | batch-sized work; no unbounded per-request CPU loops |
+| Parse/normalize/tokenize/index construction | not in first HEC hot path | explicit CPU pool or separate Tokio runtime | bounded input batches, cancellation/checkpoint points, queue depth metrics |
+| File/database durable sink | sink worker | dedicated sink workers; short `spawn_blocking` only for bounded calls | commit boundary and backpressure state visible |
+| Long-lived workers | background task or thread | dedicated task group/thread | not `spawn_blocking` loops |
+
+`spawn_blocking` is not the default answer for CPU-heavy ingest. Tokio's own docs say its blocking pool has a large default cap, needs an explicit semaphore for many CPU computations, and cannot abort already-started tasks. Use it for bounded blocking calls. Use a dedicated pool/runtime when the work is persistent, CPU-saturating, or cancellation-sensitive.
+
+The DataFusion/InfluxDB pattern is relevant but not blindly imported: a separate CPU Tokio runtime can schedule CPU-heavy dataflow streams effectively when work is batched, but I/O must remain on the I/O runtime. Their reported trap was mixing I/O into the CPU pool, causing network work to slow and congestion/backoff to appear even before all visible resources were saturated. Spank must therefore measure health latency, body-read latency, connection progress, and socket/write readiness while CPU workers are loaded.
+
+Vector comparison points:
+
+- Vector builds one named multi-thread Tokio runtime with configurable worker count and a very large blocking-thread cap in `/Users/walter/Work/Spank/sOSS/vector/src/app.rs`.
+- Vector represents buffer-full behavior as policy, not an accident: block, drop newest, or overflow in `/Users/walter/Work/Spank/sOSS/vector/lib/vector-buffers/src/lib.rs`.
+- Vector reports buffer usage by received/sent/current/dropped event and byte counts in `/Users/walter/Work/Spank/sOSS/vector/lib/vector-buffers/src/buffer_usage_data.rs`.
+- Spank should copy the explicitness, not the exact numbers. A `20_000` blocking-thread cap is a general-pipeline choice; Spank's HEC receiver should keep blocking and CPU pools deliberately small until benchmark evidence says otherwise.
 
 ## 7. Axum Use
 
