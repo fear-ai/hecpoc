@@ -936,3 +936,259 @@ These prove bounded request processing, not end-to-end queue backpressure. The f
 | ACK | postponed, request/batch scoped | codes `10`, `11`, `14`, `19`, `20`, `25`, `27`, `ackId` registry and commit-boundary semantics | implement only after `ack.boundary` and registry design are encoded in config/tests |
 | Queue/backpressure | not implemented | code `26`, health queue-full state, source admission policy | add bounded queue and blocked-worker test |
 | Axum accept visibility | deferred | connection counts, peer culling, header timeout tuning, socket backlog/buffers | add task for owned accept loop using `TcpSocket` + Hyper/hyper-util after current HEC matrix stabilizes |
+
+## 11. Appendix — Data-Path Terminology And Stage Definitions
+
+Status: proposed terminology for active HECpoc design. This replaces earlier over-broad terms such as `admission decision`, `handoff`, and `sealed block` in the common vocabulary.
+
+Purpose: name the data component of HECpoc processing from the HTTP request as exposed by Axum/Hyper through HEC validation, batching, queueing, writing, and optional later interpretation. The names should follow function first, and component names second.
+
+### 11.1 Request, Frame, Body, Line, Event, Record, Batch
+
+Use these terms with exact scope:
+
+| Term | Definition | Data | Metadata |
+|------|------------|------|----------|
+| transport stream | TCP/Tokio/Hyper receive path below the current handler-visible layer | not directly visible in current Axum handler | peer address and connection facts only when exposed by the server stack |
+| HTTP request | an HTTP method/path/header/body exchange after HTTP parsing has produced request semantics | headers plus body stream | method, path, query, headers, route match, peer if available |
+| HTTP framing | HTTP syntax and transfer structure, not application data | method, URI, headers, chunked/content-length body framing | header parse errors, length hints, keep-alive state |
+| HTTP headers | request metadata parsed before body read | header map | authorization, content encoding, content length, HEC channel, source metadata in query params |
+| HTTP body | bounded body read before content decoding | body stream chunks accumulated under limits | advertised length, actual read length, body read timing |
+| decoded body | HTTP body after content decoding such as gzip | decoded body buffer | decoded length, content encoding, decode errors |
+| raw line | one LF-delimited unit from `/services/collector/raw` after raw endpoint line splitting | bytes or text, depending mode | line number, byte offset/length, blank/invalid flags |
+| HEC event | one HEC event object or one raw endpoint event candidate | event payload plus HEC metadata | `time`, `host`, `source`, `sourcetype`, `index`, `fields`, token/channel/request id |
+| log record | application log structure inside an event, such as syslog, Apache, auditd, JSON Lines, or logfmt | event text or structured event value | parser family, parser variant, parse status/reason |
+| `HecEvents` | valid HEC events produced from one HEC HTTP request after endpoint-specific decoding and validation | event vector plus raw references | request id, token/channel, endpoint, event count, body lengths, selected commit state |
+
+`request` means the HTTP request after HTTP processing, not raw `recv()` data. Current Axum/Hyper code does not expose raw `recv()` bytes at the handler layer. If discussing lower-level receive behavior, say `transport stream`; if discussing data visible to HEC code, say `HTTP body`.
+
+`line` exists only where a format or endpoint defines it. HEC `/raw` uses line splitting. HEC `/event` uses JSON envelope boundaries, not newline boundaries. Syslog, Apache, and other file formats may be line-oriented, but multiline parsers can combine several physical lines into one log record.
+
+### 11.2 Functional Data Path
+
+Use this as the active HECpoc data path:
+
+```text
+transport stream
+  -> HTTP request/framing
+  -> HTTP headers and route
+  -> auth and request metadata validation
+  -> HTTP body
+  -> content decode
+  -> HEC decode
+  -> HEC event validation
+  -> HecEvents formation
+  -> concrete disposition
+  -> selected commit state
+  -> optional format interpretation
+  -> optional search preparation
+```
+
+Short form:
+
+```text
+receive HTTP request -> validate headers/auth -> read HTTP body -> content decode -> HEC decode -> validate events -> form HecEvents -> disposition -> commit state -> optional interpretation/search-prep
+```
+
+### 11.3 Stage Definitions
+
+| Stage | Function | Input | Output | Extracted / Attached Facts |
+|-------|----------|-------|--------|-----------------------------|
+| HTTP request/framing | convert transport stream into HTTP request semantics | transport stream below handler | method/path/headers/body stream | peer if exposed, method, path, query, headers, content length, route alias |
+| header/auth validation | validate HEC-visible request metadata before reading the full body when possible | HTTP headers and query | accepted request metadata or HEC error | auth scheme/token, channel, content encoding, content length, source query params, route alias |
+| body read | enforce HTTP body length and time bounds | HTTP body stream | bounded HTTP body | advertised length, actual read length, idle/total timing, body read error |
+| content decode | decode content encoding after enough HTTP body data exists | HTTP body | decoded body | content encoding, decoded length, gzip error, expansion-limit reason |
+| HEC decode | decode HEC protocol body | decoded body | HEC event candidates | endpoint kind, raw line number or JSON object number, envelope metadata |
+| HEC event validation | validate HEC-visible event requirements | HEC event candidates | valid HEC events or HEC error | missing/blank event, invalid fields, invalid index when configured, invalid event number |
+| HecEvents formation | collect valid HEC events produced by one HTTP request | valid HEC events | `HecEvents` | request id, token/channel, endpoint, event count, HTTP body length, decoded length, event payload lengths |
+| disposition | choose concrete next action | `HecEvents` | queued/written/dropped/rejected result | disposition kind, queue name if any, write target if any, overflow/busy reason |
+| commit state | record strongest completed state | disposition result | response/ACK/reporting state | accepted, queued, written, flushed, durable, indexed |
+| format interpretation | parse log-record structure inside events | raw/event payload | parsed record fields | parser family/variant/version, parse status/reason, field aliases |
+| search preparation | build search-oriented structures | parsed records or replayable raw events | tokens/columns/index metadata | token counts, field stats, postings/segments when implemented |
+
+### 11.4 Decode, Parse, Normalize, Tokenize
+
+Use `decode` for protocol and representation conversion:
+
+- `content decode`: gzip or other content encoding to decoded bytes.
+- `HEC decode`: decoded HEC bytes to HEC event candidates.
+
+Gzip content decode requires HTTP body data. It cannot complete before the relevant body bytes are available. Header validation can reject unsupported `Content-Encoding` before reading the body, but actual gzip validation and expansion-limit enforcement occur while reading/decoding the body.
+
+Use `parse` for log-record structure inside an event:
+
+- syslog prefix and message parse;
+- Apache/Nginx access or error parse;
+- auditd key/value parse;
+- JSON Lines or logfmt parse.
+
+Use `normalize` for canonical field/value mapping after parsing:
+
+- field aliases such as `clientip` to `client_ip`;
+- timestamps into one time representation;
+- IP/port/status-code typed values.
+
+Use `tokenize` for search-preparation terms:
+
+- field-aware terms;
+- URI/path terms;
+- position/proximity terms if enabled.
+
+### 11.5 Splunk Functional Stages And Queues
+
+Splunk's public data-pipeline model is `Input -> Parsing -> Indexing -> Search`. Splunk documentation states that the parsing function actually consists of parsing, merging, and typing pipelines. Operational queue names expose buffers between these functions.
+
+| Splunk Queue / Pipeline | Between What And What | Typical Function | HECpoc Interpretation |
+|-------------------------|-----------------------|------------------|-----------------------|
+| input segment | source acquisition before parsing queue | consume external data, split into blocks, annotate source-level metadata | HTTP request/framing and body read |
+| `parsingQueue` | input processors -> parsing pipeline | UTF-8/encoding, line breaker, data-header recognition | content decode and endpoint-specific event boundary work |
+| parsing pipeline | consumes `parsingQueue` | line breaking and data-header processing | HEC decode for HEC input; raw line splitting for `/raw` |
+| `aggQueue` | parsing pipeline -> merging/aggregation pipeline | queue before aggregator/line-merging work | relevant to multiline file/TCP input, less central to HEC `/event` |
+| merging / aggregation pipeline | consumes `aggQueue` | line merging, timestamp extraction, event boundary refinement | future multiline/event breaker work for file/TCP inputs |
+| `typingQueue` | merging pipeline -> typing pipeline | queue before regex/typing work | future format interpretation and metadata transforms |
+| typing pipeline | consumes `typingQueue` | regex replacements, annotations such as `punct`, metadata transforms | format parse/normalize stage if implemented before storage |
+| `indexQueue` | typing pipeline -> indexing pipeline | parsed events waiting to be indexed | queue before durable write/search-prep |
+| indexing pipeline | consumes `indexQueue` | output routing, index file/rawdata write, metrics | store write, durable commit, optional search-prep |
+
+`aggQueue` is a real Splunk operational queue name, not just a conceptual drawing. For HECpoc, do not copy the four queues mechanically. Copy the functional lesson: put buffers only where they express a measured control boundary or a required guarantee.
+
+Splunk `header` in this context is data-header recognition during parsing, not HTTP header parsing. HECpoc HTTP headers belong to `HTTP request/framing` and `header/auth validation`.
+
+### 11.6 Splunk-Compatible Metrics To Consider
+
+Current HECpoc metrics should eventually map to Splunk-compatible or Splunk-comparable counters where useful:
+
+| Splunk-Compatible Area | Candidate HECpoc Metric |
+|------------------------|-------------------------|
+| requests received | `hec.requests_total{endpoint,status,outcome}` |
+| incorrect URL | `hec.requests_incorrect_url_total` |
+| auth failures | `hec.auth_failures_total{reason}` for missing token, malformed auth, invalid token, disabled token |
+| HTTP body received | `hec.http_body_bytes_total{endpoint}` |
+| decoded body | `hec.decoded_body_bytes_total{encoding}` and `hec.decode_errors_total{reason}` |
+| events received | `hec.events_total{endpoint,outcome}` |
+| HEC decode errors | `hec.hec_decode_errors_total{reason}` |
+| format parse errors | `hec.format_parse_errors_total{family,reason}` |
+| queue pressure | `hec.queue_depth`, `hec.queue_full_total`, `hec.queue_wait_seconds` |
+| blocked pipeline | `hec.pipeline_blocked_total{stage}` or `hec.pipeline_blocked_seconds{stage}` once real queues exist |
+| ACK state | `hec.ack_missing_channel_total`, `hec.ack_invalid_channel_total`, `hec.ack_pending`, `hec.ack_capacity_total`, `hec.ack_poll_total{result}` |
+| output/store errors | `hec.store_write_errors_total`, `hec.store_flush_errors_total`, `hec.store_commit_errors_total` |
+| throughput by metadata | `hec.events_by_metadata_total{host,source,sourcetype,index}` only if cardinality policy permits |
+
+`num_of_requests_to_incorrect_url` is a Splunk-documented HEC introspection counter. Use our own metric name, but preserve the concept.
+
+Additional non-Splunk-specific HECpoc metrics:
+
+| Area | Candidate HECpoc Metric |
+|------|-------------------------|
+| body timeouts | `hec.body_idle_timeouts_total`, `hec.body_total_timeouts_total` |
+| body limits | `hec.http_body_too_large_total`, `hec.decoded_body_too_large_total` |
+| gzip expansion | `hec.gzip_expansion_ratio` summary/histogram |
+| HEC event grouping | `hec.hec_events_count` and `hec.hec_events_decoded_body_bytes` histograms |
+| latency by stage | `hec.stage_duration_seconds{stage}` |
+| response mapping | `hec.responses_total{http_status,hec_code}` |
+| commit state | `hec.commit_state_total{state}` |
+| current concurrency | `hec.requests_in_flight`, later `hec.connections_current` when the accept loop is visible |
+
+### 11.7 Vector Architecture Terms And Code Signals
+
+Vector's public architecture is component based:
+
+```text
+source -> transform(s) -> sink
+```
+
+Vector does not fully describe every internal scheduling and queue boundary in the public architecture documents. The local source shows useful implementation concepts:
+
+| Vector Term / Code Signal | Meaning | HECpoc Lesson |
+|---------------------------|---------|---------------|
+| source | component that receives data | comparable to HEC receiver, file input, TCP/UDP receiver |
+| transform | component that mutates, parses, filters, routes, or enriches events | comparable to format interpretation and search-prep stages |
+| sink | component that delivers events to an output | use `sink` for file/capture/drop/transmit/DB output components |
+| buffer | sink-side or component-side staging with `when_full` policy | distinguish byte buffers from bounded queues |
+| `when_full` | `block`, `drop_newest`, or overflow-style behavior | make full-policy explicit, not implicit |
+| batch config | sink batching by event count, byte size, and timeout | define HECpoc batch policy by source request first, then sink coalescing if needed |
+| acknowledgements | delivery status flows back to source when enabled | do not claim ACK success before the configured commit state |
+
+Vector both processes individual events and forms outbound batches. Its Splunk HEC source decodes incoming request bodies into individual `Event` values. Its Splunk HEC sink maps input events, partitions where needed, batches by timeout/byte-size/event-count settings, then builds outbound HEC HTTP requests. Local code anchors:
+
+- `/Users/walter/Work/Spank/sOSS/vector/src/sources/splunk_hec/mod.rs` — `EventIterator` yields individual `Event` values from HEC input.
+- `/Users/walter/Work/Spank/sOSS/vector/src/sinks/splunk_hec/logs/sink.rs` — `.batched_partitioned(...)` creates outbound sink batches.
+- `/Users/walter/Work/Spank/sOSS/vector/src/sinks/splunk_hec/logs/encoder.rs` — encodes `Vec<HecProcessedEvent>` into an outbound HEC body.
+
+HECpoc should not copy Vector's exact batch defaults. The useful lesson is that inbound HEC request grouping and outbound/store aggregation are separate mechanisms.
+
+### 11.8 HECpoc HEC Events And Aggregation Terms
+
+Approved naming direction:
+
+- Use `HecEnvelope` for one decoded JSON object from `/services/collector/event`.
+- Use `HecEvents` for valid HEC events after HEC decode and HEC validation.
+- Use `RequestRaw` for the decoded `/services/collector/raw` HTTP body before raw line splitting.
+- Use `RawEvents` for raw endpoint events after LF splitting.
+- Use `Batch` only to describe the HEC HTTP input structure or explicit HEC sender batching, where Splunk already uses the term.
+- Use `ParseBatch` only if format parsing is actually performed on a grouped set of events. Otherwise parse events individually.
+- Use `WriteBlock` for store/output aggregation for now, because output granularity should not inherit whatever grouping the shipper happened to send. Revisit this name when designing a generalized `Store` interface that must cover append-only files, segment files, SQLite/DuckDB-style databases, and future search-prep storage.
+
+| Term | Formation Rule | Use |
+|------|----------------|-----|
+| `HecEnvelope` | one JSON object decoded from `/services/collector/event` | HEC event endpoint input structure |
+| `HecBatch` | multiple `HecEnvelope` objects stacked in one HEC HTTP request | Splunk-compatible HEC batch terminology only |
+| `RequestRaw` | decoded `/raw` HTTP body before LF splitting | raw endpoint input structure |
+| `RawEvents` | non-empty raw events produced by LF splitting `RequestRaw` | HEC events for raw endpoint |
+| `HecEvents` | valid HEC events from either `HecEnvelope` or `RawEvents` | common post-validation representation |
+| `ParseBatch` | explicit group selected for format parsing | only if parser design groups events for CPU/cache behavior |
+| `WriteBlock` | store/output aggregation unit selected for append/write efficiency | current preferred term for file/store output grouping |
+| `Segment` | durable/search-prep storage unit with metadata | later store/search layout |
+| `Chunk` | byte-range subdivision inside a file or segment | low-level storage/corruption/replay unit |
+| `Transaction` | database commit group | DB-backed sink/store only |
+| `FlushGroup` | group whose buffered writer flush is tracked together | file-output buffering only |
+
+Initial rule: keep request provenance, not request granularity. Later write/store/parse stages may coalesce or split events independently of the original HEC request, but must retain request id, event ordinal, endpoint, token/channel, source metadata, and original body/reference information.
+
+Format parsing should start event-by-event unless a parser or benchmark demonstrates a benefit from `ParseBatch`. If grouped parsing is introduced, `ParseBatch` must name its policy: by sourcetype, byte range, event count, time window, store segment, or CPU/cache partition.
+
+### 11.9 Disposition And Capacity Terms
+
+Avoid vague `admission decision` and `handoff`. Name the concrete disposition:
+
+| Disposition | Meaning |
+|-------------|---------|
+| reject request | no valid accepted batch is produced; HEC response reports the reason |
+| enqueue HecEvents | `HecEvents` entered a bounded queue |
+| write HecEvents | `HecEvents` was written by the configured sink path |
+| drop HecEvents | `HecEvents` intentionally discarded in explicit drop/benchmark mode |
+| forward HecEvents | `HecEvents` sent to an external destination |
+| busy | temporary inability to accept work because a dependent resource is saturated or unavailable |
+| full | a specific bounded queue/buffer/capacity limit is reached |
+
+Use `full` for the measured condition and `busy` for the client-facing or aggregate state. Example: `ingest_queue_full` may map to HEC `server busy`.
+
+### 11.10 Commit-State Requirement
+
+Truthful commit reporting means: the response, ACK, metric, and log may not claim a state stronger than what actually completed.
+
+| State | Completed Work | Allowed Claim |
+|-------|----------------|---------------|
+| accepted | HEC event validation passed | accepted only; not queued, written, or durable |
+| queued | bounded queue insert succeeded | queued |
+| written | write call returned | written; not durable |
+| flushed | userspace flush returned | flushed; not crash durable |
+| durable | `fsync`, database commit, or equivalent durable boundary completed | durable |
+| indexed | durable evidence and search-prep structures completed | query-ready/indexed |
+
+This is separate from Splunk conformance. Splunk compatibility asks whether the selected external behavior matches Splunk. Commit-state truthfulness asks whether HECpoc's own reported state is technically true.
+
+### 11.11 Enforcement Proposal
+
+If approved, apply these rules across active documents and new code:
+
+1. Use function names before component names: `HEC decode`, `HecEvents formation`, `enqueue HecEvents`, `write HecEvents`, `format interpretation`, `search preparation`.
+2. Avoid generic `worker` or `processor` in design names unless the implementation is truly about scheduling rather than function.
+3. Replace `admission decision`, `handoff`, and `sink boundary principle` with concrete terms from this appendix.
+4. Use `decode` for content/HEC representation conversion and `parse` for log-format interpretation.
+5. Use `Batch` only for HEC HTTP input batching or `ParseBatch`; use `WriteBlock` for store/output aggregation until a generalized `Store` interface design chooses a more precise term.
+6. Use `full` for a specific capacity and `busy` for the external or aggregate condition.
+7. Do not introduce `sealed block` into common terminology until store block layout exists.
+8. Every success, ACK, stored, or committed claim must name the commit state it actually reached.
+
+Approval question: apply this terminology cleanup to `Store.md`, `Stack.md`, `InfraHEC.md`, and code identifiers now, or keep it as the governing appendix until the queue/store implementation starts?
