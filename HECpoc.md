@@ -4,7 +4,7 @@ HECpoc is a fresh Rust implementation effort for a small, testable HTTP Event Co
 
 The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every test. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
 
-The document defines the product slice, HEC protocol behavior, event/sink semantics, and open product decisions. Cross-cutting infrastructure is concentrated in `InfraHEC.md`; network/Tokio/HTTP mechanics are concentrated in `Stack.md`.
+This document defines the product contract, protocol behavior, capability bundles, staged decisions, documentation map, and inclusion rules for the HECpoc documentation set.
 
 ---
 
@@ -176,20 +176,45 @@ Initial rules:
 
 ---
 
-## 5. Reference Boundaries
+## 5. Documentation Architecture And Inclusion Rules
 
-This file defines the HEC product slice and protocol-facing decisions. `InfraHEC.md` defines cross-cutting implementation infrastructure. `Stack.md` records detailed network ingress, Tokio/Axum/Hyper, buffering, body-processing, and kernel/runtime mechanics.
+This section is the HECpoc documentation map. Subject-specific documents should not repeat this map or carry generic file-purpose lists. Each file states only its own scope and the technical subject it owns.
 
-Prior material may still be useful as evidence when it answers a specific question, but it must not drive naming, layout, configuration, error handling, concurrency, sink semantics, or validation behavior. Historical notes live in `docs/History.md` and are non-authoritative.
+| File | Focus | Includes | Excludes |
+|---|---|---|---|
+| `HECpoc.md` | product and protocol control plane | user goals, capability bundles, HEC request/event contract, staged decisions, acceptance gates, documentation map | deep parser grammars, OS/socket mechanics, implementation infrastructure internals |
+| `InfraHEC.md` | cross-cutting service infrastructure | configuration, validation, errors/outcomes, reporting/logging/observability, metrics, lifecycle, runtime policy, security posture, benchmark ledger schema | log-format grammars, queue/store algorithms, socket syscall details |
+| `Stack.md` | ingress and operating-system stack | TCP/HTTP/Tokio/Axum/Hyper, auth/body/gzip/timeouts, kernel socket buffers, page cache notes, system calls, connection accounting, network-layer backpressure | log-line grammars, token/index layout, store retirement policy |
+| `Formats.md` | log and record structure | source format origins, examples, version splits, parser choices, field extraction, field aliases, malformed record cases, format-specific parser validation | generic OS buffering, HEC status mapping, queue topology, durable store layout |
+| `Store.md` | application pipeline and stored evidence | post-framing event pipeline, queue topology, batch boundaries, text-processing handoff, token/index construction, sink states, durable commit, intermediate store, block retirement, production/benchmark profile differences | kernel/socket mechanics, detailed log-format syntax, generic reporting infrastructure |
+| `docs/History.md` | historical evidence archive | prior attempts and abandoned decisions when needed as evidence for a narrow question | active requirements, current task status, implementation direction |
 
-Code or ideas from older repos can enter HECpoc only through a current design decision:
+Inclusion rules:
 
-1. name the requirement or capability it satisfies;
-2. restate it in HECpoc vocabulary;
-3. add tests for valid, invalid, edge, overload, and hostile cases;
-4. verify dependencies and runtime assumptions;
-5. record benchmark evidence if performance is the reason;
-6. update current docs instead of reviving old status notes.
+1. A topic belongs where its primary design variable lives, not where it was first discussed.
+2. Validation belongs with the subsystem whose behavior is being proven. Protocol response validation belongs here; socket/header timeout validation belongs in `Stack.md`; parser correctness validation belongs in `Formats.md`; queue/store/durability validation belongs in `Store.md`; report/config validation belongs in `InfraHEC.md`.
+3. References should be specific evidence for the local subject. Avoid empty mentions of another project document just to say it exists.
+4. Stable requirements and justified recommendations stay in reference sections. Work tracking and status tables are kept short and only when they control the next implementation step.
+5. Older code or documents can influence HECpoc only after restating the current requirement, naming the implementation target, adding validation cases, and recording why the old approach remains suitable.
+
+Decision validity classes:
+
+| Class | Meaning | Example | Revisit Trigger |
+|---|---|---|---|
+| Contract | external HEC behavior expected to remain stable | accepted endpoints, auth response shape, event metadata preservation | Splunk/shipper comparison contradicts it |
+| Capability bundle | valid for a named feature group | local fixture capture sink, compatibility lab behavior, durable ingest mode | bundle scope changes or user workflow changes |
+| Implementation stage | valid for current implementation stage | direct capture before queue worker, all-or-nothing JSON request parsing | next stage implements queue, store, or ACK |
+| Benchmark profile | valid only for measurement | drop sink, prewarmed cache, relaxed durability, fixed payload corpus | benchmark result is cited outside its profile |
+| Deferred | explicitly not decided | ACK commit boundary, JSON partial success, index allow-list syntax | named dependency becomes active |
+
+Current decision gaps that should be normalized into this structure:
+
+- HEC response compatibility for body-too-large, unsupported encoding, bad path, and timeout classes.
+- Queue topology and backpressure policy for global, per-source, per-format, per-core, and store-partitioned queues.
+- Capture-file format, durable commit boundary, and ACK boundary.
+- Parser capability metadata and field alias views for Splunk/CIM, Sigma, ECS, and OTel.
+- Benchmark profile definitions for drop, capture, queue, durable store, and indexed store.
+
 
 ---
 

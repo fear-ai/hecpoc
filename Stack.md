@@ -789,9 +789,9 @@ These decisions belong in tests once answered. The Stack decision is only useful
 
 ## 25. Current Configurability Surface
 
-The infrastructure target for configuration is `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §7`. This section remains as an HTTP-stack ledger for which knobs affect ingress, body handling, buffering, and overload behavior.
+This section is an HTTP-stack ledger for knobs that affect ingress, body handling, buffering, and overload behavior.
 
-Current implementation loads configuration through the `InfraHEC.md §7.2` source chain:
+Current implementation loads configuration through this source chain:
 
 ```text
 compiled defaults < TOML file < command line < environment
@@ -1222,127 +1222,40 @@ Policy must include both values and actions. Suggested policy dimensions:
 
 These policies should be represented as data, not hidden in routine names such as `drop_only`. Names such as `SinkMode::Drop`, `SinkMode::CaptureFile`, `AdmissionPolicy`, `OverflowAction`, and `MalformedEventPolicy` are preferable because the source, token, thread, or flow can carry flags for later interpretation.
 
-## 32. Text Processing After Auth And Decompression
+## 32. Application Handoff After Auth And Decompression
 
-Before storage optimization, define the text pipeline as observable stages with test groups.
+Stack owns the transport and bounded-body side of the handoff. After auth, size checks, optional gzip decode, and endpoint framing, the stack should deliver a bounded decoded input or a request-scoped event candidate batch to application code. It should not own parser grammar, tokenization, index construction, durable commit, or retention policy.
 
-### 32.1 Stream And Buffer Stages
+Stack-owned handoff requirements:
 
-1. HTTP stream: frame-by-frame read with wire byte accounting.
-2. Decode stream: identity or gzip with decoded byte accounting.
-3. Boundary stream: raw endpoint line splitter or event endpoint concatenated JSON object stream.
-4. Batch builder: converts decoded bytes into `IngestBatch` with source metadata.
-5. Queue routing: maps context to a queue; initially always queue `0`.
-6. Worker processing: assigns sequence IDs and writes minimal durable records.
+- account wire bytes and decoded bytes separately;
+- enforce advertised, wire, decoded, timeout, and event-count limits before unbounded allocation;
+- preserve endpoint, route alias, peer, request ID, token class, content encoding, and body-limit reasons;
+- distinguish transport/body errors from parser errors;
+- expose enough context for later queue mapping without deciding queue topology;
+- avoid panics on invalid UTF-8, NUL bytes, CRLF, chunked bodies, or malformed gzip.
 
-Context passed into queue mapping should include:
+Handoff shapes:
 
-- session ID / connection ID;
-- host or peer IP;
-- fd/socket identifier where available;
-- Tokio worker/thread ID when available;
-- endpoint;
-- file path for file watcher sources;
-- extension and declared type for file inputs;
-- token/source class;
-- decoded format guess;
-- source flags and policy flags.
+| Endpoint | Stack Output | Notes |
+|---|---|---|
+| `/services/collector/raw` | bounded decoded byte buffer plus raw-line boundary observations | line structure and parser interpretation are not network responsibilities |
+| `/services/collector/event` | bounded decoded byte buffer or parsed HEC envelopes, depending on implementation stage | HEC envelope error mapping remains protocol-facing |
+| future file input | file read chunks plus source path/fingerprint | file-system page-cache and read-buffer behavior remain stack/OS concerns |
 
-Initial mapper:
+Open stack questions:
 
-```text
-map_to_queue(context) -> QueueId(0)
-```
+- whether raw endpoint should preserve byte-exact raw events before lossy text conversion;
+- whether body draining after early rejection is needed for keep-alive compatibility;
+- whether manual Hyper serving is required for header timeout, header count, and malformed-header counters;
+- whether listener construction should move to `TcpSocket`/`socket2` for backlog and socket buffer controls.
 
-The important part is preserving the signature now so later sharding by host, source, token, file, CPU, or load does not rewrite the whole ingest path.
 
-### 32.2 Lines
+## 33. Storage Partitioning Boundary
 
-Tests:
+Ingress should pass source facts forward without deciding storage identity. Peer address, token class, endpoint, source, sourcetype, file path, route alias, and request ID are useful routing and accounting facts, but they should not force a database-per-host, database-per-file, or database-per-log-type shape at the network layer.
 
-- LF, CRLF, final line without newline;
-- empty lines and whitespace-only lines;
-- NUL inside line;
-- invalid UTF-8;
-- very long line below/above configured cap;
-- mixed syslog/auth/apache samples;
-- line count above `HEC_MAX_EVENTS`.
-
-Policy choices:
-
-- preserve raw bytes and lossy text separately if binary validity matters;
-- for now, raw endpoint stores lossy-decoded string and must not panic;
-- optional later: byte-preserving raw store plus decoded display column.
-
-### 32.3 Events
-
-Tests:
-
-- one JSON envelope;
-- concatenated envelopes;
-- whitespace between envelopes;
-- missing `event`;
-- null/blank event;
-- nested indexed fields;
-- malformed second envelope;
-- huge field object;
-- metadata carry-forward if/when Splunk compatibility requires it.
-
-Initial behavior: parse all-or-nothing, preserve original raw value of `event`, store shallow metadata, reject on first invalid envelope with `invalid-event-number` when known.
-
-### 32.4 Fields And Values
-
-Stage shallow fields first:
-
-- `_time` / HEC `time`;
-- `_raw` / raw event string;
-- `host`;
-- `source`;
-- `sourcetype`;
-- `index`;
-- endpoint;
-- token/source class;
-- ingest time;
-- parser version.
-
-Tests:
-
-- absent vs null vs empty string;
-- integer/float/string time;
-- unknown fields preserved or ignored according to policy;
-- large values;
-- Unicode and invalid UTF-8 path from raw endpoint;
-- field name collisions between HEC metadata and parser-derived fields.
-
-### 32.5 Tokenization And Indexing
-
-Tokenization and deeper parsing are not request-path requirements for first HEC acceptance. They should be replayable from durable raw/event records.
-
-Future stages:
-
-- breaker/tokenizer per sourcetype;
-- lowercase/fold policy;
-- position-aware token index;
-- field-aware token index;
-- Sigma-oriented token and field acceleration;
-- optional regex extraction;
-- per-format parser packs for syslog, auth.log, Apache access, Apache error.
-
-## 33. Why Not Per Host, File, Or Log-Type Databases During Ingest
-
-Per-host, per-file, or per-log-type databases sound attractive because they make ownership obvious. They are bad default ingest partitions because they multiply handles, schemas, compaction work, query fanout, and migration surfaces before the workload has proven stable.
-
-Use hot buckets instead:
-
-- append to current writable bucket by time/size;
-- write core metadata columns for host/source/sourcetype/index/file;
-- seal buckets into immutable units;
-- build per-field/per-token sidecar indexes against sealed buckets;
-- resort/coalesce later for search if measurements justify it.
-
-Arithmetic reason: if there are `H` hosts, `T` log types, and `F` files, per-combination ingest storage can create up to `H*T*F` active targets. Buckets bound active targets by writer count and time/size policy. Search can still prune by host/type using metadata and indexes without making ingest pay the full Cartesian product.
-
-For one huge file or one huge log type, a dedicated parser/index worker may be justified, but that should be queue routing or bucket metadata, not a separate database identity. The system should be able to coalesce or repartition sealed data after ingest once event counts, field cardinalities, and query selectivity are known.
+Stack-level requirement: preserve enough context for later queue and store decisions while keeping socket, HTTP, timeout, body-limit, gzip, and connection-accounting behavior independent of store partitioning.
 
 ## 34. Follow-Up Task Register
 
@@ -1352,9 +1265,9 @@ For one huge file or one huge log type, a dedicated parser/index worker may be j
 | --- | --- | --- |
 | P0 | Add `ConnectionStats` counters | True connection current/accepted/closed/rejected/max visibility. |
 | P0 | Introduce manual listener construction | Explicit backlog, recv buffer, IPv4/IPv6 choice, socket policy. |
-| P0 | Add bounded enqueue/dequeue | Separate request acceptance from sink/index work with queue-full behavior. |
+| P0 | Define ingress handoff facts | Preserve peer, route, endpoint, byte counts, token class, and request timing for downstream queue decisions. |
 | P1 | Add policy structs | Values plus actions for body, gzip, parser, queue, connection limits. |
-| P1 | Add source context struct | Carries connection/session/file/source metadata to queue mapper. |
+| P1 | Add source context struct | Carries connection/session/source metadata to downstream routing without choosing storage identity. |
 | P1 | Add `/hec/connections` snapshot | Sorted/bin views for current connections. |
 
 ### 34.2 Validation And Benchmarks
@@ -1367,131 +1280,76 @@ For one huge file or one huge log type, a dedicated parser/index worker may be j
 | P1 | Add Splunk oracle comparisons | Confirm codes for body-too-large, late-invalid event, gzip errors. |
 | P2 | Add Linux benchmark host pass | Validate Linux-specific knobs, affinity, receive buffers, and perf counters. |
 
-### 34.3 Storage And Processing
+## 35. Network And Kernel Buffering Before Application Queueing
 
-| Priority | Task | Outcome |
-| --- | --- | --- |
-| P0 | Define `IngestBatch` and `SourceContext` | Stable enqueue boundary. |
-| P0 | Implement one queue and one worker | Prove state transitions and counters. |
-| P1 | Add hot bucket JSONL or binary segment | Durable local store without schema explosion. |
-| P1 | Add replayable parsing workers | Keep deeper parsing off request path. |
-| P2 | Add token/field index prototype | Sigma/search acceleration after raw durability. |
+Backpressure begins before HEC application code. This section owns the network and OS layers that can admit, buffer, delay, or reject traffic before a queue or store worker sees an event. Queue topology and store commit policy are application/store concerns; the stack requirement is to make lower-layer pressure observable.
 
-### 34.4 Documentation
-
-| Priority | Task | Outcome |
-| --- | --- | --- |
-| P0 | Keep Stack.md as implementation stack ledger | Networking, HTTP, DoS, concurrency, tools. |
-| P1 | Split benchmark recipes once repeated | Move commands/results to `Bench.md` if Stack grows too wide. |
-| P1 | Split policy spec once implemented | Move policy tables to `Policy.md` after code names settle. |
-| P2 | Add source corpus manifest | Stable list of local/public logs and attack corpora. |
-
-## 35. Backpressure And Buffering From Network To Store
-
-Backpressure is not one queue. It is a sequence of queues, buffers, admission choices, and retry/drop policies from the sender's network stack to our sink. HECpoc should name each layer so performance problems are not misattributed to Tokio, Axum, SQLite, or the parser without evidence.
-
-### 35.1 Layered Path
+### 35.1 Network-Layer Path
 
 ```text
-client app
-  -> client userspace buffer
+client userspace buffer
   -> client TCP send buffer
-  -> network / loopback path
-  -> server SYN backlog / accept queue
-  -> server accepted socket
+  -> network or loopback path
+  -> server SYN backlog
+  -> server accept queue
+  -> accepted socket
   -> server TCP receive buffer
   -> Tokio readiness
   -> Hyper HTTP parser/body channel
-  -> HEC body read buffer
+  -> HEC bounded body reader
   -> optional gzip decode buffer
-  -> raw line splitter or JSON envelope parser
-  -> EventBatch allocation
-  -> bounded ingest queue
-  -> sink worker input buffer
-  -> file BufWriter / DB transaction / index update buffers
-  -> kernel page cache / storage device queue
+  -> application handoff
 ```
 
-A slowdown at any layer can look like "HEC is slow" unless the layer has counters or sampled visibility.
+A slowdown at any layer can look like application slowness unless the layer has counters or sampled visibility.
 
 ### 35.2 IP And TCP Admission
 
 Before application code sees data, the kernel controls connection attempts and byte flow:
 
 - SYN backlog and accept queue determine whether connection setup succeeds under bursts.
-- Ephemeral port range and `TIME_WAIT` determine how far localhost clients such as `ab` can push before client-side `EADDRNOTAVAIL`.
+- Ephemeral port range and `TIME_WAIT` determine how far localhost clients such as `ab` can push before client-side exhaustion.
 - TCP receive buffer determines how much data can sit per accepted socket before application reads.
-- TCP flow control naturally slows senders when receive buffers fill.
-- TCP sequence numbers and ACK windows preserve byte order; HEC raw/event parsing can assume ordered bytes per connection, not ordered requests across connections.
-- Packet loss, ECN, RED, CoDel, fq_codel, or NIC queue policies may affect remote tests but are mostly absent in loopback tests.
+- TCP flow control slows senders when receive buffers fill.
+- TCP sequence numbers and ACK windows preserve byte order per connection, not ordering across connections.
+- Packet loss, ECN, RED, CoDel, fq_codel, or NIC queue policies can matter in remote tests and mostly disappear in loopback tests.
 
-RED-style early drop matters conceptually: shedding before buffers are saturated can keep latency bounded. In HEC terms, application equivalents are per-IP admission limits, queue high-water health degradation, and `503 Server is busy` before memory is exhausted.
+Application equivalents of early drop are per-IP admission limits, queue high-water health degradation, and server-busy responses before memory exhaustion.
 
 ### 35.3 Tokio, Hyper, And Axum Buffers
 
-Current HECpoc does not own the accept loop. Axum accepts and Hyper parses HTTP before the handler runs. The handler then reads body frames into a bounded `Vec`.
+Current HECpoc does not own the accept loop. Axum accepts and Hyper parses HTTP before the handler runs. The handler then reads body frames into bounded storage.
 
 Implications:
 
-- `HEC_MAX_BYTES` bounds what the handler accumulates, not necessarily all bytes Hyper or the kernel may have already buffered.
-- `Content-Length` rejection avoids reading known-oversized bodies, but chunked or missing-length bodies still require reading until the configured cap is reached.
-- Hyper's HTTP/1 body path uses a channel between protocol parser and body consumer, so not polling the body can apply backpressure inside Hyper.
-- Owning the listener through `TcpSocket` enables backlog and socket buffer settings; direct Hyper/hyper-util serving enables true per-connection accounting and culling.
+- configured HEC body limits bound what the handler accumulates, not necessarily all bytes already buffered by the kernel or Hyper;
+- `Content-Length` rejection avoids reading known-oversized bodies; chunked or missing-length bodies require reading until the cap;
+- Hyper's body path can apply backpressure if the handler stops polling the body;
+- owned listener construction enables backlog and socket-buffer settings; direct Hyper/hyper-util serving enables per-connection accounting and culling.
 
-### 35.4 HEC Request Buffers
+### 35.4 Stack Buffer Controls
 
-Current buffers:
+| Layer | Current Behavior | Later Control |
+|---|---|---|
+| listener backlog | library/OS default | `TcpSocket::listen(backlog)` |
+| socket receive buffer | OS default | `TcpSocket::set_recv_buffer_size` or `socket2` |
+| socket send buffer | OS default | `socket2` when needed |
+| keepalive/nodelay/reuse | default/library behavior | explicit socket options after owned listener |
+| HTTP headers | Hyper defaults | direct Hyper builder or front proxy |
+| wire body | HEC bounded reader | cap, drain/close policy, preallocation policy |
+| gzip scratch/output | HEC configured buffers | scratch size and decoded cap |
+| application handoff | current handler-local path | queue/store design outside stack |
 
-| Buffer | Current status | Risk | Desired control |
-| --- | --- | --- | --- |
-| Wire body `Vec` | bounded by `HEC_MAX_BYTES` | one large allocation per large request | keep bounded; maybe preallocate from content length up to cap |
-| Gzip output `Vec` | bounded by `HEC_MAX_DECODED_BYTES` | expansion bomb pressure | keep stop-on-cap behavior |
-| Gzip scratch | `HEC_GZIP_BUFFER_BYTES` | too small wastes calls; too large wastes per decode | keep configurable |
-| Raw line iterator | scalar `split` over decoded body | acceptable for bounded body; slower than `memchr` for large raw batches | switch to `memchr` once raw throughput matters |
-| JSON event vector | bounded by `HEC_MAX_EVENTS` | many small events allocate many `HecEvent`s | queue `EventBatch`; later use chunked/vectorized batch storage |
-| File sink writes | async file open/write/flush per batch today | sink can dominate and serialize requests | move behind queue worker and explicit flush policy |
+### 35.5 File-System And Page-Cache Notes
 
-### 35.5 File And DB Sink Backpressure
+File input and durable output interact with the OS page cache. Stack retains these OS facts because they affect benchmark interpretation even when store layout is owned elsewhere:
 
-File and DB sinks should not run directly inside request handlers once correctness smoke tests are over.
+- repeated file reads may benchmark page-cache speed rather than storage-device speed;
+- `cat file >/dev/null`, `mmap` plus touch, `posix_fadvise(WILLNEED)`, readahead controls, and tools such as `vmtouch` can prewarm file pages;
+- Linux exposes more cache and writeback controls than macOS; macOS cache behavior is more memory-pressure-driven;
+- benchmark ledgers must record whether input and store files were cold, warm, or deliberately prewarmed;
+- production tuning should not rely on manual cache pinning unless the deployment explicitly reserves memory for hot data.
 
-File path:
-
-```text
-request handler -> EventBatch -> bounded queue -> file worker -> BufWriter -> flush policy -> optional fsync policy
-```
-
-DB path:
-
-```text
-request handler -> EventBatch -> bounded queue -> DB worker -> transaction batch -> commit policy -> checkpoint policy
-```
-
-Important distinctions:
-
-- `accepted`: HTTP request parsed and valid.
-- `queued`: batch entered the bounded queue.
-- `captured`: sink wrote bytes to userspace writer or async file call returned.
-- `flushed`: userspace writer flushed to kernel.
-- `durable`: fsync or DB durable commit completed.
-
-HEC success must mean exactly one of these states per sink mode. Until ACK exists, do not imply durable commit unless success waits for durability.
-
-### 35.6 Options Through The System
-
-| Layer | Knob | First behavior | Later options |
-| --- | --- | --- | --- |
-| Accept queue | backlog | OS default | configured `listen(backlog)` |
-| Socket | recv/send buffers | OS default | `TcpSocket`/`socket2` configured sizes |
-| Per-source admission | global/per-IP limits | none | reject/close/cull policies |
-| HTTP headers | header size/time | Hyper defaults | direct Hyper config or custom accept/read path |
-| Wire body | max bytes/time | bounded handler read | preallocation and drain/close choices |
-| Decode | max decoded bytes | bounded gzip decode | gzip reader pool, worker offload if measured |
-| Raw lines | splitter | scalar split | `memchr`, streaming splitter, max line bytes |
-| Event batch | max events | bounded vector | chunked batches, prefix-accept policy if required |
-| Queue | depth/enqueue timeout | not yet separated | try_send, bounded wait, spill, shed |
-| Sink | file/DB buffers | capture file or drop | worker pool, transaction sizing, flush/fsync policy |
-| Store/search prep | hot buckets/indexes | deferred | replay workers, sealed-bucket indexing |
 
 ## 36. Raw Line Splitting: Why It Is Still Naive
 
@@ -1511,7 +1369,7 @@ When to replace it:
 - request bodies regularly carry many thousands of lines;
 - line max bytes must be enforced without building all events first;
 - streaming body parsing replaces whole-body buffering;
-- tokenization/index construction starts sharing the same line boundaries.
+- later parser or store work requires the same line-boundary facts without repeating scans.
 
 Replacement path:
 
@@ -1535,8 +1393,6 @@ The splitter should be treated as a byte-framing component, not as the whole tex
 | gzip decode | compressed and decoded bytes | data after decode | data after decode | data after decode | data after decode |
 | raw line splitter | decoded body bytes | split on LF and trim one preceding CR | data inside line | LF is delimiter, CR only trimmed before LF, others are data unless policy rejects | currently converted with `String::from_utf8_lossy`; future store should keep bytes plus derived text |
 | JSON event parser | JSON UTF-8 text | valid inside JSON strings only when escaped or ordinary whitespace | invalid unless escaped as `\u0000` | unescaped controls invalid JSON | JSON must be valid UTF-8 |
-| tokenization/indexing | raw bytes or decoded field text by policy | tokenizer-specific boundary | tokenizer-specific term or rejected byte | tokenizer-specific normalize/reject/drop | tokenizer-specific normalize, preserve, or reject |
-
 Current raw behavior should therefore be documented as:
 
 - split only on byte LF `0x0a`;
@@ -1581,24 +1437,14 @@ HecResponse
 
 Do not create separate handlers, parser types, sink paths, or metrics labels for each alias unless testing alias behavior itself. Route alias is metadata; endpoint kind is behavior.
 
-## 38. PerfIntake Perspective Applied
+## 38. Prior Performance Findings Applied To Ingress
 
-PerfIntake argued against importing `spank-rs/perf` wholesale and for distilling four things: HEC acceptance tests, feature rows, validation lab procedure, and sink/parser/benchmark lessons. Applied to current implementation:
+Prior performance work should not be imported wholesale into the ingress stack. Stack uses only the findings that affect HTTP acceptance, bounded body reading, framework choice, and transport-level measurement:
 
-- `spank-rs/perf/src/parsers.rs` informs raw/log parser optimization, not first HEC body acceptance.
-- `spank-rs/perf/src/normalize.rs` informs future columnar batches, not current `HecEvent` shape.
-- `spank-rs/perf/src/tokenize.rs` informs search prep workers, not request handlers.
-- `spank-rs/perf/src/store.rs` informs null/raw/SQLite benchmark sinks, not product storage schema.
 - `spank-hec/src/receiver.rs` informs queue/backpressure ordering, but its Axum `Bytes` extractor path should not be lifted over current bounded body read.
 - `spank-hec/src/processor.rs` informs event/null/time/parser tests, but its raw and gzip limits are weaker than current code.
-
-The immediate reusable architecture is therefore:
-
-```text
-HEC parser -> bounded EventBatch -> queue -> sink worker -> capture/hot bucket -> replay/search-prep workers
-```
-
-That is the bridge from current correctness-focused receiver to later high-throughput parsing and indexing.
+- SpankMax-style benchmarks are useful only when the measurement isolates the ingress stage being changed: body read, gzip decode, raw split, response construction, or connection behavior.
+- Parser, tokenizer, normalization, store layout, and search-prep findings are downstream application-pipeline concerns unless they change request-task CPU budgets or timeout behavior.
 
 ---
 

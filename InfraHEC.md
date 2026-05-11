@@ -1,13 +1,12 @@
 # InfraHEC — HECpoc Infrastructure Spine
 
-`InfraHEC.md` concentrates the cross-cutting infrastructure plan for the HECpoc Rust implementation: runtime, configuration, errors, outcomes, reporting, public text, metrics, lifecycle, validation, benchmarking, security posture, and operational packaging. It adopts the best layout ideas from:
+This document concentrates the cross-cutting infrastructure plan for the HECpoc Rust implementation: runtime, configuration, errors, outcomes, reporting, public text, metrics, lifecycle, validation, benchmarking, security posture, and operational packaging. It adopts the best layout ideas from:
 
 - `/Users/walter/Work/Spank/infra/Infrastructure.md` — functional layers, scale regimes, protocol selection, and operations framing;
 - `/Users/walter/Work/Spank/spank-py/Infra.md` — problem/benefit/requirements/architecture/decision sections, call-site conventions, metrics/health, security posture, and validation survey style;
-- `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` — Rust-specific mandates for `tracing`, metrics, error taxonomy, `figment`, lifecycle, Tokio runtime, CLI, health, testing, and build tooling;
-- current HECpoc documents: `HECpoc.md`, `InfraHEC.md`, `Stack.md`, and `docs/PerfIntake.md`.
+- `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` — Rust-specific mandates for `tracing`, metrics, error taxonomy, `figment`, lifecycle, Tokio runtime, CLI, health, testing, and build tooling.
 
-This is the current infrastructure reference for implementation. Specialized documents may remain as detail ledgers, but new cross-cutting implementation decisions should land here first.
+This is the current infrastructure reference for implementation services that span multiple feature areas.
 
 ---
 
@@ -23,6 +22,32 @@ HECpoc is a focused Rust implementation of a Splunk HEC-compatible receiver for 
 - request buffering, resource limits, backpressure, and resilience;
 - test harnesses, benchmarks, fixtures, and external compatibility checks;
 - build, packaging, and service operation.
+
+InfraHEC subjects, reflected in section layout:
+
+| Subject | Requirement Focus |
+|---|---|
+| operating modes | local fixture, compatibility lab, performance lab, production candidate |
+| Rust infrastructure choices | runtime, HTTP framework, configuration libraries, error libraries, logging, metrics, tests |
+| repository and module shape | crate/module placement for infrastructure code |
+| configuration | file/env/CLI precedence, typed parameters, validation, redaction |
+| errors and outcomes | internal failure classes, HEC response outcomes, mapping rules, message text |
+| reporting/logging/observability | call-site contract, field typing, fan-out, redaction, stats/log outputs |
+| metrics | counters and histograms tied to bounded resources and outcomes |
+| lifecycle | startup order, signal handling, graceful shutdown, panic policy |
+| runtime policy | Tokio worker configuration, CPU/I/O separation, blocking-call boundaries |
+| interfaces | HTTP adapter boundary, sink/queue inspection boundary, backpressure contract |
+| security posture | secrets, hostile input classes, default-safe behavior |
+| benchmark ledger | run metadata, stage timing, resource sampling, evidence files |
+| service operation | build, packaging, service/container expectations |
+
+Placement review:
+
+- lifecycle and runtime policy stay here because every subsystem depends on startup, shutdown, cancellation, and worker budgeting;
+- HEC route behavior, response compatibility, and staged product decisions are not infrastructure and should not be expanded here;
+- socket/kernel mechanics are not infrastructure policy and should not be expanded here;
+- parser grammars and record structures are not infrastructure and should not be expanded here;
+- queue topology, store commit semantics, indexing, and block retirement are not infrastructure except for the generic interface vocabulary and benchmark ledger fields.
 
 Near-term product scope:
 
@@ -51,9 +76,6 @@ The three reviewed infrastructure documents contribute different strengths.
 | `infra/Infrastructure.md` | Functional layers and scale regimes | Define HEC ingest layers from network edge to sink, with small/mid/large operating modes |
 | `spank-py/Infra.md` | Problem, requirements, architecture, decisions, call-site conventions | Each subsystem section names benefits, requirements, implementation shape, and call-site discipline |
 | `spank-rs/research/Infrust.md` | Rust library mandates and operational patterns | Use `tracing`, `clap`, `figment`, `thiserror`, Tokio Builder, signal handling, nextest/fuzz/bench tooling |
-| `HECpoc.md` | Current product scope and implementation sequence | Preserve scope, capability bundles, and first work sequence |
-| `Stack.md` | HTTP/Tokio/Axum, Tower avoidance, backpressure, byte stages | Fold into runtime, HTTP stack, body processing, and resilience sections |
-| `docs/PerfIntake.md` | Performance caution and benchmark orientation | Use benchmark evidence to admit optimizations |
 
 Preferred section cadence:
 
@@ -64,7 +86,7 @@ Preferred section cadence:
 5. validation and acceptance;
 6. open decisions only when the decision is genuinely not yet made.
 
-History and abandoned approaches do not belong in the main flow. They can be noted in `docs/History.md` when needed.
+History and abandoned approaches do not belong in the main flow. They should appear only when they provide evidence for a current decision.
 
 ---
 
@@ -80,7 +102,7 @@ Borrowing the layered discipline from the broad infrastructure document, HECpoc 
 | 4 | Event formation | JSON envelopes, raw line framing, metadata, event batch | `HecEvent`, `EventBatch`, `LineSplitter` |
 | 5 | Handoff and sink | bounded queue, capture sink, commit state | direct sink now; bounded queue next |
 | 6 | Inspection and validation | readback, stats, process tests, compatibility ledgers | stats route, capture files, fixtures, benchmark ledgers |
-| 7 | Operations | config, logs, lifecycle, packaging, health, security posture | `InfraHEC.md` mandates and implementation work items |
+| 7 | Operations | config, logs, lifecycle, packaging, health, security posture | infrastructure mandates and implementation work items |
 
 Layering rule:
 
@@ -94,7 +116,7 @@ Examples:
 - Raw line splitting does not decide tokenization/search semantics.
 - Gzip decode reports decode facts and limits; HEC outcome mapping decides client response.
 - Sink commit state reports what happened; response policy decides whether success means queued, captured, flushed, or durable.
-- Tokio provides socket/runtime primitives; Axum currently owns the server accept loop; Hyper owns HTTP parsing. Detailed accept/read mechanics remain in `Stack.md`, not in generic infrastructure.
+- Tokio provides socket/runtime primitives; Axum currently owns the server accept loop; Hyper owns HTTP parsing. Detailed accept/read mechanics are ingress-stack design, not generic infrastructure.
 
 ---
 
@@ -143,12 +165,6 @@ Initial single-crate shape:
 ```text
 HECpoc/
   Cargo.toml
-  HECpoc.md
-  InfraHEC.md
-  Stack.md
-  docs/
-    History.md
-    PerfIntake.md
   scripts/
   fixtures/
     requests/
@@ -1092,12 +1108,12 @@ Infrastructure decision: start with Tokio plus Axum, with Axum kept at the HTTP 
 
 Boundary contract:
 
-| Concern | InfraHEC owns | Stack owns |
+| Concern | Infrastructure Owns | Ingress-Stack Design Owns |
 | --- | --- | --- |
-| Runtime choice | Tokio + Axum as starting infrastructure | exact Tokio/Axum/Hyper accept and body mechanics in `Stack.md §§6–12, 28` |
-| HTTP adapter | route to handler, expose request facts, convert final outcome | framework limitations, extractor hazards, Hyper fallback evidence in `Stack.md §§2–8, 20` |
-| Protocol-critical controls | auth/body/decode/parse/outcome must be explicit HEC code paths | detailed auth/gzip/body-limit/timeout mechanics in `Stack.md §§9–12` |
-| Request phase names | stable phase vocabulary for logs, stats, validation | byte and buffer behavior by phase in `Stack.md §§32, 35–36` |
+| Runtime choice | Tokio + Axum as starting infrastructure | exact Tokio/Axum/Hyper accept and body mechanics |
+| HTTP adapter | route to handler, expose request facts, convert final outcome | framework limitations, extractor hazards, Hyper fallback evidence |
+| Protocol-critical controls | auth/body/decode/parse/outcome must be explicit HEC code paths | detailed auth/gzip/body-limit/timeout mechanics |
+| Request phase names | stable phase vocabulary for logs, stats, validation | byte and buffer behavior by phase |
 
 Request phase contract:
 
@@ -1105,7 +1121,7 @@ Request phase contract:
 route alias -> endpoint kind -> auth -> bounded body -> optional decode -> endpoint parse/framing -> EventBatch -> sink/queue -> HecResponse
 ```
 
-`InfraHEC.md` should not duplicate crate-source findings, kernel details, copy/buffer analysis, or accept-loop research. Those remain in `Stack.md`.
+Infrastructure should not duplicate crate-source findings, kernel details, copy/buffer analysis, or accept-loop research.
 
 ## 14. Sink, Queue, And Inspection Interface
 
@@ -1131,7 +1147,7 @@ Interface rules:
 - ACK is request/batch scoped and must name its selected commit boundary. `enqueue` is acceptable for explicit benchmark mode; production ACK should wait for `durable` or a similarly tested DB/file commit boundary.
 - Durable storage and production ACK wait until `durable` has a real implementation and tests.
 
-Detailed file format, buffering, sink backpressure, and future store mechanics belong in `Stack.md §§33, 35` or a future focused store document.
+Detailed file format, buffering, sink backpressure, and store mechanics are outside this interface section. This section only defines shared state names and the infrastructure expectations that call sites must satisfy.
 
 ## 15. Backpressure And Resilience Interface
 
@@ -1145,7 +1161,7 @@ Required contract:
 - default behavior is explicit rejection or server-busy response, not indefinite wait or silent drop;
 - hostile input must not crash the process.
 
-Deep mechanics remain in `Stack.md`: network-to-store buffer chain in `Stack.md §35`, kernel/runtime knobs in `Stack.md §30`, ingress resilience policy in `Stack.md §31`, and raw splitting semantics in `Stack.md §36`.
+Deep mechanics remain outside generic infrastructure: network buffer chains, kernel/runtime knobs, ingress resilience policy, raw splitting semantics, and store pressure algorithms each need subject-specific design and tests.
 
 ## 16. Security Posture
 
@@ -1479,13 +1495,6 @@ These are allowed to remain open while early phases proceed.
 ---
 
 ## 23. References
-
-Current controlling docs:
-
-- `/Users/walter/Work/Spank/HECpoc/HECpoc.md` — product scope and implementation sequence;
-- `/Users/walter/Work/Spank/HECpoc/Stack.md` — detailed HTTP/Tokio/Axum and backpressure findings;
-- `/Users/walter/Work/Spank/HECpoc/docs/PerfIntake.md` — performance distillation;
-- `/Users/walter/Work/Spank/HECpoc/docs/History.md` — non-authoritative historical pointers.
 
 Reviewed infrastructure source patterns:
 
