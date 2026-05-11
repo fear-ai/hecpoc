@@ -43,7 +43,7 @@ InfraHEC subjects, reflected in section layout:
 
 Placement review:
 
-- lifecycle and runtime policy stay here because every subsystem depends on startup, shutdown, cancellation, and worker budgeting;
+- lifecycle and runtime policy stay here because every subsystem depends on startup, shutdown, cancellation, and runtime/task budgeting;
 - HEC route behavior, response compatibility, and staged product decisions are not infrastructure and should not be expanded here;
 - socket/kernel mechanics are not infrastructure policy and should not be expanded here;
 - parser grammars and record structures are not infrastructure and should not be expanded here;
@@ -52,7 +52,7 @@ Placement review:
 Near-term product scope:
 
 ```text
-HEC HTTP input -> auth/body/decode/parse -> event batch -> capture sink -> inspection/validation
+HEC HTTP input -> auth/body/content decode/HEC decode -> HecEvents -> capture sink -> inspection/validation
 ```
 
 Explicitly outside the initial infrastructure target:
@@ -99,8 +99,8 @@ Borrowing the layered discipline from the broad infrastructure document, HECpoc 
 | 1 | Network edge | TCP accept, peer identity, connection counts, receive buffers | Tokio listener through Axum initially; owned accept instrumentation later |
 | 2 | HTTP envelope | method/path/header/body framing, content-length, timeouts | Axum adapter with explicit body reader |
 | 3 | HEC protocol | route aliases, auth, gzip, raw/event endpoints, HEC outcomes | `src/hec_receiver` protocol modules |
-| 4 | Event formation | JSON envelopes, raw line framing, metadata, event batch | `HecEvent`, `EventBatch`, `LineSplitter` |
-| 5 | Handoff and sink | bounded queue, capture sink, commit state | direct sink now; bounded queue next |
+| 4 | HEC event formation | JSON envelopes, raw line framing, metadata, `HecEvents` | `HecEvent`, `HecEvents`, `LineSplitter` |
+| 5 | Queue/write disposition | bounded queue, capture sink, commit state | direct sink now; bounded queue next |
 | 6 | Inspection and validation | readback, stats, process tests, compatibility ledgers | stats route, capture files, fixtures, benchmark ledgers |
 | 7 | Operations | config, logs, lifecycle, packaging, health, security posture | infrastructure mandates and implementation work items |
 
@@ -115,7 +115,7 @@ Examples:
 - TCP does not decide HEC auth.
 - Raw line splitting does not decide tokenization/search semantics.
 - Gzip decode reports decode facts and limits; HEC outcome mapping decides client response.
-- Sink commit state reports what happened; response policy decides whether success means queued, captured, flushed, or durable.
+- Commit state reports what happened; response policy decides whether success means queued, written, flushed, or durable.
 - Tokio provides socket/runtime primitives; Axum currently owns the server accept loop; Hyper owns HTTP parsing. Detailed accept/read mechanics are ingress-stack design, not generic infrastructure.
 
 ---
@@ -259,7 +259,7 @@ Hot reload is not a foreseeable goal. The initial configuration is frozen after 
 Avoid:
 
 - `POC` in config names;
-- `_BODY` when the actual concept is wire bytes or decoded bytes;
+- `_BODY` when the actual concept is HTTP body bytes or decoded bytes;
 - `_MILLIS`; use duration strings;
 - `_CODE`; protocol result settings are named by outcome.
 
@@ -271,7 +271,7 @@ Avoid:
 | Listen address | `hec.addr` | `HEC_ADDR` | `--addr` | `127.0.0.1:18088` | valid socket address |
 | Token | `hec.token` | `HEC_TOKEN` | `--token` | `dev-token` | non-empty; redacted |
 | Capture path | `hec.capture` | `HEC_CAPTURE` | `--capture` | none | parent exists when required |
-| Max wire bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_048_576` | positive bounded bytes |
+| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_048_576` | positive bounded bytes |
 | Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `--max-decoded-bytes` | `4_194_304` | `>= max_bytes` when gzip enabled |
 | Max events per request | `limits.max_events` | `HEC_MAX_EVENTS` | `--max-events` | `100_000` | positive bounded count |
 | Body idle timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `--idle-timeout` | `5s` | positive duration |
@@ -311,7 +311,7 @@ Protocol result settings remain configurable but centralized through outcome def
 Growth parameters enter only with matching implementation and validation:
 
 - listener backlog, receive/send buffers, nodelay, reuseaddr, reuseport;
-- runtime worker threads, blocking thread cap, thread names;
+- runtime runtime threads, blocking thread cap, thread names;
 - queue depth and enqueue timeout;
 - global and per-IP connection limits;
 - IPv4/v6 prefix grouping;
@@ -370,8 +370,8 @@ Validation classes:
 
 - **format:** TOML syntax, socket address, duration, integer, path, UTF-8 where required;
 - **known values:** TOML keys, CLI flags, env aliases, enum values, policy values;
-- **bounds:** bytes, counts, queue depths, timeouts, worker counts, port ranges, prefix lengths, protocol codes;
-- **cross-field:** decoded bytes >= wire bytes, total timeout >= idle timeout, per-IP <= global, line max <= decoded max;
+- **bounds:** bytes, counts, queue depths, timeouts, runtime/task counts, port ranges, prefix lengths, protocol codes;
+- **cross-field:** decoded bytes >= HTTP body bytes, total timeout >= idle timeout, per-IP <= global, line max <= decoded max;
 - **canonical/industry:** HEC route aliases, result codes, auth schemes, gzip names, source/sourcetype/index names, IPv4/v6 prefixes;
 - **safety:** redacted secrets, non-zero resource limits unless explicitly disabled, path checks before bind;
 - **reliability:** overflow, slow client, sink failure, decode failure, invalid request behavior defined.
@@ -438,9 +438,9 @@ Semantic boundary:
 | `Body` | content-length too large, timeout, read error | HEC/body policy outcome |
 | `Decode` | gzip invalid, decoded limit exceeded, unsupported encoding | invalid data or unsupported encoding policy |
 | `Parse` | invalid JSON, missing/blank event, invalid raw framing | HEC parser outcomes |
-| `Queue` | full queue, enqueue timeout, closed worker | server busy or configured queue policy |
+| `Queue` | full queue, enqueue timeout, closed consumer | server busy or configured queue policy |
 | `Sink` | write, flush, durable commit failure | depends on commit state |
-| `Shutdown` | signal, graceful timeout, worker join failure | log/status only |
+| `Shutdown` | signal, graceful timeout, task join failure | log/status only |
 | `Internal` | invariant violation, unexpected join error | generic server busy or startup failure; detailed log only |
 
 Top-level boundary:
@@ -515,7 +515,7 @@ BodyError -> HecResponse
 DecodeError -> HecResponse
 ParseError -> HecResponse
 QueueError -> HecResponse
-SinkError + SinkCommitState -> HecResponse
+SinkError + commit state -> HecResponse
 ```
 
 Target spelling is `HecResponse` in code and documentation. Any remaining `HecOutcome` reference is historical wording to remove, not a type to copy.
@@ -864,7 +864,7 @@ field::input_offset(offset)
 - `request_id`;
 - optional domain/adapter fields explicitly submitted by HEC/HTTP code, such as route alias or endpoint kind;
 - token id or token hash later, never raw token;
-- worker/thread id later only if a subsystem measures and submits it.
+- runtime thread id later only if a subsystem measures and submits it.
 
 Do not let generic Reporter code look up network-specific fields such as peer address, method, endpoint kind, route alias, host, or path. If an output needs those values, the HTTP/HEC adapter submits them as typed fields.
 
@@ -1060,7 +1060,7 @@ Production candidate policy:
 
 Use a Tokio multi-thread runtime.
 
-Initial runtime may use `#[tokio::main]`; production direction is explicit `tokio::runtime::Builder` so config can drive worker counts and thread names.
+Initial runtime may use `#[tokio::main]`; production direction is explicit `tokio::runtime::Builder` so config can drive runtime/task counts and thread names.
 
 Runtime knobs:
 
@@ -1068,22 +1068,22 @@ Runtime knobs:
 - `runtime.max_blocking_threads` for short blocking operations only;
 - optional `runtime.cpu_worker_threads` or separate CPU runtime size when parse/index work is moved off request tasks;
 - `runtime.thread_stack_size` only if measurement warrants;
-- thread name prefix such as `hec-worker`.
+- thread name prefix such as `hec-runtime`.
 
 Concurrency design:
 
 ```text
 network concurrency: Tokio/Axum request tasks
-sink concurrency: bounded queue + one or more sink workers
-CPU-heavy parsing/indexing: batch-sized explicit worker boundary later, not casual tokio::spawn
-blocking filesystem: isolated through sink workers or spawn_blocking/tokio::fs with measurement
+sink concurrency: bounded queue plus one or more write-path tasks
+CPU-heavy parsing/indexing: batch-sized explicit execution boundary later, not casual tokio::spawn
+blocking filesystem: isolated through write-path tasks or spawn_blocking/tokio::fs with measurement
 ```
 
 Scheduling policy:
 
 1. Keep network accept, HTTP body reads, auth, health, stats, and timeout handling on the I/O runtime.
 2. Permit bounded gzip/JSON/raw splitting on request tasks only while body limits are small and benchmark evidence shows no I/O starvation.
-3. Move parse, normalize, tokenize, index construction, compression expansion, and durable sink batching behind an explicit CPU or sink boundary when they exceed a measured per-request budget or affect health/latency under load.
+3. Move parse, normalize, tokenize, index construction, compression expansion, and durable write-path grouping behind an explicit CPU or write-path execution boundary when they exceed a measured per-request budget or affect health/latency under load.
 4. Do not use `spawn_blocking` as a generic CPU pool. Tokio documents `spawn_blocking` for blocking operations that finish; many CPU tasks need semaphores or a specialized executor, and started `spawn_blocking` tasks cannot be aborted.
 5. If a separate CPU Tokio runtime is used, size and name it explicitly and keep I/O work on the I/O runtime. DataFusion/InfluxDB experience shows this can work, but only when I/O is deliberately routed away from CPU-heavy pools.
 6. If Rayon or a dedicated pool is used, bridge results through bounded channels or oneshot replies and record queue depth, wait time, and cancellation semantics.
@@ -1097,7 +1097,7 @@ References used for this policy:
 - Tokio docs, `tokio::task::spawn_blocking` — blocking thread pool behavior, large default cap, semaphore/specialized executor warning, and non-abortability.
 - Tokio issue `tokio-rs/tokio#8085` — request for better CPU/I/O prioritization, with production discussion of separate CPU and I/O runtimes.
 - Apache DataFusion issue `apache/datafusion#13692` — documents I/O starvation before visible resource exhaustion and explores moving or wrapping CPU work.
-- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/src/app.rs` — explicit multi-thread runtime builder, configurable worker count, named worker threads.
+- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/src/app.rs` — explicit multi-thread runtime builder, configurable worker count, named runtime threads.
 - Vector local source, `/Users/walter/Work/Spank/sOSS/vector/lib/vector-buffers/src/lib.rs` — buffer-full policy as a first-class backpressure decision: block, drop, or overflow.
 
 ---
@@ -1118,7 +1118,7 @@ Boundary contract:
 Request phase contract:
 
 ```text
-route alias -> endpoint kind -> auth -> bounded body -> optional decode -> endpoint parse/framing -> EventBatch -> sink/queue -> HecResponse
+route alias -> endpoint kind -> auth -> bounded body -> optional content decode -> HEC decode/framing -> HecEvents -> write or queue disposition -> HecResponse
 ```
 
 Infrastructure should not duplicate crate-source findings, kernel details, copy/buffer analysis, or accept-loop research.
@@ -1131,10 +1131,9 @@ Commit-state vocabulary shared by implementation, logs, stats, and validation:
 
 | State | Meaning |
 | --- | --- |
-| parsed | request syntax accepted |
-| accepted | valid events formed |
-| queued | batch entered bounded handoff |
-| captured | sink write returned |
+| accepted | HEC validation produced valid `HecEvents` |
+| queued | `HecEvents` entered a bounded queue |
+| written | sink/store write returned |
 | flushed | userspace writer flushed |
 | durable | fsync/DB durable commit complete |
 
@@ -1144,7 +1143,7 @@ Interface rules:
 - Direct capture is acceptable for fixture mode.
 - Bounded queue is required before advertising backpressure behavior beyond request/body rejection.
 - Inspection starts from capture evidence, not from a search/index abstraction.
-- ACK is request/batch scoped and must name its selected commit boundary. `enqueue` is acceptable for explicit benchmark mode; production ACK should wait for `durable` or a similarly tested DB/file commit boundary.
+- ACK is request/HEC-batch scoped and must name its selected commit boundary. `queued` is acceptable for explicit benchmark mode; production ACK should wait for `durable` or a similarly tested DB/file commit boundary.
 - Durable storage and production ACK wait until `durable` has a real implementation and tests.
 
 Detailed file format, buffering, sink backpressure, and store mechanics are outside this interface section. This section only defines shared state names and the infrastructure expectations that call sites must satisfy.
@@ -1156,7 +1155,7 @@ Infrastructure decision: resource limits and overload behavior must be named, co
 Required contract:
 
 - each bounded layer has a limit name, failure reason, outcome mapping, counter, and log severity;
-- initial bounded layers are wire bytes, decoded bytes, event count, body read time, and sink handoff once queue exists;
+- initial bounded layers are HTTP body bytes, decoded bytes, event count, body read time, and queue/write disposition once queue exists;
 - future bounded layers include listener backlog, connection count, per-IP contribution, line bytes, field count, and durable sink pressure;
 - default behavior is explicit rejection or server-busy response, not indefinite wait or silent drop;
 - hostile input must not crash the process.
@@ -1327,7 +1326,7 @@ Optimization admission rule:
 keep scalar correctness path -> add optimized variant -> agreement tests -> benchmark stage -> default only after correctness and measured value
 ```
 
-Applies to raw splitting, JSON parser alternatives, tokenization, sink batching, and storage layout.
+Applies to raw splitting, JSON parser alternatives, tokenization, write-path grouping, and storage layout.
 
 ---
 
@@ -1437,9 +1436,9 @@ Smoke results are not capacity claims. They only prove the receiver starts, acce
 - Add tests for LF, CRLF, NUL, controls, non-ASCII, invalid UTF-8, long lines, no-final-newline.
 - Preserve original and canonical evidence where relevant.
 
-### Phase 4 — Queue/Sink Separation
+### Phase 4 — Queue And Write-Path Separation
 
-- Define `EventBatch`, `SinkCommit`, queue policy, and worker loop.
+- Define `HecEvents`, commit-state enum, queue policy, and write-path loop.
 - Add queue-full and sink-failure outcomes.
 - Add counters and process tests.
 

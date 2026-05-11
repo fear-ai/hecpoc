@@ -1,8 +1,6 @@
 # Store — Event Pipeline, Queue Topology, Evidence Storage, And Retirement
 
-Status: design reference and requirements input.
-
-Scope: application-level processing after HEC/body framing has produced bounded decoded input and before stored evidence is retired. This document owns queue topology, batch boundaries, parser handoff, token/index construction, sink states, durability semantics, store layout alternatives, profile-specific tuning, and validation for queue/store behavior.
+Scope: application-level processing after HEC protocol handling has produced `HecEvents` and before stored evidence is retired. This document owns event disposition, queue topology, `ParseBatch` policy, `WriteBlock` construction, commit states, durability semantics, store layout alternatives, profile-specific tuning, and validation for queue/store behavior.
 
 This is not a database-choice note. The first durable question is what state the receiver can honestly claim for an accepted request. Database selection is a later implementation choice under that state model.
 
@@ -12,71 +10,69 @@ This is not a database-choice note. The first durable question is what state the
 
 HECpoc currently proves that an HTTP handler can accept bounded HEC requests and either drop or capture events. That is not yet an ingest system. An ingest system must answer these questions without ambiguity:
 
-1. What work happens on the request path?
-2. Where does work leave the request path?
+1. Which validated `HecEvents` can the HEC request path produce?
+2. Which disposition occurs: reject, enqueue, write, drop, or forward?
 3. What is queued, in what unit, with which limit?
-4. What does HTTP success mean for the selected sink mode?
+4. Which commit state does HTTP success or ACK claim?
 5. What can be replayed after a crash?
 6. What is searchable immediately, later, or never?
-7. When can a block of information be retired?
+7. When can stored evidence be compacted, archived, or retired?
 
 Without this structure, benchmark results are not comparable. A drop sink, capture file, buffered writer, `fsync` per request, SQLite transaction, and token-indexing path can all accept the same input while measuring different systems.
 
-Recommendation: define store and pipeline states before optimizing storage. Start with append-only evidence, then add queue isolation, then add durable commit, then add search-prep workers. Do not let parser/index ambitions rewrite the HEC request handler.
+Recommendation: define store and pipeline states before optimizing storage. Start with append-only evidence, then add queue isolation, then add durable commit, then add search-preparation execution. Do not let parser/index ambitions rewrite the HEC request handler.
 
 ---
 
-## 2. Ingest-To-Retirement Sequence
+## 2. HecEvents-To-Retirement Sequence
 
-Use this sequence instead of the earlier unclear phrase “byte-to-retirement.” The sequence begins after transport/body handling has produced decoded bytes or parsed HEC envelopes and ends when stored blocks are deleted or compacted.
+The sequence begins after HEC protocol handling has produced accepted `HecEvents` and ends when stored evidence is deleted, compacted, or archived.
 
 ```text
-bounded decoded input
-  -> event boundary selection
-  -> parser dispatch or raw preservation
-  -> EventBatch construction
-  -> admission to queue or synchronous fixture sink
-  -> sink worker batch receipt
+HecEvents
+  -> disposition: reject, enqueue, write, drop, or forward
+  -> optional bounded queue
+  -> write path receipt
+  -> WriteBlock construction when buffering or durable output is enabled
   -> evidence write
   -> optional flush
   -> optional durable commit
-  -> optional parser/token/index workers
-  -> sealed information block
+  -> optional format interpretation
+  -> optional ParseBatch construction
+  -> optional search preparation
   -> query/inspection access
-  -> compaction or retirement
+  -> compaction, archive, or retirement
 ```
 
 State vocabulary:
 
 | State | Meaning | HTTP/ACK Implication |
 |---|---|---|
-| `formed` | request bytes became one or more event candidates | not enough for success if sink is required |
-| `accepted` | event batch passed protocol and parser validation for the selected mode | may return success only in explicit in-memory/drop benchmark mode |
-| `queued` | batch entered bounded store/sink handoff | acceptable benchmark ACK boundary only if declared |
-| `written` | sink write call returned | not necessarily durable |
+| `accepted` | HEC validation produced one or more valid `HecEvents` | may return success only in explicit in-memory/drop benchmark mode |
+| `queued` | `HecEvents` entered a bounded queue | acceptable benchmark ACK boundary only if declared |
+| `written` | write call returned for the selected sink/store | not necessarily durable |
 | `flushed` | userspace writer flushed to kernel/page cache | not durable against power loss |
 | `durable` | `fsync`, DB commit, or equivalent durable boundary completed | first honest production ACK boundary |
-| `indexed` | search-prep/token/field indexes are built for the batch/block | query acceleration available |
-| `sealed` | block no longer accepts writes and has stable metadata | safe for compaction/retention decisions |
-| `retired` | block was deleted, compacted away, or archived | no longer in active local search scope |
+| `search_ready` | search-prep/token/field structures are built for the relevant evidence | query acceleration available |
+| `retired` | evidence was deleted, compacted away, or archived | no longer in active local search scope |
 
-Recommendation: HTTP success for the initial capture mode should mean `written` or `flushed` only if the handler waits for that state. If the handler returns after `queued`, the response and benchmark profile must say `queued`, not captured or durable.
+Recommendation: HTTP success for the initial capture mode should mean `written` or `flushed` only if the handler waits for that state. If the handler returns after `queued`, the response and benchmark profile must say `queued`, not written, flushed, or durable.
 
 ---
 
 ## 3. Pipeline Boundaries
 
-### 3.1 Request Path
+### 3.1 HEC Request Path
 
-Allowed on the request path for the first implementation:
+Allowed on the HEC request path for the first implementation:
 
 - auth and HEC response classification;
 - bounded body read and optional gzip decode;
 - raw endpoint line boundary detection for bounded bodies;
 - HEC JSON envelope parsing for bounded bodies;
 - shallow event metadata extraction;
-- `EventBatch` construction;
-- bounded queue admission or synchronous fixture write.
+- `HecEvents` formation;
+- bounded queue insertion or synchronous fixture write.
 
 Not allowed on the request path once queue mode exists:
 
@@ -88,13 +84,13 @@ Not allowed on the request path once queue mode exists:
 - unbounded retries;
 - waits on a full queue without an explicit enqueue timeout policy.
 
-### 3.2 Sink Worker Path
+### 3.2 Write Path
 
-The sink worker receives `EventBatch` units and owns store-specific buffering and commit state. It may write raw/capture evidence, group batches into transactions, flush buffered writers, or emit work to search-prep workers.
+The write path receives `HecEvents` or `WriteBlock` units and owns store-specific buffering and commit state. It may write raw/capture evidence, group events into transactions, flush buffered writers, or emit replayable evidence to search preparation.
 
-The sink worker must report:
+The write path must report:
 
-- batches received;
+- `HecEvents` or `WriteBlock` units received;
 - events received;
 - bytes received;
 - queue wait time;
@@ -104,9 +100,9 @@ The sink worker must report:
 - failures by reason;
 - last successful commit state.
 
-### 3.3 Search-Prep Worker Path
+### 3.3 Search Preparation Path
 
-Search-prep workers operate on evidence that can be replayed. They must not be the only place where accepted input exists.
+Search preparation operates on evidence that can be replayed. It must not be the only place where accepted input exists.
 
 Search-prep work includes:
 
@@ -117,9 +113,9 @@ Search-prep work includes:
 - position or proximity indexes;
 - field-aware indexes;
 - Sigma-oriented literal/field accelerators;
-- sealed-block metadata.
+- store-block metadata.
 
-Recommendation: search-prep workers consume sealed or replayable batches. Do not couple HTTP success to token/index completion until the product bundle explicitly requires query-ready success.
+Recommendation: search preparation consumes replayable evidence and may use `ParseBatch` only when measured parser/cache behavior justifies grouping. Do not couple HTTP success to token/index completion until the product bundle explicitly requires query-ready success.
 
 ---
 
@@ -129,26 +125,26 @@ No queue topology is final. The decision should be driven by fairness, cache loc
 
 | Topology | Advantages | Risks | Best Use |
 |---|---|---|---|
-| single global queue | simplest, easiest stats, easiest backpressure | one hot source can dominate; no locality | first bounded handoff test |
+| single global queue | simplest, easiest stats, easiest backpressure | one hot source can dominate; no locality | first bounded queue test |
 | per-peer queue | limits noisy clients and brute-force sources | many small queues, peer churn | HEC exposed to multiple hosts |
 | per-token/source queue | aligns with HEC token/source policies | token cardinality can grow | compatibility lab and multi-tenant fixture |
 | per-sourcetype queue | keeps parser-specific work localized | sourcetype inference can be wrong or late | parser-heavy ingestion |
-| per-CPU queue | cache locality, less contention | harder ordering and rebalancing | high-throughput parser/index workers |
+| per-CPU queue | cache locality, less contention | harder ordering and rebalancing | high-throughput parser/index execution |
 | per-store-partition queue | aligns with DB/chunk writes | prematurely couples ingest to store layout | mature durable store |
-| hybrid admission + worker queues | separate fairness from CPU/store layout | more counters and tuning | production candidate |
+| hybrid front queue + function queues | separate fairness from CPU/store layout | more counters and tuning | production candidate |
 
 Recommended sequence:
 
 1. One global bounded queue to prove backpressure and queue-full responses.
 2. Per-token/source accounting without separate queues.
-3. Per-sourcetype or per-worker queues only after parser/index benchmarks show contention or cache-locality benefit.
+3. Per-sourcetype or per-function queues only after parser/index benchmarks show contention or cache-locality benefit.
 4. Store-partitioned queues only after block/chunk layout exists.
 
 Policy options per queue:
 
 | Policy | Meaning | Use Case |
 |---|---|---|
-| reject newest | incoming batch fails immediately when full | HEC correctness and retryable overload |
+| reject newest | incoming unit fails immediately when full | HEC correctness and retryable overload |
 | wait bounded | enqueue waits up to configured timeout | short sink jitter without lying to clients |
 | drop oldest | sacrifice stale queued data for latest | telemetry mode, not default HEC correctness |
 | spill to disk | overflow memory to disk | production durability candidate, higher complexity |
@@ -158,21 +154,21 @@ Recommendation: default HEC mode should reject newest with HEC server-busy seman
 
 ---
 
-## 5. Batch And Granularity Choices
+## 5. HecEvents, ParseBatch, And WriteBlock Granularity
 
 Pipeline tuning begins with the unit of work.
 
 | Unit | Description | Strength | Risk |
 |---|---|---|---|
-| request batch | all events from one HEC request | preserves HEC response/ACK scope | large uneven batches |
-| fixed event batch | N events per batch | predictable worker cost | splits request identity |
-| byte-sized batch | target decoded/raw byte size | cache and IO friendly | event count varies widely |
-| time-slice batch | collect until duration expires | latency bound | less deterministic benchmark results |
-| store-block batch | collect until block target size | efficient sealing/indexing | too late for request-level feedback |
+| `HecEvents` | all accepted events from one HEC request | preserves HEC response/ACK provenance | large uneven groups |
+| `ParseBatch` by event count | N events selected for format interpretation | predictable parser cost | must preserve request provenance |
+| byte-sized `ParseBatch` | target decoded/raw byte size | cache and CPU friendly | event count varies widely |
+| time-window `ParseBatch` | collect until duration expires | latency bound | less deterministic benchmark results |
+| `WriteBlock` | collect until store target size or flush policy fires | efficient output buffering and later indexing | too late for request-level feedback |
 
-Recommendation: keep `EventBatch` as request-scoped at ingress, then allow sink workers to coalesce into store-block batches. Store-block batching should not erase request ID, channel, token, source, or commit-state provenance.
+Recommendation: keep HEC request provenance at ingress, then allow write and search-preparation paths to split or coalesce into `WriteBlock` and `ParseBatch` units. Store/output aggregation must not erase request ID, channel, token, source, or commit-state provenance.
 
-Batch metadata requirements:
+Provenance fields required on `HecEvents`, `ParseBatch`, or `WriteBlock` as applicable:
 
 - request ID;
 - endpoint kind;
@@ -182,8 +178,8 @@ Batch metadata requirements:
 - decoded byte count;
 - event count;
 - parser status counts;
-- queue admission timestamp;
-- sink receipt timestamp;
+- queue insertion timestamp;
+- write path receipt timestamp;
 - commit state timestamp.
 
 ---
@@ -212,7 +208,7 @@ Recommendation: use capture JSONL for fixture and compatibility lab mode, not as
 
 ### 6.2 Length-Delimited Raw Chunks
 
-Store length-prefixed raw events or batches with a checksum per record or block.
+Store length-prefixed raw events or `WriteBlock` units with a checksum per record or block.
 
 Strengths:
 
@@ -231,7 +227,7 @@ Recommendation: likely second storage format after JSONL once replay and durabil
 
 ### 6.3 Column/Segment Store
 
-Store hot fields and token/index structures in separate segment files by sealed block.
+Store hot fields and token/index structures in separate segment files by `WriteBlock` or later store segment.
 
 Strengths:
 
@@ -282,11 +278,11 @@ Recommended initial model:
 
 - append into a small number of hot buckets selected by time/size and possibly benchmark profile;
 - store host, source, sourcetype, index, file path, and parser family as metadata, not as database identity;
-- seal buckets into immutable information blocks;
-- build per-field, per-token, or per-format sidecar structures against sealed blocks;
-- coalesce or repartition sealed data later only when measurements show a search or retention benefit.
+- close buckets into immutable information blocks after store block layout is defined;
+- build per-field, per-token, or per-format sidecar structures against store blocks;
+- coalesce or repartition immutable data later only when measurements show a search or retention benefit.
 
-A dedicated worker for one huge file, one dominant sourcetype, or one high-cost parser may be justified. That is routing and scheduling, not a reason to create a separate database family during ingest.
+A dedicated execution path for one huge file, one dominant sourcetype, or one high-cost parser may be justified. That is routing and scheduling, not a reason to create a separate database family during ingest.
 
 ---
 
@@ -306,7 +302,7 @@ raw or parsed event
   -> optional position/proximity records
   -> per-block term dictionary
   -> per-term postings or field segment
-  -> sealed-block skip metadata
+  -> store-block skip metadata
 ```
 
 Optimization choices:
@@ -324,18 +320,9 @@ Optimization choices:
 
 Recommendation: implement scalar correctness first, then add optimized variants behind agreement tests. A faster tokenizer that changes tokens is a bug, not an optimization.
 
-### 7.2 Prior Prototype Signals
+### 7.2 Reuse Gate
 
-Prior prototype material is useful as evidence, not as code to lift blindly:
-
-| Source | Useful Signal | Store/Pipeline Interpretation |
-|---|---|---|
-| `/Users/walter/Work/Spank/spank-rs/perf/src/parsers.rs` | scalar and `memchr` parser direction | candidate delimiter and parser benchmark implementation after raw correctness is fixed |
-| `/Users/walter/Work/Spank/spank-rs/perf/src/normalize.rs` | field normalization and batch-oriented values | future canonical field/value batch representation |
-| `/Users/walter/Work/Spank/spank-rs/perf/src/tokenize.rs` | search-prep token construction | replayable token worker, not request-path logic |
-| `/Users/walter/Work/Spank/spank-rs/perf/src/store.rs` | null/raw/SQLite benchmark sinks | benchmark-profile store variants, not production schema by default |
-| `spank-hec/src/receiver.rs` | bounded receiver and queue/backpressure ordering | validates need for explicit queue state and pressure counters |
-| `spank-hec/src/processor.rs` | event/null/time/parser test ideas | fixture coverage source, with current limits and HEC outcomes restated before reuse |
+Reuse existing parser, tokenizer, normalization, or storage code only after restating the current requirement, naming the target module, proving naming compatibility, and adding validation cases. Prior code is evidence, not an implementation contract.
 
 ---
 
@@ -347,9 +334,9 @@ Profiles prevent benchmark decisions from leaking into product claims.
 |---|---|---|---|---|
 | `fixture-capture` | written or flushed capture file | reject newest on full | JSONL/capture | testable local HEC fixture |
 | `drop-benchmark` | accepted or queued | configurable | drop sink | parser/HTTP upper bound only |
-| `queue-benchmark` | queued | reject newest or bounded wait | no durable claim | handoff/backpressure capacity |
+| `queue-benchmark` | queued | reject newest or bounded wait | no durable claim | queue/backpressure capacity |
 | `durable-capture` | durable raw/capture block | reject newest or spill | fsync/DB commit | production-like durability baseline |
-| `indexed-store` | durable + indexed | queue plus search-prep workers | sealed blocks + indexes | query-ready ingest |
+| `indexed-store` | durable + search_ready | queue plus search preparation | store blocks + indexes | query-ready ingest |
 
 Every benchmark result must name its profile. A `drop-benchmark` number cannot be cited as ingest capacity for a durable store.
 
@@ -361,15 +348,15 @@ Queue/store validation is part of the store design, not an afterthought.
 
 | Validation Group | Required Cases |
 |---|---|
-| queue admission | empty queue, full queue, simultaneous producers, enqueue timeout, closed receiver |
+| queue insertion | empty queue, full queue, simultaneous producers, enqueue timeout, closed receiver |
 | queue fairness | hot peer/source does not starve control/health path; per-source counters visible |
 | sink states | accepted, queued, written, flushed, durable, failed-after-accept |
 | write failures | permission denied, ENOSPC, short write, interrupted write, path removed |
 | durability | crash before flush, crash after flush, crash after fsync/commit |
 | replay | rebuild parser/index output from raw/capture evidence |
-| batching | request-sized, fixed event count, byte-sized, and store-block batches produce equivalent event sets |
+| grouping | request-sized `HecEvents`, fixed-count `ParseBatch`, byte-sized `ParseBatch`, and `WriteBlock` grouping produce equivalent event sets |
 | token/index | scalar and optimized tokenizers agree on token stream and field assignment |
-| retention | sealed block deletion does not remove blocks still referenced by active metadata |
+| retention | store block retirement does not remove evidence still referenced by active metadata |
 
 Metrics/counters needed for validation:
 
@@ -379,11 +366,11 @@ Metrics/counters needed for validation:
 - sink write duration histogram;
 - flush duration histogram;
 - durable commit duration histogram;
-- batches by commit state;
+- HEC request groups or write units by commit state;
 - events by commit state;
 - bytes by commit state;
 - replay failures;
-- sealed blocks created/retired.
+- store blocks created/retired.
 
 ---
 
@@ -396,7 +383,7 @@ Method:
 1. Identify query and inspection requirements.
 2. Determine which fields/tokens must exist at search time.
 3. Decide whether those fields/tokens are materialized during ingest or built asynchronously.
-4. Choose batch size and queue topology to match the chosen materialization stage.
+4. Choose `ParseBatch`, `WriteBlock`, and queue topology to match the chosen materialization stage.
 5. Choose store block size and sealing rules.
 6. Tune parser and tokenizer parallelism.
 7. Tune network/body limits only after store pressure is visible.
@@ -414,11 +401,11 @@ Examples:
 
 | Area | Question | Blocking Condition |
 |---|---|---|
-| queue topology | global queue, per-source accounting, or per-source queues first? | before implementing queue worker beyond one global queue |
+| queue topology | global queue, per-source accounting, or per-source queues first? | before implementing consumers beyond one global queue |
 | queue-full behavior | reject newest, bounded wait, spill, or drop oldest per mode? | before advertising backpressure behavior |
 | capture format | JSONL, length-delimited JSON, raw chunks, or dual raw+metadata? | before relying on capture for replay |
 | success boundary | does HTTP success mean queued, written, flushed, or durable for each mode? | before ACK or production claims |
-| store block size | event count, byte size, or time window? | before sealed blocks or index segments |
+| store block size | event count, byte size, or time window? | before store blocks or index segments |
 | index timing | ingest-time, asynchronous replay, or query-time? | before Sigma/search acceleration |
 | raw preservation | byte-exact raw bytes or decoded text only in first durable format? | before malicious/non-UTF validation claims |
 | optimized tokenizers | scalar only, SIMD-gated, or per-format optimized variants? | before performance claims beyond correctness path |

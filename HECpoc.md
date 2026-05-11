@@ -14,11 +14,9 @@ This document defines the product contract, protocol behavior, capability bundle
 
 The initial scope is HEC ingest, local capture, inspection, and validation. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them.
 
-Prior attempts are not part of the active design. They are cataloged in `docs/History.md` only as evidence for narrow questions.
-
 ### 1.2 Product Vocabulary
 
-Names should match the domain and data direction. Prefer `Event`, `HecEvent`, `Collector`, `EventSink`, `CaptureSink`, `SinkCommit`, and `InspectQuery`. Avoid `Row` and `Sender` in ingest code unless the role is truly generic and direction-free.
+Names should match the domain and data direction. The selected terminology is governed by Appendix 11: `HecEnvelope`, `RequestRaw`, `RawEvents`, `HecEvents`, `ParseBatch`, `WriteBlock`, concrete dispositions, and truthful commit states. Avoid `Row`, `Sender`, generic `worker`, and generic `Batch` unless the role is truly generic and direction-free.
 
 Rename directories, files, and implementation primitives when the current names obscure function, compatibility, or review. Regularity is a feature here because the repo must be understandable by a small team.
 
@@ -42,7 +40,7 @@ The user wants to start a local endpoint, send events using ordinary HEC clients
 | Backpressure response | Overload becomes visible, not silently accepted |
 | Local inspection | Tests assert stored output without reading internals |
 | Bounded resource use | Bad inputs and slow sinks do not consume unbounded memory or worker time |
-| Resilient failure reporting | Users can distinguish rejected, accepted, captured, and failed-after-accept cases |
+| Resilient failure reporting | Users can distinguish rejected, accepted, written, flushed, durable, and failed-after-accept cases |
 
 ### 2.2 Capability bundles
 
@@ -75,14 +73,15 @@ Request states:
 
 ```text
 HTTP request
-  -> admitted or rejected
   -> authenticated or rejected
-  -> decoded or rejected
-  -> parsed as event/raw or rejected
-  -> normalized into events
-  -> submitted to sink or rejected by backpressure
-  -> captured or committed
-  -> inspectable
+  -> HTTP body read or rejected
+  -> content decoded or rejected
+  -> HEC decoded or rejected
+  -> HEC events validated or rejected
+  -> HecEvents formed
+  -> concrete disposition selected
+  -> commit state recorded
+  -> inspectable when stored
 ```
 
 Core entities:
@@ -93,9 +92,9 @@ Core entities:
 | `HecCredential` | Parsed auth scheme and token |
 | `HecEnvelope` | JSON event endpoint envelope |
 | `HecEvent` | Normalized accepted event |
-| `EventBatch` | One request's accepted events |
-| `SinkCommit` | Sink result visible to validation |
-| `InspectQuery` | Minimal read path over captured events |
+| `HecEvents` | Valid HEC events from one request after HEC decode and validation |
+| commit state | Strongest completed state visible to response, ACK, validation, and reporting |
+| `InspectQuery` | Minimal read path over stored capture evidence |
 
 Each transition should have a validation case before surrounding code is considered stable.
 
@@ -108,7 +107,7 @@ Minimum surface:
 - `/services/collector/health`: report simple availability.
 - `/services/collector/ack`: return a deliberate disabled/unsupported response until commit semantics exist.
 - Body encoding: identity and gzip, with explicit pre-decode and post-decode size policy.
-- Admission controls: bounded request body, decoded body, per-event raw size, and bounded sink handoff.
+- Resource gates: bounded HTTP body, decoded body, per-event raw size, event count, and bounded queue insertion when queue mode exists.
 
 Route aliases such as `/services/collector/1.0/*` should wait for client evidence.
 
@@ -133,7 +132,7 @@ The main design must capture corner cases because they shape parser, error, sink
 | Raw | empty body, trailing newline, CRLF, blank line, whitespace-only line, invalid UTF-8 if text output is used |
 | Gzip and size | valid gzip, malformed gzip, empty decoded body, pre-decode limit, post-decode limit |
 | Metadata | missing values, explicit empty strings, nested fields, non-scalar fields |
-| Backpressure | full queue, slow sink, sink error after accepted handoff |
+| Backpressure | full queue, slow sink, sink error after accepted write/queue disposition |
 | ACK/channel | channel absent, channel empty, channel present with ACK disabled, ACK request before implementation |
 
 ---
@@ -163,14 +162,14 @@ A sink trait is justified only when two concrete implementations need the same c
 
 ### 4.3 Resource and failure boundaries
 
-The sink boundary is where concurrency and resilience become concrete. The collector should not let request handlers become file-system workers under load.
+The core design choice is whether validated `HecEvents` are written synchronously in fixture mode or inserted into a bounded queue for later `WriteBlock` construction. The collector should not let request handlers perform long file or database work under load.
 
 Initial rules:
 
-- Request handlers may parse and normalize small HEC bodies, but they should not perform long blocking writes.
-- Sink writes should happen through a bounded handoff or a clearly synchronous fixture mode; the chosen mode must be visible in validation.
+- Request handlers may HEC-decode and validate small bounded bodies, but they should not perform long blocking writes.
+- The chosen disposition must be visible in validation: `write HecEvents`, `enqueue HecEvents`, `drop HecEvents`, `forward HecEvents`, or `reject request`.
 - Queue depth, max request bytes, max decoded bytes, max raw event bytes, and max events per request should be configurable or at least named constants.
-- Slow sink behavior should be tested by a deliberately blocking or failing sink.
+- Slow write behavior should be tested by a deliberately blocking or failing sink/store path.
 - Capture files should use buffered writes, but flush semantics must be tied to explicit validation expectations.
 - Crash resilience is limited at first: file capture should be append-only and inspectable after process exit, but not advertised as durable ACK storage.
 
@@ -186,8 +185,7 @@ This section is the HECpoc documentation map. Subject-specific documents should 
 | `InfraHEC.md` | cross-cutting service infrastructure | configuration, validation, errors/outcomes, reporting/logging/observability, metrics, lifecycle, runtime policy, security posture, benchmark ledger schema | log-format grammars, queue/store algorithms, socket syscall details |
 | `Stack.md` | ingress and operating-system stack | TCP/HTTP/Tokio/Axum/Hyper, auth/body/gzip/timeouts, kernel socket buffers, page cache notes, system calls, connection accounting, network-layer backpressure | log-line grammars, token/index layout, store retirement policy |
 | `Formats.md` | log and record structure | source format origins, examples, version splits, parser choices, field extraction, field aliases, malformed record cases, format-specific parser validation | generic OS buffering, HEC status mapping, queue topology, durable store layout |
-| `Store.md` | application pipeline and stored evidence | post-framing event pipeline, queue topology, batch boundaries, text-processing handoff, token/index construction, sink states, durable commit, intermediate store, block retirement, production/benchmark profile differences | kernel/socket mechanics, detailed log-format syntax, generic reporting infrastructure |
-| `docs/History.md` | historical evidence archive | prior attempts and abandoned decisions when needed as evidence for a narrow question | active requirements, current task status, implementation direction |
+| `Store.md` | application pipeline and stored evidence | `HecEvents` disposition, queue topology, `ParseBatch` policy, `WriteBlock` construction, commit states, durable commit, intermediate store, token/index construction, production/benchmark profile differences | kernel/socket mechanics, detailed log-format syntax, generic reporting infrastructure |
 
 Inclusion rules:
 
@@ -195,7 +193,7 @@ Inclusion rules:
 2. Validation belongs with the subsystem whose behavior is being proven. Protocol response validation belongs here; socket/header timeout validation belongs in `Stack.md`; parser correctness validation belongs in `Formats.md`; queue/store/durability validation belongs in `Store.md`; report/config validation belongs in `InfraHEC.md`.
 3. References should be specific evidence for the local subject. Avoid empty mentions of another project document just to say it exists.
 4. Stable requirements and justified recommendations stay in reference sections. Work tracking and status tables are kept short and only when they control the next implementation step.
-5. Older code or documents can influence HECpoc only after restating the current requirement, naming the implementation target, adding validation cases, and recording why the old approach remains suitable.
+5. External or historical code can influence HECpoc only after restating the current requirement, naming the implementation target, adding validation cases, and recording why the approach remains suitable.
 
 Decision validity classes:
 
@@ -203,7 +201,7 @@ Decision validity classes:
 |---|---|---|---|
 | Contract | external HEC behavior expected to remain stable | accepted endpoints, auth response shape, event metadata preservation | Splunk/shipper comparison contradicts it |
 | Capability bundle | valid for a named feature group | local fixture capture sink, compatibility lab behavior, durable ingest mode | bundle scope changes or user workflow changes |
-| Implementation stage | valid for current implementation stage | direct capture before queue worker, all-or-nothing JSON request parsing | next stage implements queue, store, or ACK |
+| Implementation stage | valid for current implementation stage | direct capture before bounded queue, all-or-nothing JSON request parsing | next stage implements queue, store, or ACK |
 | Benchmark profile | valid only for measurement | drop sink, prewarmed cache, relaxed durability, fixed payload corpus | benchmark result is cited outside its profile |
 | Deferred | explicitly not decided | ACK commit boundary, JSON partial success, index allow-list syntax | named dependency becomes active |
 
@@ -222,14 +220,14 @@ Current decision gaps that should be normalized into this structure:
 
 The first sequence keeps product behavior and implementation infrastructure aligned without duplicating the infrastructure spec here.
 
-1. Implement configuration and startup infrastructure from `InfraHEC.md §§7, 11, 20`.
-2. Centralize HEC outcomes and request error mapping from `InfraHEC.md §§8, 10, 20`.
+1. Implement typed configuration, validation, startup, and shutdown.
+2. Centralize HEC outcomes, request error mapping, and public message text.
 3. Lock raw/event protocol behavior for auth, body, gzip, JSON envelopes, raw line framing, and no-data cases.
 4. Create request fixtures for JSON event, raw, gzip, malformed auth, malformed JSON, bad gzip, oversize bodies, and no-data bodies.
-5. Implement capture sink states enough to distinguish accepted, queued, captured, flushed, and durable claims.
-6. Add bounded handoff between request processing and sink writing once direct capture behavior is stable.
+5. Implement capture states enough to distinguish accepted, queued, written, flushed, and durable claims.
+6. Add bounded queue insertion between `HecEvents` formation and write path once direct capture behavior is stable.
 7. Run local curl/process tests, then selected Splunk Enterprise and Vector comparisons.
-8. Record benchmark and validation evidence using `InfraHEC.md §§17–18`.
+8. Record benchmark and validation evidence with stable run metadata, stage timing, resource samples, and result files.
 
 First target:
 
@@ -272,7 +270,7 @@ This register keeps the unresolved work visible without forcing everything into 
 |------|-----------------|------------------|
 | Capture format | The first file format is not selected | Choose JSONL or length-delimited JSON and document exact fields |
 | Raw preservation | Text preservation and byte preservation are not the same | Start with text comparison; plan raw-byte preservation before replay claims |
-| Sink commit | Accepted, queued, captured, flushed, and durable are different states | Name these states and decide what HTTP success means |
+| Sink commit | Accepted, queued, written, flushed, and durable are different states | Name these states and decide what HTTP success means |
 | Sink failure | A sink may fail after request acceptance | Decide whether failure changes health, phase, metrics, or only run ledger |
 | Inspection API | Term/time inspection is needed, but exact command/interface is unsettled | Start with one readback helper over capture files |
 | Index namespace | `index` is logical first, physical later | Store as event field; defer partitioning |
@@ -282,16 +280,9 @@ This register keeps the unresolved work visible without forcing everything into 
 
 ## 8. References
 
-References are split into current project documents and external comparison points. Historical project material is cataloged separately in `docs/History.md` and is not authoritative for this repo.
+References here are external comparison points. The documentation map above is the source for project-document placement.
 
-### 8.1 Current Project Documents
-
-1. `/Users/walter/Work/Spank/HECpoc/InfraHEC.md` — infrastructure implementation spine; specific current anchors are §7 config, §8 errors/outcomes/reporting, §11 lifecycle, §17 validation, §18 benchmarks, and §20 sequence.
-2. `/Users/walter/Work/Spank/HECpoc/Stack.md` — network ingress and request-processing ledger; specific current anchors are §§6–12 Tokio/Axum/auth/gzip/body/timeouts, §28 accept/receive paths, §30 kernel/runtime knobs, §§35–36 buffering and raw splitting.
-3. `/Users/walter/Work/Spank/HECpoc/docs/PerfIntake.md` — performance intake notes for benchmark design and optimization admission.
-4. `/Users/walter/Work/Spank/HECpoc/docs/History.md` — non-authoritative catalog of prior attempts and abandoned approaches.
-
-### 8.2 External Comparison Points
+### 8.1 External Comparison Points
 
 1. [Splunk: Format events for HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector) — JSON envelope and metadata examples.
 2. [Splunk: Troubleshoot HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/TroubleshootHTTPEventCollector) — error/status behavior.
@@ -302,9 +293,9 @@ References are split into current project documents and external comparison poin
 
 ---
 
-## 9. Appendix — Validation Pass 2026-05-05
+## 9. Appendix — Validation And Benchmark Evidence
 
-This appendix records the first broader validation pass after the infrastructure/reporting changes. It is intentionally concrete: what was mapped, what was run, what broke, what was fixed, and what remains open.
+This appendix records concrete validation and benchmark evidence: what was mapped, what was run, what broke, what was fixed, and what remains open.
 
 ### 9.1 Reporter Component Map
 
@@ -316,7 +307,7 @@ Reporter component/source mapping is now part of the stack design and code path.
 | `Component::Auth` | `hec.auth` | authorization header and token checks | `hec.auth.token_required`, `hec.auth.invalid_authorization`, `hec.auth.token_invalid` |
 | `Component::Body` | `hec.body` | content length, body read, gzip decode | `hec.body.too_large`, `hec.body.timeout`, `hec.body.gzip_request`, `hec.body.gzip_failed` |
 | `Component::Parser` | `hec.parser` | event/raw interpretation | `hec.parser.failed`, `hec.parser.events_parsed` |
-| `Component::Sink` | `hec.sink` | event handoff and capture/drop sink | `hec.sink.failed`, `hec.sink.completed` |
+| `Component::Sink` | `hec.sink` | `HecEvents` disposition and capture/drop sink | `hec.sink.failed`, `hec.sink.completed` |
 
 Important implementation detail: `tracing` callsite targets must be literals, not dynamic strings. The implementation therefore branches on `Component` and emits through literal targets such as `target: "hec.auth"`. This is mildly repetitive but keeps target-level filtering fast and compatible with `tracing-subscriber::EnvFilter`.
 
@@ -336,7 +327,7 @@ Receiver configuration used:
 
 - release binary;
 - capture sink enabled;
-- max wire bytes `30_000_000`;
+- max HTTP body bytes `30_000_000`;
 - max decoded bytes `60_000_000`;
 - max events `1_000_000`;
 - JSON tracing enabled;
@@ -439,7 +430,7 @@ These are observed or strongly suspected from code inspection and the validation
 |------|------------------------|------|-----------------------|
 | Raw parser allocation | creates a `String` and full `Event` per line immediately | high allocation rate for large raw batches | introduce `RawEventRef`/batch representation or bytes-backed event until sink/store boundary |
 | Raw byte preservation | raw endpoint stores lossy text plus byte length, not original bytes | cannot replay exact binary/log input | add optional raw byte capture or escaped byte field before claiming byte-preserving ingest |
-| Capture sink | opens and flushes file per request batch under a mutex | poor high-concurrency write behavior | persistent buffered writer or sink worker with explicit flush policy |
+| Capture sink | opens and flushes file per HEC request group under a mutex | poor high-concurrency write behavior | persistent buffered writer or write path with explicit flush policy |
 | Reporter field serialization | dynamic fields are collapsed into JSON string for tracing | less useful structured filtering/querying in tracing backend | static fields for hot/common fields or custom `valuable`/JSON layer later |
 | Counter labels | counters are flat atomics without reason labels | loses distinction between rejection causes beyond a few coarse counters | introduce bounded reason enums or structured stats snapshot |
 | Request failure accounting | benchmark run showed 5 request failures with no detailed counters | possible unclassified failure path or warmup artifact | add `REQUEST_FAILED` reason field and trace failed responses during benchmark repro |
@@ -582,7 +573,7 @@ Current implementation anchors:
 1. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs` — HEC response body and HTTP status mapping.
 2. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` — configurable HEC response code defaults.
 3. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/config.rs` — CLI/env/TOML/default limits and validation.
-4. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/body.rs` — advertised length, wire body, timeout, and gzip limit handling.
+4. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/body.rs` — advertised length, HTTP body, timeout, and gzip limit handling.
 5. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_event.rs` — `/services/collector/event` JSON envelope parsing.
 6. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_raw.rs` — `/services/collector/raw` line splitting and lossy text conversion.
 7. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` — route handling, health response, and current handler-level tests.
@@ -659,7 +650,7 @@ Current configured values and constraints:
 | `hec.addr` | `127.0.0.1:18088` | valid socket address; port must be greater than zero | listener bind at startup |
 | `hec.token` | `dev-token` | non-empty; no ASCII control characters | exact token membership in `TokenStore` |
 | `hec.capture` | none | if present, cannot be empty | file sink path when capture sink is wired |
-| `limits.max_bytes` | `1_048_576` | must be greater than zero | maximum advertised `Content-Length` and maximum received wire body bytes |
+| `limits.max_bytes` | `1_048_576` | must be greater than zero | maximum advertised `Content-Length` and maximum received HTTP body bytes |
 | `limits.max_decoded_bytes` | `4_194_304` | must be at least `max_bytes` | maximum identity body after receipt and maximum gzip-expanded body |
 | `limits.max_events` | `100_000` | must be greater than zero | maximum parsed events per request for raw and event endpoints |
 | `limits.idle_timeout` | `5s` | must be greater than zero | maximum wait for next body frame |
@@ -679,7 +670,7 @@ Current hard or implicit limits:
 - No independent per-line maximum exists for raw input; a single raw line may consume almost the whole decoded body cap.
 - No independent JSON nesting, string length, field count, metadata length, token length maximum, or index/source/sourcetype length maximum exists.
 - No accepted-connection count, concurrent-request count, per-peer byte rate, or per-peer failure-rate limit exists yet.
-- No configured queue capacity exists yet because enqueue/dequeue is not wired as the core handoff path.
+- No configured queue capacity exists yet because enqueue/dequeue is not wired as the core path from `HecEvents` to write path.
 - No explicit read buffer size is exposed beyond Axum/Hyper/Tokio internals and the gzip scratch buffer.
 - No filesystem flush, `fsync`, rotation, capture-file size, or disk-available bound exists for capture mode.
 
@@ -905,11 +896,11 @@ Postponed `fields` tests:
 |------|---------------------|--------------------|---------------------------|
 | `7` incorrect index | event names an index not allowed for token/config | index registry and token-to-index policy | send allowed and disallowed `index` values and verify response/counter |
 | `23` shutting down | request arrives after shutdown begins and intake is closed | graceful shutdown orchestration around existing `Phase::Stopping` behavior | begin shutdown, send request during drain, expect `503/code23` or documented alternate |
-| `26` queue at capacity | bounded ingest queue cannot accept more work | bounded queue, queue policy, and source/request admission counters | fill queue with blocked worker, send one more request, expect `429/code26` or chosen busy mapping |
+| `26` queue at capacity | bounded ingest queue cannot accept more work | bounded queue, queue policy, and source/request capacity counters | fill queue with blocked write path, send one more request, expect `429/code26` or chosen busy mapping |
 | `27` ACK channel at capacity | ACK-enabled request/batch needs a channel but channel capacity is exhausted | ACK channel registry and capacity policy | create max channels, send new channel, expect `429/code27` or Splunk-matched response |
 | `18`/`19`/`20` health subcauses | queue full, ACK unavailable, or both | queue health and ACK health exposed separately | health endpoint under forced queue/ACK conditions |
 
-Current `23` status: implemented at the handler/lifecycle-phase level. `Phase::Stopping` now returns `503/code23` for `/services/collector/health` and for new ingest requests. What remains is a system-level graceful-shutdown test that starts the real server, initiates shutdown, proves new work is rejected with code `23`, and proves already accepted work reaches the selected sink boundary.
+Current `23` status: implemented at the handler/lifecycle-phase level. `Phase::Stopping` now returns `503/code23` for `/services/collector/health` and for new ingest requests. What remains is a system-level graceful-shutdown test that starts the real server, initiates shutdown, proves new work is rejected with code `23`, and proves already accepted work reaches the selected commit boundary.
 
 #### Backpressure Before Queue Full
 
@@ -922,7 +913,7 @@ Backpressure cannot be validated as queue-full until a bounded queue exists. Int
 5. slow body timeout;
 6. concurrent request smoke runs with stats deltas.
 
-These prove bounded request processing, not end-to-end queue backpressure. The first real queue-full test should use a bounded queue of size `1`, a sink worker deliberately blocked on a test latch, and one extra request that must receive a deterministic retryable response.
+These prove bounded request processing, not end-to-end queue backpressure. The first real queue-full test should use a bounded queue of size `1`, a write path deliberately blocked on a test latch, and one extra request that must receive a deterministic retryable response.
 
 #### Development Blocker Status
 
@@ -934,12 +925,10 @@ These prove bounded request processing, not end-to-end queue backpressure. The f
 | Lifecycle | handler-level `Phase::Stopping` implemented | graceful drain semantics, shutdown request behavior, accepted-work completion | add graceful-shutdown system test harness |
 | Index policy | not implemented | code `7`, per-token allowed index validation, logical namespace enforcement | define minimal index allow-list config and behavior for unknown index |
 | ACK | postponed, request/batch scoped | codes `10`, `11`, `14`, `19`, `20`, `25`, `27`, `ackId` registry and commit-boundary semantics | implement only after `ack.boundary` and registry design are encoded in config/tests |
-| Queue/backpressure | not implemented | code `26`, health queue-full state, source admission policy | add bounded queue and blocked-worker test |
+| Queue/backpressure | not implemented | code `26`, health queue-full state, source admission policy | add bounded queue and blocked-write-path test |
 | Axum accept visibility | deferred | connection counts, peer culling, header timeout tuning, socket backlog/buffers | add task for owned accept loop using `TcpSocket` + Hyper/hyper-util after current HEC matrix stabilizes |
 
 ## 11. Appendix — Data-Path Terminology And Stage Definitions
-
-Status: proposed terminology for active HECpoc design. This replaces earlier over-broad terms such as `admission decision`, `handoff`, and `sealed block` in the common vocabulary.
 
 Purpose: name the data component of HECpoc processing from the HTTP request as exposed by Axum/Hyper through HEC validation, batching, queueing, writing, and optional later interpretation. The names should follow function first, and component names second.
 
@@ -1153,7 +1142,7 @@ Avoid vague `admission decision` and `handoff`. Name the concrete disposition:
 
 | Disposition | Meaning |
 |-------------|---------|
-| reject request | no valid accepted batch is produced; HEC response reports the reason |
+| reject request | no valid `HecEvents` unit is produced; HEC response reports the reason |
 | enqueue HecEvents | `HecEvents` entered a bounded queue |
 | write HecEvents | `HecEvents` was written by the configured sink path |
 | drop HecEvents | `HecEvents` intentionally discarded in explicit drop/benchmark mode |
@@ -1191,4 +1180,17 @@ If approved, apply these rules across active documents and new code:
 7. Do not introduce `sealed block` into common terminology until store block layout exists.
 8. Every success, ACK, stored, or committed claim must name the commit state it actually reached.
 
-Approval question: apply this terminology cleanup to `Store.md`, `Stack.md`, `InfraHEC.md`, and code identifiers now, or keep it as the governing appendix until the queue/store implementation starts?
+### 11.12 Visual Reference Candidates
+
+Use visuals to reduce repeated prose, not to create another status layer. Good candidates:
+
+| Visual | Purpose | Best Location |
+|--------|---------|---------------|
+| Stage flow diagram | Show `HTTP request` through `HecEvents`, disposition, commit state, and optional interpretation/search preparation | `HECpoc.md` Appendix 11 |
+| Terminology crosswalk | Compare Splunk, Vector, and HECpoc terms without forcing identical architecture | `HECpoc.md` Appendix 11 |
+| Commit-state ladder | Prove which response/ACK/log claims are allowed at accepted, queued, written, flushed, durable, and search-ready states | `Store.md` or `HECpoc.md` Appendix 11 |
+| `HecBatch` vs `WriteBlock` diagram | Show why HTTP input grouping and store/output grouping are different | `Store.md` |
+| Buffer/queue pressure map | Place kernel buffers, Hyper body stream, HEC body limits, queues, and write buffers in order | `Stack.md` |
+| Validation matrix | Tie each protocol condition to HTTP status, HEC code, metric, log/report fact, and test fixture | `HECpoc.md` Appendix 9 |
+
+

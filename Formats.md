@@ -1,7 +1,5 @@
 # Formats — Log Record Structures, Parser Technique, And Format-Specific Processing
 
-Status: reference and requirements input.
-
 Scope: log and record formats that Spank HECpoc must preserve, parse, classify, normalize, tokenize, index, validate, and eventually search. This document owns format origins, structural examples, parser choices, edge cases, exception handling, and source-specific technical nuance. It does not own HEC wire behavior, Tokio/Axum mechanics, configuration infrastructure, or project status.
 
 Primary local source carried forward: `/Users/walter/Work/Spank/spank-py/Logs.md`, especially the format taxonomy, timestamp problem, syslog/auth.log validation, Apache access inventory, Vector coverage model, Sigma context, parser dispatch alternatives, and auth.log corpus expansion findings. This document restates only the material needed for the Rust HECpoc direction.
@@ -63,7 +61,7 @@ Mar 10 23:30:31 host sshd[1234]: Failed password for invalid user admin from 203
 References:
 
 - [RFC 5424 — The Syslog Protocol](https://www.rfc-editor.org/rfc/rfc5424.html) defines modern syslog header and structured data.
-- `/Users/walter/Work/Spank/spank-py/Logs.md §4` documents prior syslog parser findings and the Ubuntu ISO timestamp fix.
+- `/Users/walter/Work/Spank/spank-py/Logs.md §4` documents syslog parser findings and the Ubuntu ISO timestamp fix.
 
 Parser implications:
 
@@ -261,7 +259,7 @@ Auth subparser fields:
 | `auth_method` | password, publickey, keyboard-interactive, etc. |
 | `stage` | preauth or session stage when emitted |
 
-Known version split from prior validation:
+Known version split from validation:
 
 ```text
 OpenSSH 6.x:  Received disconnect from 187.12.249.74: 11: Bye Bye [preauth]
@@ -270,7 +268,7 @@ OpenSSH 7.x+: Received disconnect from 101.36.123.66 port 43856:11: Bye Bye [pre
 
 Requirements:
 
-- Accept both old and new OpenSSH message forms.
+- Accept both legacy and current OpenSSH message forms.
 - Keep unmatched auth messages as structured syslog events with `process=sshd` and raw `message`.
 - Store `parse_family=syslog`, `parse_variant=linux_auth`, `parse_status=matched|partial|unmatched`.
 - Avoid one monolithic regex; use prefix parse followed by process/message dispatch.
@@ -625,7 +623,7 @@ Open format gaps:
 
 Local:
 
-- `/Users/walter/Work/Spank/spank-py/Logs.md` — prior format landscape, syslog/auth.log validation, Apache access inventory, parser dispatch alternatives, Vector coverage model, and normalization comparison.
+- `/Users/walter/Work/Spank/spank-py/Logs.md` — format landscape, syslog/auth.log validation, Apache access inventory, parser dispatch alternatives, Vector coverage model, and normalization comparison.
 - `/Users/walter/Work/Spank/sOSS/sigma` — local Sigma rule corpus used for logsource counts.
 - `/Users/walter/Work/Spank/sOSS/vector` — local Vector implementation and docs.
 

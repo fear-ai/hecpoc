@@ -1,7 +1,5 @@
 # Stack — HECpoc HTTP Stack Without Application-Level Tower
 
-Status: design decision and implementation reference.
-
 Scope: focused Splunk HEC-compatible receiver in Rust, using Tokio and Axum while deliberately avoiding direct use of Tower middleware for protocol-critical behavior. This document records HTTP stack, buffering, and request-processing details that are more specific than the infrastructure-wide design.
 
 ## 1. Decision
@@ -65,7 +63,7 @@ accept socket
   -> HEC handler receives Request<Body>
   -> classify endpoint and method
   -> read cheap headers only
-  -> phase / health / admission check
+  -> phase / health / capacity check
   -> authenticate before body collection
   -> reject unsupported encoding before body collection
   -> enforce advertised Content-Length if present
@@ -112,11 +110,11 @@ Tokio is kept as infrastructure:
 - `#[tokio::main]` or explicit runtime for the binary.
 - `tokio::net::TcpListener` for binding when using `axum::serve`.
 - `tokio::time::timeout` for body-read, decode, enqueue, and shutdown budgets.
-- `tokio::sync::mpsc` for bounded ingestion queue when there is a background sink worker.
+- `tokio::sync::mpsc` for bounded ingestion queue when there is a background write path.
 - `tokio::signal` for graceful shutdown.
 - `tokio::task::JoinSet` for owned task groups once there is more than one background task.
 
-Do not use Tokio as a place to hide CPU work. JSON parsing and gzip decompression happen on the request task initially because the PoC body sizes are bounded. If profiling shows gzip, parse, normalization, tokenization, indexing, or durable write preparation dominating async worker threads, move that specific stage behind an explicit CPU/sink boundary.
+Do not use Tokio as a place to hide CPU work. JSON parsing and gzip decompression happen on the request task initially because the PoC body sizes are bounded. If profiling shows gzip, parse, normalization, tokenization, indexing, or durable write preparation dominating async runtime threads, move that specific stage behind an explicit CPU or write-path execution boundary.
 
 Recent Tokio/DataFusion review sharpens the rule:
 
@@ -125,7 +123,7 @@ Recent Tokio/DataFusion review sharpens the rule:
 | Accept, HTTP parse, body frame read, auth, health, stats | I/O runtime | I/O runtime | must stay responsive under parser and sink load |
 | Small bounded gzip/JSON/raw splitting | request task | CPU runtime or dedicated pool if measured expensive | batch-sized work; no unbounded per-request CPU loops |
 | Parse/normalize/tokenize/index construction | not in first HEC hot path | explicit CPU pool or separate Tokio runtime | bounded input batches, cancellation/checkpoint points, queue depth metrics |
-| File/database durable sink | sink worker | dedicated sink workers; short `spawn_blocking` only for bounded calls | commit boundary and backpressure state visible |
+| File/database durable sink | write path | dedicated write tasks; short `spawn_blocking` only for bounded calls | commit boundary and backpressure state visible |
 | Long-lived workers | background task or thread | dedicated task group/thread | not `spawn_blocking` loops |
 
 `spawn_blocking` is not the default answer for CPU-heavy ingest. Tokio's own docs say its blocking pool has a large default cap, needs an explicit semaphore for many CPU computations, and cannot abort already-started tasks. Use it for bounded blocking calls. Use a dedicated pool/runtime when the work is persistent, CPU-saturating, or cancellation-sensitive.
@@ -275,7 +273,7 @@ That is useful generic HTTP behavior, but HECpoc needs:
 - explicit compressed and decompressed size accounting;
 - explicit malformed-gzip response behavior;
 - visible test points for gzip bombs;
-- observability that records wire bytes and decoded bytes separately.
+- observability that records HTTP body bytes and decoded body bytes separately.
 
 Current spank-rs already uses manual `flate2::read::GzDecoder` and maps malformed gzip to HEC invalid data. That is closer to what we need, but HECpoc should improve it by bounding decoded output.
 
@@ -330,7 +328,7 @@ Tower's body-limit layer does two useful things:
 - It rejects `Content-Length` larger than the configured limit before reading the body.
 - It wraps unknown-length bodies so reading past the limit returns an error.
 
-But it returns generic `413 Payload Too Large`, and the limit is one-dimensional. HEC needs a visible policy for wire bytes, decoded bytes, event count, and HEC-compatible responses.
+But it returns generic `413 Payload Too Large`, and the limit is one-dimensional. HEC needs a visible policy for HTTP body bytes, decoded bytes, event count, and HEC-compatible responses.
 
 The current spank-rs check happens after Axum has already extracted `Bytes`, which means the whole request has already been read into memory. HECpoc should not repeat that.
 
@@ -486,8 +484,8 @@ Keep these design hooks:
 - reject missing channel when ACK is enabled;
 - validate channel format when ACK mode requires it;
 - reserve response metadata for `ackId`;
-- define a request/batch commit boundary before implementing ACK;
-- keep sink result capable of returning committed request/batch IDs or failure.
+- define a request/HEC batch commit boundary before implementing ACK;
+- keep sink result capable of returning committed request/HEC batch IDs or failure.
 
 Do not fake ACK durability. Returning `ackId` before a defined local commit boundary is worse than not supporting ACK, except in an explicitly labeled benchmark mode such as ACK-on-enqueue.
 
@@ -496,7 +494,7 @@ Do not fake ACK durability. Returning `ackId` before a defined local commit boun
 Without `tower-http::trace`, we must implement small explicit logging:
 
 - request method/path/status/code/duration;
-- wire bytes and decoded bytes;
+- HTTP body bytes and decoded body bytes;
 - queue depth and queue full count;
 - parse error class, not raw body;
 - auth outcome class, not token;
@@ -805,7 +803,7 @@ compiled defaults < TOML file < command line < environment
 | Listen address | `hec.addr` | `HEC_ADDR` | `127.0.0.1:18088` | Socket address for the receiver. Supports IPv4 or IPv6 socket syntax. |
 | Token | `hec.token` | `HEC_TOKEN`, fallback `SPANK_HEC_TOKEN` | `dev-token` | Accepted Splunk HEC token. |
 | Capture path | `hec.capture` | `HEC_CAPTURE` | none | Optional JSONL accepted-event capture sink. Absence uses drop sink. |
-| Max wire bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `1_048_576` | Maximum advertised and actually read request bytes before decompression. |
+| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `1_048_576` | Maximum advertised and actually read request bytes before decompression. |
 | Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `4_194_304` | Maximum bytes after gzip decompression. |
 | Max events | `limits.max_events` | `HEC_MAX_EVENTS` | `100_000` | Maximum HEC events in one request body. |
 | Idle body timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `5s` | Maximum time waiting for a body frame. |
@@ -997,7 +995,7 @@ That fallback is useful later, but the current Axum layer avoids hand-written HT
 
 `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` owns the application receive pipeline:
 
-1. health admission;
+1. health capacity;
 2. auth header parse and token check;
 3. content encoding parse;
 4. advertised `Content-Length` rejection;
@@ -1091,7 +1089,7 @@ Connection sorting/binning views should be derived snapshots, not maintained in 
 
 - by start time;
 - by last I/O time;
-- by total wire bytes;
+- by total HTTP body bytes;
 - by lifetime bytes/sec;
 - by recent bytes/sec;
 - by request count;
@@ -1191,7 +1189,7 @@ Current code uses the simple path. Expansion path:
 
 - `tokio::net::TcpSocket`: explicit IPv4/IPv6 socket creation, `set_reuseaddr`, `set_recv_buffer_size`, `listen(backlog)`.
 - `socket2`: access to options Tokio does not expose directly, including platform-specific keepalive, reuseport, send buffer, dual-stack controls, and raw file-descriptor/socket conversion.
-- Manual `listener.accept().await`: connection registry, per-IP admission, high-water stats, and culling hooks.
+- Manual `listener.accept().await`: connection registry, per-IP capacity, high-water stats, and culling hooks.
 - `hyper-util`: direct per-connection serving once Axum `serve` is too opaque.
 - Tokio runtime builder: explicit worker threads and thread names; CPU affinity requires OS calls or a crate such as `core_affinity` and careful measurement.
 
@@ -1220,27 +1218,27 @@ Policy must include both values and actions. Suggested policy dimensions:
 | Sink failure | sink retry policy | 503, retry bounded, spill, drop with counter | 503 for request-scoped failure. |
 | Parser optional fields | schema policy | preserve raw only, parse shallow, parse deep later | preserve raw plus shallow HEC fields. |
 
-These policies should be represented as data, not hidden in routine names such as `drop_only`. Names such as `SinkMode::Drop`, `SinkMode::CaptureFile`, `AdmissionPolicy`, `OverflowAction`, and `MalformedEventPolicy` are preferable because the source, token, thread, or flow can carry flags for later interpretation.
+These policies should be represented as data, not hidden in routine names such as `drop_only`. Names such as `SinkMode::Drop`, `SinkMode::CaptureFile`, `CapacityPolicy`, `OverflowAction`, and `MalformedEventPolicy` are preferable because the source, token, thread, or flow can carry flags for later interpretation.
 
-## 32. Application Handoff After Auth And Decompression
+## 32. Stack Output After Auth And Content Decode
 
-Stack owns the transport and bounded-body side of the handoff. After auth, size checks, optional gzip decode, and endpoint framing, the stack should deliver a bounded decoded input or a request-scoped event candidate batch to application code. It should not own parser grammar, tokenization, index construction, durable commit, or retention policy.
+Ingress stack owns transport, HTTP framing, auth, bounded body read, content decode, and HEC-visible framing. After those checks, it should deliver `RequestRaw`, `RawEvents`, `HecEnvelope`, or `HecEvents` facts to application code. It should not own log-format parser grammar, tokenization, index construction, durable commit, or retention policy.
 
-Stack-owned handoff requirements:
+Stack-owned output requirements:
 
-- account wire bytes and decoded bytes separately;
-- enforce advertised, wire, decoded, timeout, and event-count limits before unbounded allocation;
+- account HTTP body bytes and decoded body bytes separately;
+- enforce advertised, HTTP body, decoded, timeout, and event-count limits before unbounded allocation;
 - preserve endpoint, route alias, peer, request ID, token class, content encoding, and body-limit reasons;
 - distinguish transport/body errors from parser errors;
 - expose enough context for later queue mapping without deciding queue topology;
 - avoid panics on invalid UTF-8, NUL bytes, CRLF, chunked bodies, or malformed gzip.
 
-Handoff shapes:
+Stack output shapes:
 
 | Endpoint | Stack Output | Notes |
 |---|---|---|
-| `/services/collector/raw` | bounded decoded byte buffer plus raw-line boundary observations | line structure and parser interpretation are not network responsibilities |
-| `/services/collector/event` | bounded decoded byte buffer or parsed HEC envelopes, depending on implementation stage | HEC envelope error mapping remains protocol-facing |
+| `/services/collector/raw` | `RequestRaw` plus `RawEvents` boundary observations | log-format parser interpretation is not a network responsibility |
+| `/services/collector/event` | decoded body plus `HecEnvelope` or `HecEvents`, depending on implementation stage | HEC envelope error mapping remains protocol-facing |
 | future file input | file read chunks plus source path/fingerprint | file-system page-cache and read-buffer behavior remain stack/OS concerns |
 
 Open stack questions:
@@ -1265,7 +1263,7 @@ Stack-level requirement: preserve enough context for later queue and store decis
 | --- | --- | --- |
 | P0 | Add `ConnectionStats` counters | True connection current/accepted/closed/rejected/max visibility. |
 | P0 | Introduce manual listener construction | Explicit backlog, recv buffer, IPv4/IPv6 choice, socket policy. |
-| P0 | Define ingress handoff facts | Preserve peer, route, endpoint, byte counts, token class, and request timing for downstream queue decisions. |
+| P0 | Define stack output facts | Preserve peer, route, endpoint, body lengths, token class, and request timing for downstream queue decisions. |
 | P1 | Add policy structs | Values plus actions for body, gzip, parser, queue, connection limits. |
 | P1 | Add source context struct | Carries connection/session/source metadata to downstream routing without choosing storage identity. |
 | P1 | Add `/hec/connections` snapshot | Sorted/bin views for current connections. |
@@ -1298,7 +1296,7 @@ client userspace buffer
   -> Hyper HTTP parser/body channel
   -> HEC bounded body reader
   -> optional gzip decode buffer
-  -> application handoff
+  -> stack output
 ```
 
 A slowdown at any layer can look like application slowness unless the layer has counters or sampled visibility.
@@ -1314,7 +1312,7 @@ Before application code sees data, the kernel controls connection attempts and b
 - TCP sequence numbers and ACK windows preserve byte order per connection, not ordering across connections.
 - Packet loss, ECN, RED, CoDel, fq_codel, or NIC queue policies can matter in remote tests and mostly disappear in loopback tests.
 
-Application equivalents of early drop are per-IP admission limits, queue high-water health degradation, and server-busy responses before memory exhaustion.
+Application equivalents of early drop are per-IP capacity limits, queue high-water health degradation, and server-busy responses before memory exhaustion.
 
 ### 35.3 Tokio, Hyper, And Axum Buffers
 
@@ -1336,9 +1334,9 @@ Implications:
 | socket send buffer | OS default | `socket2` when needed |
 | keepalive/nodelay/reuse | default/library behavior | explicit socket options after owned listener |
 | HTTP headers | Hyper defaults | direct Hyper builder or front proxy |
-| wire body | HEC bounded reader | cap, drain/close policy, preallocation policy |
+| HTTP body | HEC bounded reader | cap, drain/close policy, preallocation policy |
 | gzip scratch/output | HEC configured buffers | scratch size and decoded cap |
-| application handoff | current handler-local path | queue/store design outside stack |
+| stack output | current handler-local path | queue/store design outside stack |
 
 ### 35.5 File-System And Page-Cache Notes
 
@@ -1380,7 +1378,7 @@ Replacement path:
 5. default to `memchr` only after behavior and benchmark agreement;
 6. later add streaming splitter that consumes body frames without requiring one decoded body allocation.
 
-This preserves the PerfIntake principle: keep a scalar correctness path before optimized paths, use proven crates before unsafe/SIMD, and import SpankMax ideas only when the benchmark names the exact need.
+This preserves the optimization rule: keep a scalar correctness path before optimized paths, use proven crates before unsafe/SIMD, and import specialized parser ideas only when the benchmark names the exact need.
 
 ### 36.1 Byte And Character Semantics By Stage
 
@@ -1429,17 +1427,17 @@ Internal names should remain stable:
 EndpointKind::{Event, Raw, Health, Ack}
 HecRequest
 SourceContext
-EventBatch
+HecEvents
 EventSink
-SinkCommit
+commit state
 HecResponse
 ```
 
 Do not create separate handlers, parser types, sink paths, or metrics labels for each alias unless testing alias behavior itself. Route alias is metadata; endpoint kind is behavior.
 
-## 38. Prior Performance Findings Applied To Ingress
+## 38. Performance Findings Applied To Ingress
 
-Prior performance work should not be imported wholesale into the ingress stack. Stack uses only the findings that affect HTTP acceptance, bounded body reading, framework choice, and transport-level measurement:
+Performance findings belong here only when they affect HTTP acceptance, bounded body reading, framework choice, and transport-level measurement:
 
 - `spank-hec/src/receiver.rs` informs queue/backpressure ordering, but its Axum `Bytes` extractor path should not be lifted over current bounded body read.
 - `spank-hec/src/processor.rs` informs event/null/time/parser tests, but its raw and gzip limits are weaker than current code.
@@ -1497,7 +1495,7 @@ Several timeouts are needed because they defend against different failures and a
 | Minimum body rate | not implemented | attacker sends just under idle timeout forever | add after body tests; Apache `MinRate` pattern is the model |
 | Request processing timeout | not implemented as one wrapper | parser/sink hang after full body | add around parse+sink when sink queue exists |
 | Enqueue timeout | not implemented | bounded queue near full, brief backpressure may recover | add with queue policy; default probably very small or zero for HEC retryability |
-| Sink write/flush timeout | not implemented | filesystem or DB stalls after acceptance | add with sink worker and commit-state policy |
+| Sink write/flush timeout | not implemented | filesystem or DB stalls after acceptance | add with write path and commit-state policy |
 | Keep-alive idle timeout | not configured in app | idle connection slot retention | future Hyper direct or front proxy setting |
 | Graceful shutdown timeout | partially conceptual | process never exits due to in-flight work | add with lifecycle/shutdown design |
 
@@ -1538,7 +1536,7 @@ Stage 1 tests should stay at handler level for values that can be represented by
 Add a future implementation task: replace `axum::serve(listener, app)` with owned listener construction and per-connection serving when one of these becomes required:
 
 1. connection current/max counters;
-2. peer/IP admission and culling;
+2. peer/IP capacity and culling;
 3. configured listen backlog or socket receive buffer;
 4. configured Hyper `http1::Builder` values;
 5. header read timeout or max header count tests;
@@ -1599,7 +1597,7 @@ The next test harness should therefore distinguish:
 
 Splunk HEC indexer acknowledgment is a request-level confirmation protocol layered on HEC. Official Splunk docs say ordinary successful HEC receipt returns before the event enters the full processing pipeline; ACK-enabled tokens instead return an `ackID`, and the client polls `/services/collector/ack` with the same channel to learn whether the request reached the indexed/replicated boundary Splunk defines.
 
-ACK granularity for HECpoc should be request/batch scoped, not event/row/line scoped. If one HTTP request contains 500 raw lines or 500 stacked JSON objects, the response should contain at most one `ackId` for that submitted request. Internally the ACK may depend on all events in the request reaching the selected commit boundary.
+ACK granularity for HECpoc should be request/HEC batch scoped, not event/row/line scoped. If one HTTP request contains 500 raw lines or 500 stacked JSON objects, the response should contain at most one `ackId` for that submitted request. Internally the ACK may depend on all events in the request reaching the selected commit boundary.
 
 Minimum compatible semantics:
 
@@ -1621,7 +1619,7 @@ Configurable ACK boundary is acceptable if the mode name makes the guarantee obv
 
 | Boundary | Intended use | Meaning | Production posture |
 |----------|--------------|---------|--------------------|
-| `enqueue` | benchmark/load testing | request batch entered bounded in-memory queue | allowed only when explicitly configured; not a durability claim |
+| `enqueue` | benchmark/load testing | HEC request group entered bounded in-memory queue | allowed only when explicitly configured; not a durability claim |
 | `write` | local capture and fixture testing | sink write returned | useful but still not crash-durable |
 | `flush` | stronger file capture | userspace writer flush returned | still not necessarily durable to media |
 | `fsync` / `db_commit` | production durability baseline | file fsync or database commit completed | first honest production ACK boundary |
@@ -1646,7 +1644,7 @@ AckStatus
   Pending | Delivered | Failed | Expired
 ```
 
-The registry backs two paths: ingest assigns an `ackId` to the request/batch and records pending state; `/services/collector/ack` looks up requested IDs by channel and returns their boolean/status view according to the Splunk-compatible response shape.
+The registry backs two paths: ingest assigns an `ackId` to the request/HEC batch and records pending state; `/services/collector/ack` looks up requested IDs by channel and returns their boolean/status view according to the Splunk-compatible response shape.
 
 First honest ACK design milestone:
 
@@ -1671,7 +1669,7 @@ Code `23` is now implemented at the handler phase boundary:
 - `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs` maps `HecError::ServerShuttingDown` to `503` and text `Server is shutting down`.
 - `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` maps `Phase::Stopping` to code `23` for health and new ingest requests.
 
-Remaining validation: a real-server graceful-shutdown test must prove that new requests receive `503/code23` while already accepted requests are drained to the chosen sink boundary.
+Remaining validation: a real-server graceful-shutdown test must prove that new requests receive `503/code23` while already accepted requests are drained to the chosen commit boundary.
 
 ### 40.5 Axum And Hyper 404/Parser Checks
 
@@ -1711,7 +1709,7 @@ Recommended configuration set:
 
 Arithmetic checks:
 
-- Current max wire body is `1,048,576` bytes. With `30s` total timeout, the effective request-completion rate floor is `34,953 B/s`, about `34 KiB/s`, even without a separate min-rate check.
+- Current max HTTP body is `1,048,576` bytes. With `30s` total timeout, the effective request-completion rate floor is `34,953 B/s`, about `34 KiB/s`, even without a separate min-rate check.
 - If `max_bytes` is raised to `30 MiB` while total timeout remains `30s`, the expected sender must sustain about `1 MiB/s`. The config validator should warn when `max_bytes / total_timeout` exceeds the intended low-end shipper throughput.
 - If total timeout is removed and only a `5s` idle timeout remains, an attacker can send one byte every `4.9s` forever. That is why idle and total timeouts are both required.
 - If body min-rate is set to `32 KiB/s`, a `30 MiB` body needs at least about `960s`; therefore min-rate cannot replace total timeout. It is a floor for slow-drip defense, not a transfer-size planner.
