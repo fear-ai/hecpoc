@@ -1,0 +1,47 @@
+flowchart TD
+  classDef stack fill:#e8f1ff,stroke:#315f9d,color:#111827
+  classDef hec fill:#e8fff1,stroke:#2f855a,color:#111827
+  classDef decision fill:#fff7d6,stroke:#b7791f,color:#111827
+  classDef store fill:#f3e8ff,stroke:#6b46c1,color:#111827
+  classDef error fill:#ffe8e8,stroke:#c53030,color:#111827
+  classDef optional fill:#f7fafc,stroke:#718096,color:#111827,stroke-dasharray: 4 3
+
+  A["Transport stream<br/>TCP/Tokio/Hyper below handler"]:::stack
+  B["HTTP request/framing<br/>method, route, headers, body stream"]:::stack
+  C["HTTP headers and route<br/>path, endpoint kind, content length"]:::stack
+  D{"Auth and request metadata valid?"}:::decision
+  E["HTTP body<br/>bounded read with idle/total timeout"]:::stack
+  F{"Body limits and read status OK?"}:::decision
+  G["Content decode<br/>identity or gzip"]:::stack
+  H{"Decode and expansion limits OK?"}:::decision
+  I["HEC decode<br/>JSON envelopes or raw line units"]:::hec
+  J{"HEC event validation OK?"}:::decision
+  K["HecEvents formation<br/>events plus request provenance"]:::hec
+  L{"Concrete disposition"}:::decision
+  M["reject request<br/>HEC response with reason"]:::error
+  N["write HecEvents<br/>direct fixture/capture path"]:::store
+  O["enqueue HecEvents<br/>bounded queue"]:::store
+  P["drop HecEvents<br/>explicit benchmark mode"]:::store
+  Q["forward HecEvents<br/>future external destination"]:::store
+  R["WriteBlock construction<br/>store/output aggregation"]:::store
+  S["Commit state<br/>accepted, queued, written, flushed, durable"]:::store
+  T["Inspection/readback<br/>capture evidence and run assertions"]:::store
+  U["Format interpretation<br/>parse log-record structure"]:::optional
+  V["Search preparation<br/>normalize, tokenize, index"]:::optional
+
+  A --> B --> C --> D
+  D -- no --> M
+  D -- yes --> E --> F
+  F -- no --> M
+  F -- yes --> G --> H
+  H -- no --> M
+  H -- yes --> I --> J
+  J -- no --> M
+  J -- yes --> K --> L
+  L -- "write HecEvents" --> N --> R
+  L -- "enqueue HecEvents" --> O --> R
+  L -- "drop benchmark" --> P --> S
+  L -- "forward later" --> Q --> S
+  R --> S --> T
+  S --> U --> V
+  M --> S

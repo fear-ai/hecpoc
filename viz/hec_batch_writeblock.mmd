@@ -1,0 +1,64 @@
+flowchart LR
+  classDef request fill:#e8f1ff,stroke:#315f9d,color:#111827
+  classDef hec fill:#e8fff1,stroke:#2f855a,color:#111827
+  classDef store fill:#f3e8ff,stroke:#6b46c1,color:#111827
+  classDef meta fill:#fff7d6,stroke:#b7791f,color:#111827
+  classDef note fill:#f7fafc,stroke:#718096,color:#111827,stroke-dasharray: 4 3
+
+  subgraph R1["HTTP request A"]
+    A1["HecEnvelope A.1"]:::request
+    A2["HecEnvelope A.2"]:::request
+    A3["HecEnvelope A.3"]:::request
+  end
+
+  subgraph R2["HTTP request B"]
+    B1["HecEnvelope B.1"]:::request
+    B2["HecEnvelope B.2"]:::request
+  end
+
+  subgraph R3["/raw HTTP request C"]
+    C0["RequestRaw C"]:::request
+    C1["RawEvents C.1..C.n"]:::request
+  end
+
+  HB1["HecBatch A<br/>stacked JSON input only"]:::hec
+  HB2["HecBatch B<br/>stacked JSON input only"]:::hec
+  HE1["HecEvents A<br/>valid events + provenance"]:::hec
+  HE2["HecEvents B<br/>valid events + provenance"]:::hec
+  HE3["HecEvents C<br/>raw events + provenance"]:::hec
+
+  P["Preserved provenance<br/>request id, endpoint, event ordinal,<br/>token/channel, source metadata,<br/>HTTP body length, decoded length"]:::meta
+
+  subgraph W["Store/output grouping independent of shipper grouping"]
+    W1["WriteBlock 1<br/>A.1, A.2, B.1, C.1..."]:::store
+    W2["WriteBlock 2<br/>A.3, B.2, C.k..."]:::store
+  end
+
+  subgraph PP["Optional format interpretation"]
+    PB1["ParseBatch by sourcetype"]:::store
+    PB2["ParseBatch by byte range"]:::store
+  end
+
+  N1["Do not make HTTP request grouping the store layout."]:::note
+  N2["Use Batch only for HEC input batching or explicit ParseBatch."]:::note
+  N3["Use WriteBlock for output aggregation until Store design chooses a final term."]:::note
+
+  A1 --> HB1
+  A2 --> HB1
+  A3 --> HB1
+  B1 --> HB2
+  B2 --> HB2
+  C0 --> C1
+  HB1 --> HE1
+  HB2 --> HE2
+  C1 --> HE3
+  HE1 --> P
+  HE2 --> P
+  HE3 --> P
+  P --> W1
+  P --> W2
+  P --> PB1
+  P --> PB2
+  N1 --- W
+  N2 --- HB1
+  N3 --- W

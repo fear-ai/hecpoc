@@ -1,31 +1,18 @@
-# HECpoc — Focused HEC Proof Of Concept Starting Point
+# HECpoc — Focused HEC Receiver Design
 
-HECpoc is a fresh Rust implementation effort for a small, testable HTTP Event Collector receiver. The first product is a local endpoint that accepts realistic HEC traffic, preserves events, exposes enough inspection to assert what arrived, and makes compatibility differences explicit.
+HECpoc is a focused Rust implementation of a small, testable HTTP Event Collector receiver. The first product is a local endpoint that accepts realistic Splunk HEC traffic, preserves accepted events, exposes enough inspection to assert what arrived, and makes compatibility differences explicit.
 
-The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every test. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
+The starting user is a developer or CI engineer who wants to test code that sends logs to Splunk HEC without running full Splunk for every run. The immediate benefit is practical: catch bad tokens, malformed payloads, missing metadata, gzip mistakes, raw endpoint surprises, retry behavior, and storage/inspection mismatches before production.
 
-This document defines the product contract, protocol behavior, capability bundles, staged decisions, documentation map, and inclusion rules for the HECpoc documentation set.
+Scope is intentionally narrow: HEC ingest, local capture, inspection, validation, and measurement. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them. This document defines the product contract, protocol behavior, high-level architecture, staged decisions, documentation map, and references for the HECpoc documentation set.
 
 ---
 
-## 1. Product Guardrails
+## 1. Scope, Wants, And Capability Bundles
 
-### 1.1 Scope
+The design starts from user wants and then derives feature bundles. It should not be organized around every Splunk feature that can be named.
 
-The initial scope is HEC ingest, local capture, inspection, and validation. Search, parser specialization, Sigma, retention, repair, TLS hardening, full ACK semantics, and performance-specific storage enter only after the HEC path proves correct enough to need them.
-
-### 1.2 Product Vocabulary
-
-Names should match the domain and data direction. The selected terminology is governed by Appendix 11: `HecEnvelope`, `RequestRaw`, `RawEvents`, `HecEvents`, `ParseBatch`, `WriteBlock`, concrete dispositions, and truthful commit states. Avoid `Row`, `Sender`, generic `worker`, and generic `Batch` unless the role is truly generic and direction-free.
-
-Rename directories, files, and implementation primitives when the current names obscure function, compatibility, or review. Regularity is a feature here because the repo must be understandable by a small team.
-
-
-## 2. Scope, Wants, and Capability Bundles
-
-The scope starts from user wants, then derives features. It should not be organized around every Splunk feature that can be named.
-
-### 2.1 Wants, features, benefits
+### 1.1 User Wants And Benefits
 
 The user wants to start a local endpoint, send events using ordinary HEC clients, see clear success or failure, inspect accepted events, compare selected behavior with Splunk, and repeat the same run in development and CI.
 
@@ -39,109 +26,256 @@ The user wants to start a local endpoint, send events using ordinary HEC clients
 | File capture sink | Accepted events are directly inspectable |
 | Backpressure response | Overload becomes visible, not silently accepted |
 | Local inspection | Tests assert stored output without reading internals |
-| Bounded resource use | Bad inputs and slow sinks do not consume unbounded memory or worker time |
+| Bounded resource use | Bad inputs and slow sinks do not consume unbounded memory or runtime capacity |
 | Resilient failure reporting | Users can distinguish rejected, accepted, written, flushed, durable, and failed-after-accept cases |
 
-### 2.2 Capability bundles
+### 1.2 Capability Bundles
 
 Group capabilities by functional bundle and likely sequence, not by requirement prefix.
 
-| Bundle | Contents | Stage |
-|--------|----------|-------|
-| A. JSON, raw, files | `ING-HEC-JSON`, `ING-HEC-RAW`, `EVT-RAW`; visible file/capture evidence | First |
-| B. Backpressure | `ING-BACKPRESS`; explicit retryable failure under saturation | First |
-| C. Time and metadata | `EVT-TIME`, `EVT-HOST`, `EVT-SOURCE`, `EVT-SOURCETYPE`; event identity | First |
-| D. Auth and gzip | `ING-HEC-AUTH`, `ING-HEC-GZIP`; realistic client behavior | First |
-| E. Inspection | `SCH-TERM`, `SCH-TIME`, maybe `SCH-FIELDS`; assertion surface | Early |
-| F. More sinks, index, metrics | `EVT-INDEX`, `OBS-METRICS`, durable sink work | Later |
-| G. ACK and capability metadata | `ING-HEC-ACK`, `PAR-CAP`; commit and parser capability semantics | Later |
-| H. Resource and resilience controls | body limits, queue limits, slow-sink behavior, health degradation | First |
+| Bundle | Contents | Stage | Action |
+|--------|----------|-------|--------|
+| A. JSON, raw, files | `ING-HEC-JSON`, `ING-HEC-RAW`, `EVT-RAW`; visible file/capture evidence | First | keep protocol tests and capture readback passing |
+| B. Backpressure | `ING-BACKPRESS`; explicit retryable failure under saturation | First | add bounded queue and deterministic queue-full response |
+| C. Time and metadata | `EVT-TIME`, `EVT-HOST`, `EVT-SOURCE`, `EVT-SOURCETYPE`; event identity | First | verify storage fields and Splunk comparison cases |
+| D. Auth and gzip | `ING-HEC-AUTH`, `ING-HEC-GZIP`; realistic client behavior | First | complete malformed/oversize/unsupported tests |
+| E. Inspection | `SCH-TERM`, `SCH-TIME`, maybe `SCH-FIELDS`; assertion surface | Early | expose stable fixture readback before indexing |
+| F. More sinks, index, metrics | `EVT-INDEX`, `OBS-METRICS`, durable sink work | Later | define Store interface and benchmark profiles first |
+| G. ACK and capability metadata | `ING-HEC-ACK`, `PAR-CAP`; commit and parser capability semantics | Later | implement only after commit-boundary design is encoded |
+| H. Resource and resilience controls | body limits, queue limits, slow-sink behavior, health degradation | First | make limits configurable and observable |
 
-### 2.3 Initial detail level
+### 1.3 Design Detail Level
 
-Capture concrete requirements, high-level architecture, event/sink/validation design, and only the low-level details that block implementation. Work decomposition should stay short. Validation is designed alongside code, not appended after it.
+Capture concrete requirements, high-level architecture, event validation, sink/store boundaries, and only the low-level details that block implementation. Work decomposition should stay short and actionable. Validation is designed alongside code, not appended after it.
 
 ---
 
-## 3. Protocol and Event Semantics
+## 2. Protocol And Event Semantics
 
-Protocol design is the first technical center of gravity. It defines which entities exist, how requests move through states, and what behavior must be tested.
+Protocol design is the first technical center of gravity. It defines the externally visible HEC behavior, the internal data units that survive request handling, and the states the receiver may truthfully report.
 
-### 3.1 Request phases and entities
+### 2.1 Definitive Data Path, States, And Entities
 
-Request states:
+The active HECpoc data path is:
 
 ```text
-HTTP request
-  -> authenticated or rejected
-  -> HTTP body read or rejected
-  -> content decoded or rejected
-  -> HEC decoded or rejected
-  -> HEC events validated or rejected
-  -> HecEvents formed
-  -> concrete disposition selected
-  -> commit state recorded
-  -> inspectable when stored
+transport stream
+  -> HTTP request/framing
+  -> HTTP headers and route
+  -> auth and request metadata validation
+  -> HTTP body
+  -> content decode
+  -> HEC decode
+  -> HEC event validation
+  -> HecEvents formation
+  -> concrete disposition
+  -> selected commit state
+  -> optional format interpretation
+  -> optional search preparation
 ```
+
+Short form:
+
+```text
+receive HTTP request -> validate headers/auth -> read HTTP body -> content decode -> HEC decode -> validate events -> form HecEvents -> disposition -> commit state -> optional interpretation/search-prep
+```
+
+Request states used by implementation, tests, and reporting:
+
+| State | Meaning | Failure/Response Implication |
+|-------|---------|------------------------------|
+| `authenticated` | HEC auth requirements passed | failures map to auth HEC errors before body-dependent work |
+| `body_read` | bounded HTTP body was read under configured limits | failures map to body limit, timeout, or read errors |
+| `decoded` | content encoding such as gzip was decoded | failures map to unsupported or malformed encoding outcomes |
+| `hec_decoded` | `/event` JSON envelopes or `/raw` line units were decoded | failures map to endpoint/protocol parse outcomes |
+| `validated` | HEC event requirements passed | failures map to missing/blank event, invalid fields, or configured index policy |
+| `accepted` | valid `HecEvents` exist | success may claim only accepted unless a stronger disposition completed |
+| `queued` | `HecEvents` entered a bounded queue | valid benchmark or ACK boundary only when configured |
+| `written` | write call returned for the selected sink/store path | not crash durable |
+| `flushed` | userspace flush returned | kernel/page-cache visible but not power-loss durable |
+| `durable` | `fsync`, DB commit, or equivalent durable boundary completed | first production-grade ACK boundary |
+| `search_ready` | search-prep structures exist for the evidence | query acceleration is available |
 
 Core entities:
 
-| Entity | Meaning |
-|--------|---------|
-| `HecRequest` | Method, path, headers, body, peer context |
-| `HecCredential` | Parsed auth scheme and token |
-| `HecEnvelope` | JSON event endpoint envelope |
-| `HecEvent` | Normalized accepted event |
-| `HecEvents` | Valid HEC events from one request after HEC decode and validation |
-| commit state | Strongest completed state visible to response, ACK, validation, and reporting |
-| `InspectQuery` | Minimal read path over stored capture evidence |
+| Entity | Meaning | Owner |
+|--------|---------|-------|
+| `HecRequest` | Method, path, headers, body stream, route, peer facts when exposed | Stack/HEC receiver boundary |
+| `HecCredential` | Parsed auth scheme and token class | HEC auth |
+| `HecEnvelope` | One JSON object decoded from `/services/collector/event` | HEC decode |
+| `RequestRaw` | Decoded `/raw` HTTP body before LF splitting | HEC raw endpoint |
+| `RawEvents` | Non-empty raw events produced by LF splitting `RequestRaw` | HEC raw endpoint |
+| `HecEvent` | One normalized accepted HEC event | HEC validation |
+| `HecEvents` | Valid HEC events from one HTTP request after HEC decode and validation | HEC receiver; passed to queue/write path |
+| `ParseBatch` | Optional group selected for format interpretation | Format/search preparation only |
+| `WriteBlock` | Store/output aggregation unit selected for append/write efficiency | Store/write path |
+| commit state | Strongest completed state visible to response, ACK, validation, and reporting | Sink/store policy |
+| `InspectQuery` | Minimal read path over stored capture evidence | Inspection |
 
-Each transition should have a validation case before surrounding code is considered stable.
+Appendix B records naming rationale and external terminology comparisons. It is not a competing definition of the data path.
 
-### 3.2 Endpoint behavior
+### 2.2 Endpoint Behavior
 
 Minimum surface:
 
-- `/services/collector/event`: accept one or more JSON envelopes.
-- `/services/collector/raw`: accept newline-framed raw events with documented CRLF behavior.
-- `/services/collector/health`: report simple availability.
-- `/services/collector/ack`: return a deliberate disabled/unsupported response until commit semantics exist.
+- `/services/collector/event`: accept one or more stacked JSON `HecEnvelope` objects.
+- `/services/collector/raw`: accept LF-framed raw events with documented CRLF behavior.
+- `/services/collector/health`: report availability and lifecycle phase.
+- `/services/collector/ack`: return a deliberate disabled/unsupported response until ACK commit semantics exist.
 - Body encoding: identity and gzip, with explicit pre-decode and post-decode size policy.
 - Resource gates: bounded HTTP body, decoded body, per-event raw size, event count, and bounded queue insertion when queue mode exists.
 
-Route aliases such as `/services/collector/1.0/*` should wait for client evidence.
+Route aliases such as `/services/collector/1.0/*` should wait for client evidence. Incorrect paths are protocol validation cases, not generic Axum 404 trivia.
 
-### 3.3 Event fields
+### 2.3 Event Fields And Metadata
 
 Initial field rules:
 
-- `_raw`: preserve event text for comparison; raw byte preservation can become a later sink property.
-- `_time`: store parsed event time with an explicit precision decision. Do not assume nanoseconds before Splunk comparison and storage design; microseconds may be enough, nanoseconds may be convenient internally.
+- `_raw`: preserve event text for comparison; raw byte preservation becomes a sink/store property before replay claims.
+- `_time`: store parsed event time with explicit precision; choose microseconds or nanoseconds after Splunk comparison and sink format review.
 - `host`, `source`, `sourcetype`: store payload values and make defaults visible.
 - `index`: logical namespace first; physical partitioning later.
-- `fields`: start with flat scalar values; nested behavior must be accepted, ignored, or rejected deliberately.
+- `fields`: start with flat scalar values; nested behavior must be accepted, ignored, stringified, or rejected deliberately.
 
-### 3.4 Invalid and questionable input
+Metadata extracted before store/write decisions includes endpoint, token/channel class, request id, event ordinal, HTTP body length, decoded length, content encoding, source query params, and validation outcome. Store/output grouping may split or coalesce events later, but it must retain request provenance.
 
-The main design must capture corner cases because they shape parser, error, sink, and validation code.
+### 2.4 Protocol Validation Surface
 
-| Group | Cases |
-|-------|-------|
-| Auth | missing, malformed, wrong scheme, empty token, invalid token, valid token |
-| JSON | empty, malformed, multiple envelopes, later invalid envelope, event absent, null, empty string, object, array |
-| Raw | empty body, trailing newline, CRLF, blank line, whitespace-only line, invalid UTF-8 if text output is used |
-| Gzip and size | valid gzip, malformed gzip, empty decoded body, pre-decode limit, post-decode limit |
-| Metadata | missing values, explicit empty strings, nested fields, non-scalar fields |
-| Backpressure | full queue, slow sink, sink error after accepted write/queue disposition |
-| ACK/channel | channel absent, channel empty, channel present with ACK disabled, ACK request before implementation |
+Protocol validation belongs here because it defines externally visible HEC behavior. Detailed HTTP status/code matrices and limit cases are in Appendix A.
+
+| Group | Immediate Cases | Action |
+|-------|-----------------|--------|
+| Auth | missing, malformed, wrong scheme, empty token, invalid token, valid token | keep distinct enough for Splunk comparison and operator diagnosis |
+| JSON | empty, malformed, stacked envelopes, later invalid envelope, missing/null/blank `event`, object/array/scalar event | reject whole request unless Splunk verification requires a different policy |
+| Raw | empty body, trailing newline, CRLF, blank line, whitespace-only line, invalid UTF-8 if text output is used | define LF splitting and byte/text preservation before optimizing |
+| Gzip and size | valid gzip, malformed gzip, empty decoded body, pre-decode limit, post-decode limit | enforce both advertised and decoded caps |
+| Metadata | missing values, explicit empty strings, nested fields, non-scalar fields | store what is supported; reject or preserve unsupported forms deliberately |
+| Backpressure | full queue, slow sink, write failure after accepted queue/write disposition | respond retryably; do not silently drop in correctness mode |
+| ACK/channel | channel absent, channel empty, channel present with ACK disabled, ACK request before implementation | keep disabled behavior explicit until registry and commit boundary exist |
 
 ---
 
-## 4. Sink, Store, and Inspection Strategy
+## 3. Architecture And High-Level Design
+
+HECpoc is not just an Axum handler. It is a staged receiver with explicit protocol, resource, disposition, commit, inspection, and evidence boundaries. The first implementation can be small, but the boundaries must be stable enough that queueing, durable stores, and format interpretation can be added without rewriting the protocol core.
+
+### 3.1 Component Responsibilities
+
+| Component | Owns | Does Not Own | Current Direction |
+|-----------|------|--------------|-------------------|
+| Ingress stack | TCP/HTTP/Tokio/Axum/Hyper behavior, request body reading, content length, body timeouts, content encoding facts | log-format parsing, storage partitioning, durable claims | Axum/Tokio now; owned accept loop later if connection stats/culling require it |
+| HEC protocol | endpoints, auth, HEC response codes, JSON/raw HEC decode, event validation, request outcome | database layout, search indexes, generic infrastructure services | concrete HEC code paths, not Tower middleware for protocol-critical checks |
+| Event formation | `HecEnvelope`, `RequestRaw`, `RawEvents`, `HecEvent`, `HecEvents`, metadata attachment | store block sizing or parser batching | request provenance is preserved even when later stages regroup events |
+| Resource policy | size limits, event count, body timeouts, queue full, busy/unhealthy/shutdown behavior | hidden magic defaults | typed config with validation and observable outcomes |
+| Queue/write path | `enqueue HecEvents`, `write HecEvents`, commit states, failure-after-accept behavior | HEC syntax parsing | direct capture first, bounded queue next, durable commit later |
+| Store/inspection | capture files, readback, `WriteBlock`, optional durable formats, eventual search-prep inputs | HTTP correctness | starts close to evidence; does not inherit shipper batch size as output granularity |
+| Infrastructure | config, errors/outcomes/messages, reporting/logging, metrics, lifecycle, benchmark ledger | protocol-specific truth tables except where mapped | centralized services with precise call-site contracts |
+
+### 3.2 Control And Data Flow
+
+```mermaid
+flowchart TD
+  A["HTTP request"] --> B["headers, route, auth"]
+  B -->|reject| R["HEC error response"]
+  B --> C["bounded HTTP body"]
+  C --> D["content decode"]
+  D --> E["HEC decode"]
+  E --> F["HEC event validation"]
+  F -->|valid| G["HecEvents"]
+  F -->|invalid| R
+  G --> H{"disposition"}
+  H -->|write HecEvents| I["capture/write path"]
+  H -->|enqueue HecEvents| Q["bounded queue"]
+  H -->|drop benchmark| X["drop path"]
+  Q --> I
+  I --> J["commit state: written/flushed/durable"]
+  J --> K["inspection/readback"]
+  J --> L["optional format interpretation/search preparation"]
+```
+
+The main invariant is commit-state truthfulness: response, ACK, report, and benchmark output may not claim a state stronger than what actually completed.
+
+### 3.3 Accepted Design Decisions
+
+| Area | Decision | Reason | Revisit Trigger |
+|------|----------|--------|-----------------|
+| Runtime | Use Tokio and Axum initially | gets a real HEC server running while keeping protocol checks explicit | connection-level stats, header limits, culling, or accept-loop policy require Hyper/hyper-util direct control |
+| Protocol checks | Implement auth/body/gzip/HEC response mapping in HEC-owned code | protocol-critical behavior must be testable and Splunk-comparable | a library feature proves identical behavior and better maintainability |
+| JSON HEC batching | Support stacked JSON objects for `/event`; do not assume JSON array batches | Splunk documents stacked objects distinctly from arrays | local Splunk or a target shipper proves arrays are required |
+| Output grouping | Use `WriteBlock` for store/output aggregation, not HEC request grouping | store/write granularity should match storage and benchmark needs | generalized Store interface chooses a better term |
+| Queue policy | Correctness mode rejects newest or returns busy when full | HEC senders can retry; silent drop lies | telemetry profile explicitly chooses drop/spill behavior |
+| Store partitioning | Preserve host/source/sourcetype/index metadata; do not make per-host/per-log DBs during ingest | avoids writer/schema/compaction explosion | measured workload proves partition-local writes or searches dominate |
+| ACK | Defer ACK until registry and commit boundary exist | ACK without a truthful boundary is worse than unsupported | queue/durable store design is implemented and tested |
+| Search preparation | Keep format parsing/tokenization replayable and optional after evidence capture | accepted input must not exist only in parser/index output | product bundle requires query-ready ingest |
+
+### 3.4 Immediate Architecture Gaps
+
+These are not open-ended questions; each names the next design or test artifact needed.
+
+| Area | Needed Artifact | Blocks |
+|------|-----------------|--------|
+| Capture format | exact JSONL or length-delimited format with fields and escaping rules | reliable inspection, replay, malicious input tests |
+| Queue topology | one bounded global queue spec with full/busy response mapping | `ING-BACKPRESS`, queue-full tests, health degradation |
+| Write path | direct capture vs queued capture mode contract | performance claims and failure-after-accept behavior |
+| Body/header policy | Axum-visible body limits plus documented Hyper/header gaps | slowloris/header-bloat validation and fallback decision |
+| Raw framing | LF/CRLF/NUL/non-UTF policy with byte/text preservation decision | raw endpoint correctness and file replay claims |
+| Config schema | file/env/CLI precedence and validation for all limits/policies | reproducible tests and safe defaults |
+| Reporting | call-site contract for events, fields, outcomes, metrics, and console/log routing | useful failure diagnosis and benchmark ledgers |
+| Splunk oracle | scripts and fixtures for selected ambiguous HEC cases | compatibility claims beyond docs |
+
+---
+
+## 4. Event Validation, Compatibility, And Measurement
+
+Event and protocol validation should be grouped by externally visible behavior. Store durability, queue internals, and search preparation have their own sections and subject documents.
+
+### 4.1 Compatibility Verification
+
+Use Splunk documentation as the starting point, local Splunk Enterprise as the oracle for ambiguous cases, and Vector/Fluent Bit/OpenTelemetry behavior as shipper compatibility evidence. Appendix A lists HEC return values, status mappings, limit classes, and verification tasks.
+
+Immediate verification targets:
+
+1. Incorrect HEC paths and Axum/Hyper fallback behavior.
+2. Missing/malformed/invalid auth response bodies and status codes.
+3. Body too large before read, body too large while reading, and gzip expansion too large.
+4. Stacked JSON object success and malformed-late-object failure.
+5. JSON array rejection unless a real shipper requires arrays.
+6. Raw endpoint CRLF, blank line, trailing newline, NUL, and invalid UTF-8 behavior.
+7. Health during stopping (`503/code23`) and later queue-full health degradation.
+
+### 4.2 Metrics And Evidence Needed Per Run
+
+Every validation or benchmark run should record enough context to be interpretable later:
+
+| Evidence | Purpose |
+|----------|---------|
+| config snapshot with secrets redacted | proves limits, sink mode, runtime mode, and filters used |
+| request corpus manifest | makes payload size/event-count comparisons possible |
+| response ledger | maps each request to HTTP status, HEC code, response body, and outcome |
+| stats snapshot before/after | computes receiver-side bytes/sec, events/sec, rejects, and body errors |
+| process/system samples | separates load-generator limits from receiver limits |
+| output/capture files | proves accepted events are inspectable and not merely counted |
+| Splunk/Vector comparison notes | distinguishes documented behavior from local oracle behavior |
+
+### 4.3 Test Upgrade Priorities
+
+| Priority | Tests | Why |
+|----------|-------|-----|
+| P0 | protocol matrix for auth, JSON, raw, gzip, no-data, and oversize | locks externally visible behavior |
+| P0 | health/stopping and incorrect-path responses | prevents framework defaults from defining product behavior accidentally |
+| P0 | capture readback and response/counter agreement | proves accepted events are visible and counted coherently |
+| P1 | queue-full with blocked write path | first true backpressure proof |
+| P1 | slow body and malformed header probes | distinguishes Axum/Hyper behavior from HEC-owned checks |
+| P1 | Splunk oracle scripts for ambiguous codes | prevents folklore-driven compatibility claims |
+| P2 | hostile input corpus and fuzz/property tests | hardens parser and body handling after core behavior stabilizes |
+
+---
+
+## 5. Store, Sink, And Inspection Strategy
 
 Sink choice is part of ingest correctness. The first implementation should prove accepted events are visible before it designs a database.
 
-### 4.1 Sink order
+### 5.1 Sink And Store Order
 
 Sort by usefulness and complexity:
 
@@ -154,13 +288,13 @@ Sort by usefulness and complexity:
 
 The first practical path is capture file plus simple inspection.
 
-### 4.2 Inspection path
+### 5.2 Inspection Path
 
 Start close to stored evidence: write accepted events to a documented file format, provide a tiny inspection command or test helper, support term/time filters only after semantics are defined, and add indexing only when the simple path fails.
 
 A sink trait is justified only when two concrete implementations need the same call sites and can be tested independently. Until then, a concrete capture sink is simpler than an abstraction display case.
 
-### 4.3 Resource and failure boundaries
+### 5.3 Queue, Write, And Commit Boundaries
 
 The core design choice is whether validated `HecEvents` are written synchronously in fixture mode or inserted into a bounded queue for later `WriteBlock` construction. The collector should not let request handlers perform long file or database work under load.
 
@@ -175,7 +309,46 @@ Initial rules:
 
 ---
 
-## 5. Documentation Architecture And Inclusion Rules
+## 6. Implementation Sequence
+
+This sequence is intentionally short. Detailed implementation infrastructure belongs in `InfraHEC.md`; ingress mechanics belong in `Stack.md`; store mechanics belong in `Store.md`.
+
+| Step | Work | Acceptance Signal |
+|------|------|-------------------|
+| 1 | Typed configuration, validation, startup, shutdown | invalid config fails early; startup logs/reporting are stable |
+| 2 | Central HEC outcomes, request error mapping, public message text | every handler error maps to one response, metric, and report fact |
+| 3 | Protocol fixtures for auth, body, gzip, JSON, raw, no-data, oversize | protocol matrix passes in unit and handler tests |
+| 4 | Capture sink format and readback helper | accepted events can be inspected without internal knowledge |
+| 5 | Benchmark/validation ledger | runs record config, corpus, stats, system samples, and output paths |
+| 6 | Bounded queue between `HecEvents` and write path | deterministic queue-full response and health/counter behavior |
+| 7 | Splunk and shipper comparison scripts | selected edge cases verified against local Splunk and Vector |
+| 8 | Store/write profile expansion | durable and search-prep claims tied to measured commit states |
+
+First target:
+
+```text
+merge config -> validate -> bind -> accept HEC JSON/raw -> classify errors -> capture event -> inspect capture -> record run evidence
+```
+
+---
+
+## 7. Decision Register
+
+Decision rows are grouped by expected validity. Revisit only when the trigger occurs; do not carry every uncertainty as a blocking question.
+
+| Class | Decision | Current Position | Revisit Trigger |
+|-------|----------|------------------|-----------------|
+| Contract | HEC JSON/raw endpoints and response shape | compare with Splunk for selected edge cases | Splunk/shipper comparison contradicts current behavior |
+| Contract | Metadata preservation | preserve `time`, `host`, `source`, `sourcetype`, `index`, `fields` where supported | supported client emits a case we mishandle |
+| Implementation stage | Direct capture before bounded queue | acceptable fixture phase | queue/backpressure bundle starts |
+| Implementation stage | All-or-nothing JSON request parsing | default until Splunk oracle says otherwise | Splunk accepts partial success for a target case |
+| Benchmark profile | Drop/null sink numbers | HTTP/parser upper bound only | result is cited as durable ingest capacity |
+| Deferred | ACK commit boundary | unsupported until registry and commit policy exist | bounded queue plus durable store is implemented |
+| Deferred | Parser capability metadata and aliases | design in Formats/Store before code claims | field/search/Sigma work starts |
+
+---
+
+## 8. Documentation Architecture And Inclusion Rules
 
 This section is the HECpoc documentation map. Subject-specific documents should not repeat this map or carry generic file-purpose lists. Each file states only its own scope and the technical subject it owns.
 
@@ -195,94 +368,11 @@ Inclusion rules:
 4. Stable requirements and justified recommendations stay in reference sections. Work tracking and status tables are kept short and only when they control the next implementation step.
 5. External or historical code can influence HECpoc only after restating the current requirement, naming the implementation target, adding validation cases, and recording why the approach remains suitable.
 
-Decision validity classes:
-
-| Class | Meaning | Example | Revisit Trigger |
-|---|---|---|---|
-| Contract | external HEC behavior expected to remain stable | accepted endpoints, auth response shape, event metadata preservation | Splunk/shipper comparison contradicts it |
-| Capability bundle | valid for a named feature group | local fixture capture sink, compatibility lab behavior, durable ingest mode | bundle scope changes or user workflow changes |
-| Implementation stage | valid for current implementation stage | direct capture before bounded queue, all-or-nothing JSON request parsing | next stage implements queue, store, or ACK |
-| Benchmark profile | valid only for measurement | drop sink, prewarmed cache, relaxed durability, fixed payload corpus | benchmark result is cited outside its profile |
-| Deferred | explicitly not decided | ACK commit boundary, JSON partial success, index allow-list syntax | named dependency becomes active |
-
-Current decision gaps that should be normalized into this structure:
-
-- HEC response compatibility for body-too-large, unsupported encoding, bad path, and timeout classes.
-- Queue topology and backpressure policy for global, per-source, per-format, per-core, and store-partitioned queues.
-- Capture-file format, durable commit boundary, and ACK boundary.
-- Parser capability metadata and field alias views for Splunk/CIM, Sigma, ECS, and OTel.
-- Benchmark profile definitions for drop, capture, queue, durable store, and indexed store.
-
-
 ---
 
-## 6. Initial Work Sequence
-
-The first sequence keeps product behavior and implementation infrastructure aligned without duplicating the infrastructure spec here.
-
-1. Implement typed configuration, validation, startup, and shutdown.
-2. Centralize HEC outcomes, request error mapping, and public message text.
-3. Lock raw/event protocol behavior for auth, body, gzip, JSON envelopes, raw line framing, and no-data cases.
-4. Create request fixtures for JSON event, raw, gzip, malformed auth, malformed JSON, bad gzip, oversize bodies, and no-data bodies.
-5. Implement capture states enough to distinguish accepted, queued, written, flushed, and durable claims.
-6. Add bounded queue insertion between `HecEvents` formation and write path once direct capture behavior is stable.
-7. Run local curl/process tests, then selected Splunk Enterprise and Vector comparisons.
-8. Record benchmark and validation evidence with stable run metadata, stage timing, resource samples, and result files.
-
-First target:
-
-```text
-merge config -> validate -> bind -> accept HEC JSON/raw -> classify errors -> capture event -> inspect capture -> record run evidence
-```
-
-
-## 7. Open Product Work, Gaps, and Decisions
-
-This register keeps the unresolved work visible without forcing everything into one artificial component or decision ID chain. Items here are not a replacement for tests or implementation; they are the current map of what must be settled to make the PoC coherent.
-
-### 7.1 Product And Scope
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| Primary user | The first user is a CI/developer user, but exact packaging is not settled | Decide whether the first UX is binary plus shell tests, Rust test helper, or later pytest wrapper |
-| Fixture versus emulator | HEC fixture scope can expand into exact HEC emulator behavior | Keep first bundle fixture-oriented; classify emulator-only features separately |
-| Compatibility language | "Splunk-compatible" is too broad | Use capability-specific language: HEC JSON-compatible, Vector-sendable, Splunk-compared |
-| Requirement subset | HECpoc still needs its own filtered matrix | Create local HEC-only requirement table from `Features.csv` |
-| Bundling | Capability bundles A-G are draft groupings | Validate by mapping each to one runnable user workflow |
-
-### 7.2 Protocol Behavior
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| Endpoint aliases | `/services/collector/1.0/*` and SDK legacy paths are undecided | Test curl, Vector, and any local SDK client before adding aliases |
-| Auth errors | Missing, malformed, bad scheme, empty token, and invalid token may need distinct outcomes | Compare Splunk Enterprise and choose stable response mapping |
-| `event` semantics | Absent, null, empty string, object, array, number, and boolean need explicit behavior | Build a protocol matrix and tests before parser reuse |
-| `fields` semantics | Flat scalar, nested object, array, and non-string handling are unsettled | Start flat/scalar; classify nested behavior as reject, stringify, or ignore |
-| Time precision | Internal precision is not yet decided | Compare Splunk output, JSON number precision, and sink format; choose microseconds or nanoseconds explicitly |
-| Raw endpoint | CRLF, blank lines, whitespace-only lines, invalid UTF-8, and metadata query params are unsettled | Define raw framing before implementing raw as more than a smoke path |
-| Gzip limits | Pre-decode and post-decode size behavior both matter | Enforce and test both or explicitly defer decoded-size cap |
-| ACK disabled | The response for `/ack` before ACK support is unsettled | Compare Splunk with ACK disabled and Vector behavior |
-| Channel handling | Header, empty header, query channel, UUID validation, and ACK interaction are unsettled | Implement non-ACK channel only after response behavior is documented |
-
-### 7.3 Event, Sink, And Inspection
-
-| Area | Gap or question | Near-term action |
-|------|-----------------|------------------|
-| Capture format | The first file format is not selected | Choose JSONL or length-delimited JSON and document exact fields |
-| Raw preservation | Text preservation and byte preservation are not the same | Start with text comparison; plan raw-byte preservation before replay claims |
-| Sink commit | Accepted, queued, written, flushed, and durable are different states | Name these states and decide what HTTP success means |
-| Sink failure | A sink may fail after request acceptance | Decide whether failure changes health, phase, metrics, or only run ledger |
-| Inspection API | Term/time inspection is needed, but exact command/interface is unsettled | Start with one readback helper over capture files |
-| Index namespace | `index` is logical first, physical later | Store as event field; defer partitioning |
-| Resilience state | Success response, file append, flush, fsync, and ACK durability are distinct | Name the strongest state actually reached by each mode |
-
----
-
-## 8. References
+## 9. References
 
 References here are external comparison points. The documentation map above is the source for project-document placement.
-
-### 8.1 External Comparison Points
 
 1. [Splunk: Format events for HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/FormateventsforHTTPEventCollector) — JSON envelope and metadata examples.
 2. [Splunk: Troubleshoot HTTP Event Collector](https://docs.splunk.com/Documentation/Splunk/latest/Data/TroubleshootHTTPEventCollector) — error/status behavior.
@@ -293,273 +383,7 @@ References here are external comparison points. The documentation map above is t
 
 ---
 
-## 9. Appendix — Validation And Benchmark Evidence
-
-This appendix records concrete validation and benchmark evidence: what was mapped, what was run, what broke, what was fixed, and what remains open.
-
-### 9.1 Reporter Component Map
-
-Reporter component/source mapping is now part of the stack design and code path.
-
-| Reporter component | Tracing target | Processing origin | Typical facts |
-|--------------------|----------------|-------------------|---------------|
-| `Component::Hec` | `hec.receiver` | route, endpoint, request completion | `hec.request.received`, `hec.request.succeeded`, `hec.request.failed` |
-| `Component::Auth` | `hec.auth` | authorization header and token checks | `hec.auth.token_required`, `hec.auth.invalid_authorization`, `hec.auth.token_invalid` |
-| `Component::Body` | `hec.body` | content length, body read, gzip decode | `hec.body.too_large`, `hec.body.timeout`, `hec.body.gzip_request`, `hec.body.gzip_failed` |
-| `Component::Parser` | `hec.parser` | event/raw interpretation | `hec.parser.failed`, `hec.parser.events_parsed` |
-| `Component::Sink` | `hec.sink` | `HecEvents` disposition and capture/drop sink | `hec.sink.failed`, `hec.sink.completed` |
-
-Important implementation detail: `tracing` callsite targets must be literals, not dynamic strings. The implementation therefore branches on `Component` and emits through literal targets such as `target: "hec.auth"`. This is mildly repetitive but keeps target-level filtering fast and compatible with `tracing-subscriber::EnvFilter`.
-
-Current filter example:
-
-```sh
-HEC_OBSERVE_LEVEL='debug,hec.receiver=debug,hec.auth=debug,hec.body=debug,hec.parser=debug,hec.sink=debug'
-```
-
-Convenience TOML such as `[observe.sources] hec.auth = "debug"` is still a design target, not implemented. The currently implemented control is the global `observe.level` filter expression.
-
-### 9.2 Input Coverage Run
-
-Run directory: `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z`.
-
-Receiver configuration used:
-
-- release binary;
-- capture sink enabled;
-- max HTTP body bytes `30_000_000`;
-- max decoded bytes `60_000_000`;
-- max events `1_000_000`;
-- JSON tracing enabled;
-- console output enabled;
-- all component targets set to debug.
-
-Inputs exercised:
-
-| Input | Source path | Endpoint | Expected result | Observed |
-|-------|-------------|----------|-----------------|----------|
-| syslog sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/syslog` first 200 KB | raw | accepted as raw lines | `200` |
-| auth sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/auth.log` first 200 KB | raw | accepted as raw lines | `200` |
-| Apache LogHub | `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log` | raw | accepted as raw lines | `200` |
-| OpenSSH LogHub | `/Users/walter/Work/Spank/Logs/loghub/OpenSSH_2k.log` | raw | accepted as raw lines | `200` |
-| Windows LogHub | `/Users/walter/Work/Spank/Logs/loghub/Windows_2k.log` | raw | accepted as raw lines | `200` |
-| Vector NDJSON | `/Users/walter/Work/Spank/Logs/vector/vector_log.ndjson` | raw | accepted as raw text lines | `200` |
-| Wazuh NDJSON | `/Users/walter/Work/Spank/Logs/wazuh/state.ndjson` | raw | accepted as raw text lines | `200` |
-| CSV | `/Users/walter/Work/Spank/Logs/prices.csv` | raw | accepted as raw text lines | `200` |
-| CRLF | generated `one\r\ntwo\r\nthree\n` | raw | accepted; CR stripped | `200` |
-| embedded NUL | generated `a\0b\n` | raw | accepted; preserved in JSON string escaping | `200` |
-| invalid UTF-8 | generated `0xff 0xfe \n valid\n` | raw | accepted through lossy text conversion | `200` |
-| blank only | generated LF/CRLF blanks | raw | no data | `400`, `{"text":"No data","code":5}` |
-| gzip syslog | gzip of syslog sample | raw | accepted after decode | `200` |
-| valid HEC JSON | generated envelope | event | accepted | `200` |
-| concatenated HEC JSON | generated two envelopes | event | accepted | `200` |
-| missing event | generated JSON without `event` | event | event field required | `400`, code `12` |
-| syslog to event endpoint | syslog bytes | event | invalid data format | `400`, code `6` |
-| missing auth | generated raw | raw | token required | `401`, code `2` |
-| bad token | generated raw | raw | invalid token | `403`, code `4` |
-| malformed auth | generated raw | raw | invalid authorization | `401`, code `3` |
-| unsupported encoding | generated raw with `Content-Encoding: br` | raw | invalid data / unsupported media | `415`, code `6` |
-| advertised oversize | generated raw with huge `Content-Length` | raw | request too large | `413`, code `6` |
-| parallel Apache | 32 concurrent requests, 8-way client parallelism | raw | all accepted | all `200` |
-
-Summary stats from `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/stats.json`:
-
-```json
-{"requests_total":54,"requests_ok":46,"requests_failed":8,"auth_failures":3,"body_too_large":1,"timeouts":0,"gzip_requests":1,"gzip_failures":0,"parse_failures":3,"wire_bytes":6805324,"decoded_bytes":6986001,"events_observed":73813,"events_drop_sink":0,"events_written":73813,"sink_failures":0,"latency_nanos_total":9151439000,"latency_nanos_max":327345000}
-```
-
-Capture file readback:
-
-- `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/capture.jsonl` contains `73_813` records.
-- The capture count matches `events_written`.
-- The run produced target-separated tracing records: `hec.receiver`, `hec.auth`, `hec.body`, and `hec.parser` were all observed.
-
-### 9.3 Output, Reporting, Record, Benchmark, And Profile Permutations
-
-Output permutations exercised in this pass:
-
-| Mode | Configuration | Purpose | Outcome |
-|------|---------------|---------|---------|
-| JSON tracing + console + stats + capture | validation run | verify report fan-out and target mapping under real inputs | worked; component targets observed |
-| tracing off + console off + stats on + drop sink | benchmark run | isolate request/raw parsing and stats from output/capture overhead | worked; no request failures from `ab` |
-| redacted show-config | prior config validation | verify configured redaction text | worked |
-| passthrough show-config | prior config validation | verify explicit secret passthrough mode | worked |
-
-Benchmark/profile run directory: `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z`.
-
-Payload:
-
-- `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log`;
-- `171_239` bytes;
-- `1_999` lines/events per request.
-
-`ab` results:
-
-| Run | Complete | Failed | Requests/sec | Mean request time | Notes |
-|-----|----------|--------|--------------|-------------------|-------|
-| `ab -n 500 -c 1` | 500 | 0 | `3250.11` | `0.308 ms` | client-side `ab` summary |
-| `ab -n 2000 -c 16` | 2000 | 0 | `14930.83` | `1.072 ms` | client-side `ab` summary |
-
-Receiver stats after benchmark:
-
-```json
-{"requests_total":2505,"requests_ok":2500,"requests_failed":5,"auth_failures":0,"body_too_large":0,"timeouts":0,"gzip_requests":0,"gzip_failures":0,"parse_failures":0,"wire_bytes":428097500,"decoded_bytes":428097500,"events_observed":5000000,"events_drop_sink":5000000,"events_written":0,"sink_failures":0,"latency_nanos_total":1077444000,"latency_nanos_max":2370000}
-```
-
-Interpretation limits:
-
-- These are smoke benchmarks, not capacity claims.
-- `ab` reports response throughput, not submitted payload throughput, so byte/sec must be computed from receiver stats and elapsed wall time if needed.
-- The run used drop sink and output disabled except stats; capture-file results are intentionally separate.
-- The `requests_failed = 5` counter in the benchmark run is unexplained because `ab` reported zero failed requests and detailed error counters remained zero. This needs a focused repro with tracing enabled and stats snapshots before and after warmup/readiness.
-- macOS `sample` captured a process report at `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z/sample-c16.txt`; the run was too short for deep attribution, but it records a physical footprint around 25.5 MB during the sampled interval.
-
-### 9.4 Bugs Fixed During This Pass
-
-| Issue | Symptom | Fix | Regression coverage |
-|-------|---------|-----|---------------------|
-| Raw byte length after lossy UTF-8 | invalid UTF-8 raw lines stored `raw_bytes_len` after replacement-character expansion, not original byte length | added `Event::from_raw_line_with_len` and passed original byte count from raw parser | `parse_raw::lossy_decodes_non_utf8_without_panic` now checks original byte length |
-| Advertised oversize counter missing | huge `Content-Length` returned 413 but `body_too_large` stayed zero | routed advertised oversize through `report_body_error` | `handler::advertised_oversize_increments_body_too_large_counter` |
-| Component target design mismatch | docs described per-component filter targets but Reporter emitted all tracing under one target | branched Reporter tracing emission by component with literal targets | validation run observed `hec.auth`, `hec.body`, `hec.parser`, and `hec.receiver` targets |
-
-### 9.5 Obvious Inefficiencies And Poor Implementation Areas
-
-These are observed or strongly suspected from code inspection and the validation runs.
-
-| Area | Current implementation | Risk | Improvement direction |
-|------|------------------------|------|-----------------------|
-| Raw parser allocation | creates a `String` and full `Event` per line immediately | high allocation rate for large raw batches | introduce `RawEventRef`/batch representation or bytes-backed event until sink/store boundary |
-| Raw byte preservation | raw endpoint stores lossy text plus byte length, not original bytes | cannot replay exact binary/log input | add optional raw byte capture or escaped byte field before claiming byte-preserving ingest |
-| Capture sink | opens and flushes file per HEC request group under a mutex | poor high-concurrency write behavior | persistent buffered writer or write path with explicit flush policy |
-| Reporter field serialization | dynamic fields are collapsed into JSON string for tracing | less useful structured filtering/querying in tracing backend | static fields for hot/common fields or custom `valuable`/JSON layer later |
-| Counter labels | counters are flat atomics without reason labels | loses distinction between rejection causes beyond a few coarse counters | introduce bounded reason enums or structured stats snapshot |
-| Request failure accounting | benchmark run showed 5 request failures with no detailed counters | possible unclassified failure path or warmup artifact | add `REQUEST_FAILED` reason field and trace failed responses during benchmark repro |
-| Benchmark method | `ab` client metrics omit submitted bytes/sec and server CPU | misleading throughput interpretation | compute receiver-side bytes/sec/events/sec from stats deltas and wall time; add `time`, `ps`, `sample`, and later `dtrace`/Instruments recipes |
-| Component source config | `observe.level` can express target filters but TOML `[observe.sources]` is not implemented | operator-facing config is less readable | map `[observe.sources]` to an `EnvFilter` directive string during config load |
-
-### 9.6 Methodology Outcomes
-
-Useful method choices from this pass:
-
-- Use result directories under `/Users/walter/Work/Spank/HECpoc/results/` with `summary.tsv`, response bodies, server logs, stats, and manifests.
-- Keep real-log raw acceptance separate from HEC JSON event compatibility.
-- Verify counters against response matrix; the advertised-oversize bug was visible only because response and stats were compared.
-- Run output-heavy validation separately from output-light benchmark/profiling.
-- Treat each benchmark as evidence for one configuration, not as a general performance claim.
-
-Method problems to fix:
-
-- The first benchmark script accidentally used bare `wait`, which waited on the server process and required manual cleanup. Future scripts should wait only on explicit short-lived child process IDs.
-- Benchmarks should snapshot stats before and after each run, not only at the end.
-- Benchmark manifests should record binary hash, git status, command line, payload bytes, payload line count, CPU model, OS, and power mode.
-- Validation scripts should become checked-in scripts only after their names, outputs, and failure semantics are stable.
-
-### 9.7 Open Questions
-
-| Question | Why it matters | Suggested next action |
-|----------|----------------|-----------------------|
-| Why did benchmark stats report 5 request failures? | Failure counters must be trusted before performance claims | rerun with tracing enabled for `hec.receiver=debug`, stats before/after each `ab` stage, and response body capture for non-200s |
-| Should unsupported encoding have its own counter/fact? | Current response is correct enough, but observability is coarse | add `BODY_UNSUPPORTED_ENCODING` or map to a decode failure reason |
-| Should body-too-large code remain HEC code `6`? | Splunk compatibility may differ | compare local Splunk and Vector client behavior |
-| Should raw invalid UTF-8 be accepted lossy, rejected, or byte-preserved? | Search/replay correctness depends on this | document raw text policy and add byte-preserving mode if needed |
-| Should blank raw lines be skipped or represented? | Some logs may contain meaningful blank records | compare Splunk raw HEC behavior and decide |
-| Should capture success imply flushed or merely written to userspace buffer? | HTTP success semantics and ACK later depend on this | define sink commit state for direct file sink |
-| Should per-component filters be TOML sugar or first-class Reporter filters? | `EnvFilter` is good for tracing, not all outputs | implement TOML-to-EnvFilter first; add Reporter filters only when needed |
-
-### 9.8 Pending And Future Work Decomposition
-
-Near-term implementation tasks:
-
-1. Add a validation script that reproduces `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z` without ad hoc shell editing.
-2. Add a benchmark script with explicit stats-before/stats-after snapshots and no bare `wait`.
-3. Add `[observe.sources]` TOML support that composes into `observe.level`/`EnvFilter` directives.
-4. Add failure reason fields to `REQUEST_FAILED` and counters where coarse counters hide cause.
-5. Add `BODY_UNSUPPORTED_ENCODING` reporting or an explicit decode/body reason field.
-6. Add capture sink mode with persistent buffered writer and configurable flush policy.
-7. Add raw-byte preservation design and tests before claiming replay-grade raw ingest.
-
-Validation tasks:
-
-1. Compare the same response matrix against local Splunk Enterprise HEC.
-2. Send with Vector as HEC client into this receiver and inspect request shapes.
-3. Run full-size syslog and auth.log with raised limits and record bytes/sec/events/sec.
-4. Add gzip expansion tests using both valid high-ratio gzip and malformed gzip.
-5. Add slow-body tests to exercise idle and total body timeouts.
-6. Add no-auth/malformed-auth/bad-token load tests to validate auth rejection cost and logging volume.
-
-Design tasks:
-
-1. Decide raw text versus raw bytes as an explicit product policy.
-2. Decide HEC response compatibility for body-too-large, unsupported encoding, ACK disabled, and raw blank-line behavior.
-3. Define sink commit states for drop, capture, flushed, and durable modes.
-4. Define stats schema with bounded reason labels before Prometheus or external metrics.
-5. Decide whether Reporter should own output routing only, or also a source/fact runtime filter table for non-tracing outputs.
-
-### 9.9 Performance Comparison — Current HECpoc, Earlier Rust Work, And Vendor Signals
-
-The current HECpoc numbers measure a localhost HTTP receiver using Axum/Tokio/Hyper, bounded body read, raw line splitting, and the drop sink. They do not include durable file or database commit, indexing, ACK, TLS, remote network, or Splunk-compatible storage/search costs.
-
-| Source | Workload | Result | Interpretation |
-|--------|----------|--------|----------------|
-| HECpoc current regular run | Apache raw payload, `171_239` bytes and `1_999` events/request, drop sink, `ab -n 500 -c 1` | about `3,000 req/s`; receiver delta about `6.0M events/s`, `489 MiB/s` | HTTP/request overhead visible; very high event rate only because each request carries many raw lines and sink is drop-only |
-| HECpoc current regular run | same payload, `ab -n 2000 -c 16` | about `17,011 req/s`; receiver delta about `33.9M events/s`, `2.7 GiB/s`; one extra body-read failure from AB tail behavior | useful upper smoke signal for in-memory raw splitting, not production ingest capacity |
-| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 1000 -c 1` | about `11,998 req/s`; `0` server failures | measures request overhead with tiny payload, not parsing throughput |
-| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 5000 -c 50` | about `38,735 req/s`; `0` server failures | shows the server can answer many tiny local HTTP requests when body work is trivial |
-| SpankMax focused parser harness | generated Apache, `100_000` rows, `memchr`, simple tokenizer, null store | about `2.78M events/s`, `362 MiB/s` | cleaner CPU parser/tokenizer/store-null measurement; no HTTP, Axum, auth, body limits, or sink durability |
-| SpankMax focused parser harness | real Apache-ish input, `13_628` rows, `memchr`, simple tokenizer, null store | about `1.49M events/s`, `444 MiB/s` | parser harness remains the better place to study parser/tokenizer layout |
-| SpankMax focused parser harness | syslog, `9_148` rows, simple tokenizer, null store | about `680k events/s`, `125 MiB/s` | syslog/tokenization path is materially heavier than raw-line HEC splitting |
-| Earlier integrated `spank-hec` crate | Axum `Bytes` extractor, mpsc queue, file sender | no comparable retained benchmark artifact found | code is useful design history but not a current performance baseline; it reads whole bodies before HEC-owned limits and uses a different queue/file path |
-
-External vendor signals are not apples-to-apples, but they set order-of-magnitude expectations:
-
-- Splunk Stream HEC HTTP raw tests report `streamfwd` sender rates from `13` to `11,437 events/sec` in a 100K-response HTTP test across 8 Mbps to 10 Gbps, and up to `22,411 events/sec` in a 25K-response HTTP test before drop rates appear at higher rates. Source: [Splunk Independent streamfwd HEC HTTP raw tests](https://help.splunk.com/en/splunk-enterprise/collect-stream-data/install-and-configure-splunk-stream/8.0/splunk-stream-performance-tests-and-considerations/independent-streamfwd-hec-tests---http-raw-events).
-- Splunk HEC troubleshooting/performance guidance emphasizes batching, HTTP versus HTTPS, keep-alive, Monitoring Console dashboards, and persistent queue cost rather than a single universal throughput number. Source: [Splunk HEC troubleshooting](https://docs.splunk.com/Documentation/Splunk/9.4.2/Data/TroubleshootHTTPEventCollector).
-- Vector sizing guidance estimates unstructured logs at about `10 MiB/s/vCPU` and structured logs at about `25 MiB/s/vCPU`, explicitly as conservative sizing starting points that vary by workload. Source: [Vector sizing and capacity planning](https://vector.dev/docs/setup/going-to-prod/sizing/).
-- Vector's public positioning says it is high-performance and claims up to `10x` faster than alternatives, but that is vendor positioning, not a replacement for our local apples-to-apples HEC receiver tests. Source: [Vector GitHub README](https://github.com/vectordotdev/vector).
-
-Current conclusion: HECpoc is already fast enough that the next bottlenecks should be correctness, measurement reliability, and sink/queue design rather than raw Axum/Tokio viability. The parser harness still beats the HEC server as a controlled microbench because it removes HTTP and request lifecycle overhead. Vendor numbers reinforce that batching dominates event/sec comparisons; request/sec without payload size is nearly meaningless.
-
-### 9.10 Five-Failure Diagnosis And Benchmark Tooling
-
-The previous `requests_failed = 5` anomaly was reproduced as the same class with a smaller count: AB completed the configured request count successfully, while the server observed one or more extra tail requests that failed during body read with HEC code `6`. After adding `body_read_errors`, the regular run recorded `requests_ok = 2500`, `requests_failed = 1`, and `body_read_errors = 1`; AB still reported `0` failed requests.
-
-Likely interpretation: ApacheBench can leave extra/incomplete POST attempts near the end of a concurrent run. Hyper delivers those as body read errors after the HEC handler has accepted the route and auth context. These should not be mixed into the measured successful-request throughput; they should be reported separately as client/tool tail behavior unless reproduced with another client.
-
-Instrumentation added:
-
-| Script or field | Path | Purpose |
-|-----------------|------|---------|
-| `bench_hec_ab.sh` | `/Users/walter/Work/Spank/HECpoc/scripts/bench_hec_ab.sh` | builds release binary, starts HEC receiver, runs AB single/concurrent stages, captures stats before/after, starts system monitor, writes `summary.json` |
-| `capture_system_stats.sh` | `/Users/walter/Work/Spank/HECpoc/scripts/capture_system_stats.sh` | samples process CPU, memory, thread count, descriptor count, top output, VM stats, netstat, iostat, and thread listing |
-| `analyze_bench_run.py` | `/Users/walter/Work/Spank/HECpoc/scripts/analyze_bench_run.py` | parses AB output and HEC stats deltas into receiver requests/sec, MiB/sec, events/sec, and failure counters |
-| `body_read_errors` | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/stats.rs` | separates malformed/incomplete body stream failures from parser/auth/timeout failures |
-| `failure_reason` | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/report.rs` | includes the HEC response text in failed request reports |
-
-Default benchmark invocation:
-
-```bash
-cd /Users/walter/Work/Spank/HECpoc
-scripts/bench_hec_ab.sh
-```
-
-Useful overrides:
-
-```bash
-PAYLOAD=/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/syslog C1_REQUESTS=1000 CN_REQUESTS=10000 CONCURRENCY=32 PORT=18450 MONITOR_INTERVAL=2 scripts/bench_hec_ab.sh
-```
-
-Long-run policy:
-
-1. Always keep `stats-before.json`, stage stats, AB output, `summary.json`, server logs, and `system/` samples together under one result directory.
-2. Compare AB-reported failures with HEC `requests_failed` and reason counters.
-3. Treat `body_read_errors` during AB as a benchmark-tool artifact until reproduced with `oha`, `wrk`, Vector, or a raw socket harness.
-4. Report both request/sec and event/sec, plus payload bytes/sec. Request/sec alone is misleading when one request can contain one line or two thousand lines.
-5. Use drop sink, capture sink, queue sink, and durable sink as separate benchmark modes; never blend them into one headline number.
-
-
----
-
-## 10. Appendix — HEC Return Values, Limits, And Constraints
+## Appendix A — HEC Return Values, Limits, And Constraints
 
 This appendix is the background ledger for tightening HEC compatibility, upgrading tests, and deciding where Spank should intentionally diverge from Splunk. It cross-checks the current receiver implementation against Splunk's published HEC format and troubleshooting pages, then enumerates present bounds and unaddressed edge cases.
 
@@ -578,7 +402,7 @@ Current implementation anchors:
 6. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_raw.rs` — `/services/collector/raw` line splitting and lossy text conversion.
 7. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` — route handling, health response, and current handler-level tests.
 
-### 10.1 Splunk HTTP Status Cross-Check
+### A.1 Splunk HTTP Status Cross-Check
 
 Splunk's current troubleshooting table assigns particular meaning to HEC response-code/status pairs. The current receiver produces a smaller but not identical HTTP status set.
 
@@ -598,7 +422,7 @@ Splunk's current troubleshooting table assigns particular meaning to HEC respons
 
 Important conclusion: the current receiver is HEC-shaped but not yet Splunk-status-compatible for all failure classes. The strongest mismatch candidates are body too large, unsupported encoding, timeout, unhealthy health status, and incorrect-path handling.
 
-### 10.2 HEC Return Code Coverage
+### A.2 HEC Return Code Coverage
 
 The current Splunk table lists HEC codes `0` through `27`, with some gaps in feature coverage rather than just missing tests. Current receiver protocol defaults expose only codes `0`, `2`, `3`, `4`, `5`, `6`, `9`, `12`, `13`, `15`, `17`, `18`, and `23`.
 
@@ -641,7 +465,7 @@ Actionable distinction:
 - Present as code paths but weakly invokable or untested at handler level: timeout, health unhealthy, sink failure, unsupported encoding body, body too large body.
 - Not addressed by design yet: disabled tokens, index allow-list, ACK/channel, query-string auth, queue capacity states, internal-error state, incorrect-path metrics/body.
 
-### 10.3 Size, Transfer, And Buffer Bounds
+### A.3 Size, Transfer, And Buffer Bounds
 
 Current configured values and constraints:
 
@@ -681,7 +505,7 @@ Immediate upgrade candidates:
 3. Add connection/request concurrency and per-source accounting before meaningful DoS-resilience claims.
 4. Add sink/capture bounds: max file size, flush policy, sync policy, write timeout, and failure mapping.
 
-### 10.4 Syntax, Punctuation, Separators, And Endpoint Shape
+### A.4 Syntax, Punctuation, Separators, And Endpoint Shape
 
 Current accepted request and payload syntax:
 
@@ -707,7 +531,7 @@ Punctuation and separators currently have narrow meaning:
 - Quotes, braces, brackets, parentheses, and commas have no meaning on raw endpoint.
 - JSON endpoint punctuation is entirely governed by `serde_json`; malformed, unterminated, or trailing non-whitespace input produces invalid-data at the relevant zero-based event index.
 
-### 10.5 Character Set, Encoding, And Escaping
+### A.5 Character Set, Encoding, And Escaping
 
 Current character handling:
 
@@ -727,7 +551,7 @@ Open policy decisions:
 3. Header token policy should decide whether tokens are strictly visible text or arbitrary opaque bytes.
 4. Capture output should state whether it preserves semantic event text, JSON value, or exact source bytes.
 
-### 10.6 Incomplete Entries, Quotes, Brackets, And Request Boundaries
+### A.6 Incomplete Entries, Quotes, Brackets, And Request Boundaries
 
 Current incomplete-input behavior:
 
@@ -747,7 +571,7 @@ Current incomplete-input behavior:
 
 Key compatibility issue: Splunk explicitly says raw events must be contained within a single HTTP request and cannot span multiple requests. The current receiver matches that boundary, but not Splunk's sourcetype-driven line-breaking sophistication.
 
-### 10.7 Event Granularity, Sections, Attributes, And Alignment
+### A.7 Event Granularity, Sections, Attributes, And Alignment
 
 Current event granularity:
 
@@ -774,7 +598,7 @@ Implementation implications:
 4. Preserve original endpoint and original field names while storing canonical internal names.
 5. Keep queue/store alignment decisions out of HEC parsing until the internal event batch representation is designed.
 
-### 10.8 Numeric, Datetime, Sequence, And Code Representation
+### A.8 Numeric, Datetime, Sequence, And Code Representation
 
 Current numeric handling:
 
@@ -802,13 +626,13 @@ Protocol-code decisions to make:
 
 ACK design decisions already settled enough to guide implementation:
 
-- ACK is scoped to the HTTP request/batch, not to each row/event/line.
+- ACK is scoped to the HTTP request/HEC batch, not to each row/event/line.
 - A request containing many raw lines or stacked JSON event objects should receive at most one `ackId`.
 - ACK boundary should be configurable for explicit modes such as `enqueue`, `write`, `flush`, `fsync`/`db_commit`, and later `indexed`.
 - `enqueue` is acceptable for benchmark/load-test mode only when labeled as such; production ACK should wait for a real durable boundary.
 - ACK registry is required before implementing `/services/collector/ack`: channel map, per-channel IDs, pending status table, capacity limits, idle cleanup, and consumed status removal.
 
-### 10.9 Test Upgrade Plan From This Appendix
+### A.9 Test Upgrade Plan From This Appendix
 
 Focused tests to add next:
 
@@ -830,7 +654,7 @@ Implementation priorities implied by this review:
 4. Postpone ACK/channel codes until the ACK feature is real; avoid fake compatibility.
 5. Add raw-byte policy and per-line limits before claiming production resilience.
 
-### 10.10 Splunk Verification Harness And Development Blockers
+### A.10 Splunk Verification Harness And Development Blockers
 
 This section separates developer decisions from facts that must be discovered against a live Splunk HEC endpoint. It also records what is blocked by missing subsystems rather than by uncertainty.
 
@@ -897,10 +721,10 @@ Postponed `fields` tests:
 | `7` incorrect index | event names an index not allowed for token/config | index registry and token-to-index policy | send allowed and disallowed `index` values and verify response/counter |
 | `23` shutting down | request arrives after shutdown begins and intake is closed | graceful shutdown orchestration around existing `Phase::Stopping` behavior | begin shutdown, send request during drain, expect `503/code23` or documented alternate |
 | `26` queue at capacity | bounded ingest queue cannot accept more work | bounded queue, queue policy, and source/request capacity counters | fill queue with blocked write path, send one more request, expect `429/code26` or chosen busy mapping |
-| `27` ACK channel at capacity | ACK-enabled request/batch needs a channel but channel capacity is exhausted | ACK channel registry and capacity policy | create max channels, send new channel, expect `429/code27` or Splunk-matched response |
+| `27` ACK channel at capacity | ACK-enabled request/HEC batch needs a channel but channel capacity is exhausted | ACK channel registry and capacity policy | create max channels, send new channel, expect `429/code27` or Splunk-matched response |
 | `18`/`19`/`20` health subcauses | queue full, ACK unavailable, or both | queue health and ACK health exposed separately | health endpoint under forced queue/ACK conditions |
 
-Current `23` status: implemented at the handler/lifecycle-phase level. `Phase::Stopping` now returns `503/code23` for `/services/collector/health` and for new ingest requests. What remains is a system-level graceful-shutdown test that starts the real server, initiates shutdown, proves new work is rejected with code `23`, and proves already accepted work reaches the selected commit boundary.
+Current `23` behavior: implemented at the handler/lifecycle-phase level. `Phase::Stopping` now returns `503/code23` for `/services/collector/health` and for new ingest requests. What remains is a system-level graceful-shutdown test that starts the real server, initiates shutdown, proves new work is rejected with code `23`, and proves already accepted work reaches the selected commit boundary.
 
 #### Backpressure Before Queue Full
 
@@ -915,24 +739,26 @@ Backpressure cannot be validated as queue-full until a bounded queue exists. Int
 
 These prove bounded request processing, not end-to-end queue backpressure. The first real queue-full test should use a bounded queue of size `1`, a write path deliberately blocked on a test latch, and one extra request that must receive a deterministic retryable response.
 
-#### Development Blocker Status
+#### Development Dependencies
 
-| Area | Status | What is blocked | Next concrete step |
+| Area | Current State | What is blocked | Next concrete step |
 |------|--------|-----------------|--------------------|
 | Splunk response gray areas | open | final mapping for `408`, `413`, `415`, unknown route, raw blanks, malformed JSON details | run `scripts/verify_splunk_hec.sh` and record local Splunk version |
 | Raw policy | open | replay-grade ingest and binary safety claims | decide strict UTF-8, lossy text, or byte-preserving raw event representation |
 | Observability | partially implemented | complete failure reason accounting and benchmark ledger | add bounded reason fields for every `REQUEST_FAILED` path |
 | Lifecycle | handler-level `Phase::Stopping` implemented | graceful drain semantics, shutdown request behavior, accepted-work completion | add graceful-shutdown system test harness |
 | Index policy | not implemented | code `7`, per-token allowed index validation, logical namespace enforcement | define minimal index allow-list config and behavior for unknown index |
-| ACK | postponed, request/batch scoped | codes `10`, `11`, `14`, `19`, `20`, `25`, `27`, `ackId` registry and commit-boundary semantics | implement only after `ack.boundary` and registry design are encoded in config/tests |
-| Queue/backpressure | not implemented | code `26`, health queue-full state, source admission policy | add bounded queue and blocked-write-path test |
+| ACK | postponed, request/HEC batch scoped | codes `10`, `11`, `14`, `19`, `20`, `25`, `27`, `ackId` registry and commit-boundary semantics | implement only after `ack.boundary` and registry design are encoded in config/tests |
+| Queue/backpressure | not implemented | code `26`, health queue-full state, source capacity policy | add bounded queue and blocked-write-path test |
 | Axum accept visibility | deferred | connection counts, peer culling, header timeout tuning, socket backlog/buffers | add task for owned accept loop using `TcpSocket` + Hyper/hyper-util after current HEC matrix stabilizes |
 
-## 11. Appendix — Data-Path Terminology And Stage Definitions
+---
 
-Purpose: name the data component of HECpoc processing from the HTTP request as exposed by Axum/Hyper through HEC validation, batching, queueing, writing, and optional later interpretation. The names should follow function first, and component names second.
+## Appendix B — Naming, Data-Path Terminology, And Design Choices
 
-### 11.1 Request, Frame, Body, Line, Event, Record, Batch
+Purpose: maintain naming choices, design justifications, and terminology comparisons that would otherwise clutter the main design. The main text is authoritative for the selected data path and entities; this appendix provides the supporting vocabulary, crosswalks, and enforcement rules.
+
+### B.1 Request, Frame, Body, Line, Event, Record, Batch
 
 Use these terms with exact scope:
 
@@ -953,33 +779,11 @@ Use these terms with exact scope:
 
 `line` exists only where a format or endpoint defines it. HEC `/raw` uses line splitting. HEC `/event` uses JSON envelope boundaries, not newline boundaries. Syslog, Apache, and other file formats may be line-oriented, but multiline parsers can combine several physical lines into one log record.
 
-### 11.2 Functional Data Path
+### B.2 Main Data Path Reference
 
-Use this as the active HECpoc data path:
+The definitive data path, state sequence, and core entities are in Section 2.1. This appendix does not restate them as a competing source of truth. It only records terminology nuances, external comparisons, and naming rules that support the main design.
 
-```text
-transport stream
-  -> HTTP request/framing
-  -> HTTP headers and route
-  -> auth and request metadata validation
-  -> HTTP body
-  -> content decode
-  -> HEC decode
-  -> HEC event validation
-  -> HecEvents formation
-  -> concrete disposition
-  -> selected commit state
-  -> optional format interpretation
-  -> optional search preparation
-```
-
-Short form:
-
-```text
-receive HTTP request -> validate headers/auth -> read HTTP body -> content decode -> HEC decode -> validate events -> form HecEvents -> disposition -> commit state -> optional interpretation/search-prep
-```
-
-### 11.3 Stage Definitions
+### B.3 Stage Fact Vocabulary
 
 | Stage | Function | Input | Output | Extracted / Attached Facts |
 |-------|----------|-------|--------|-----------------------------|
@@ -995,7 +799,7 @@ receive HTTP request -> validate headers/auth -> read HTTP body -> content decod
 | format interpretation | parse log-record structure inside events | raw/event payload | parsed record fields | parser family/variant/version, parse status/reason, field aliases |
 | search preparation | build search-oriented structures | parsed records or replayable raw events | tokens/columns/index metadata | token counts, field stats, postings/segments when implemented |
 
-### 11.4 Decode, Parse, Normalize, Tokenize
+### B.4 Decode, Parse, Normalize, Tokenize
 
 Use `decode` for protocol and representation conversion:
 
@@ -1023,7 +827,7 @@ Use `tokenize` for search-preparation terms:
 - URI/path terms;
 - position/proximity terms if enabled.
 
-### 11.5 Splunk Functional Stages And Queues
+### B.5 Splunk Functional Stages And Queues
 
 Splunk's public data-pipeline model is `Input -> Parsing -> Indexing -> Search`. Splunk documentation states that the parsing function actually consists of parsing, merging, and typing pipelines. Operational queue names expose buffers between these functions.
 
@@ -1043,7 +847,7 @@ Splunk's public data-pipeline model is `Input -> Parsing -> Indexing -> Search`.
 
 Splunk `header` in this context is data-header recognition during parsing, not HTTP header parsing. HECpoc HTTP headers belong to `HTTP request/framing` and `header/auth validation`.
 
-### 11.6 Splunk-Compatible Metrics To Consider
+### B.6 Splunk-Compatible Metrics To Consider
 
 Current HECpoc metrics should eventually map to Splunk-compatible or Splunk-comparable counters where useful:
 
@@ -1078,7 +882,7 @@ Additional non-Splunk-specific HECpoc metrics:
 | commit state | `hec.commit_state_total{state}` |
 | current concurrency | `hec.requests_in_flight`, later `hec.connections_current` when the accept loop is visible |
 
-### 11.7 Vector Architecture Terms And Code Signals
+### B.7 Vector Architecture Terms And Code Signals
 
 Vector's public architecture is component based:
 
@@ -1106,7 +910,7 @@ Vector both processes individual events and forms outbound batches. Its Splunk H
 
 HECpoc should not copy Vector's exact batch defaults. The useful lesson is that inbound HEC request grouping and outbound/store aggregation are separate mechanisms.
 
-### 11.8 HECpoc HEC Events And Aggregation Terms
+### B.8 HECpoc HEC Events And Aggregation Terms
 
 Approved naming direction:
 
@@ -1136,7 +940,7 @@ Initial rule: keep request provenance, not request granularity. Later write/stor
 
 Format parsing should start event-by-event unless a parser or benchmark demonstrates a benefit from `ParseBatch`. If grouped parsing is introduced, `ParseBatch` must name its policy: by sourcetype, byte range, event count, time window, store segment, or CPU/cache partition.
 
-### 11.9 Disposition And Capacity Terms
+### B.9 Disposition And Capacity Terms
 
 Avoid vague `admission decision` and `handoff`. Name the concrete disposition:
 
@@ -1152,7 +956,7 @@ Avoid vague `admission decision` and `handoff`. Name the concrete disposition:
 
 Use `full` for the measured condition and `busy` for the client-facing or aggregate state. Example: `ingest_queue_full` may map to HEC `server busy`.
 
-### 11.10 Commit-State Requirement
+### B.10 Commit-State Requirement
 
 Truthful commit reporting means: the response, ACK, metric, and log may not claim a state stronger than what actually completed.
 
@@ -1167,9 +971,9 @@ Truthful commit reporting means: the response, ACK, metric, and log may not clai
 
 This is separate from Splunk conformance. Splunk compatibility asks whether the selected external behavior matches Splunk. Commit-state truthfulness asks whether HECpoc's own reported state is technically true.
 
-### 11.11 Enforcement Proposal
+### B.11 Enforcement Rules
 
-If approved, apply these rules across active documents and new code:
+Apply these rules across active documents and new code:
 
 1. Use function names before component names: `HEC decode`, `HecEvents formation`, `enqueue HecEvents`, `write HecEvents`, `format interpretation`, `search preparation`.
 2. Avoid generic `worker` or `processor` in design names unless the implementation is truly about scheduling rather than function.
@@ -1180,17 +984,283 @@ If approved, apply these rules across active documents and new code:
 7. Do not introduce `sealed block` into common terminology until store block layout exists.
 8. Every success, ACK, stored, or committed claim must name the commit state it actually reached.
 
-### 11.12 Visual Reference Candidates
+### B.12 Visual Reference Candidates
 
-Use visuals to reduce repeated prose, not to create another status layer. Good candidates:
+Use visuals to reduce repeated prose, not to create another status layer. Suggested reference artifacts:
 
-| Visual | Purpose | Best Location |
-|--------|---------|---------------|
-| Stage flow diagram | Show `HTTP request` through `HecEvents`, disposition, commit state, and optional interpretation/search preparation | `HECpoc.md` Appendix 11 |
-| Terminology crosswalk | Compare Splunk, Vector, and HECpoc terms without forcing identical architecture | `HECpoc.md` Appendix 11 |
-| Commit-state ladder | Prove which response/ACK/log claims are allowed at accepted, queued, written, flushed, durable, and search-ready states | `Store.md` or `HECpoc.md` Appendix 11 |
-| `HecBatch` vs `WriteBlock` diagram | Show why HTTP input grouping and store/output grouping are different | `Store.md` |
+| Visual | Purpose | Location |
+|--------|---------|----------|
+| Stage flow diagram | Show `HTTP request` through `HecEvents`, disposition, commit state, and optional interpretation/search preparation | `viz/stage_flow.mmd` |
+| Terminology crosswalk | Compare Splunk, Vector, and HECpoc terms without forcing identical architecture | `HECpoc.md` Appendix B |
+| Commit-state ladder | Prove which response/ACK/log claims are allowed at accepted, queued, written, flushed, durable, and search-ready states | `Store.md` or `HECpoc.md` Appendix B |
+| `HecBatch` vs `WriteBlock` diagram | Show why HTTP input grouping and store/output grouping are different | `viz/hec_batch_writeblock.mmd` |
 | Buffer/queue pressure map | Place kernel buffers, Hyper body stream, HEC body limits, queues, and write buffers in order | `Stack.md` |
-| Validation matrix | Tie each protocol condition to HTTP status, HEC code, metric, log/report fact, and test fixture | `HECpoc.md` Appendix 9 |
+| Validation matrix | Tie each protocol condition to HTTP status, HEC code, metric, log/report fact, and test fixture | `HECpoc.md` Appendix C |
+
+---
+
+## Appendix C — Validation And Benchmark Evidence
+
+This appendix records concrete validation and benchmark evidence: what was mapped, what was run, what broke, what was fixed, and what remains open.
+
+### C.1 Reporter Component Map
+
+Reporter component/source mapping is now part of the stack design and code path.
+
+| Reporter component | Tracing target | Processing origin | Typical facts |
+|--------------------|----------------|-------------------|---------------|
+| `Component::Hec` | `hec.receiver` | route, endpoint, request completion | `hec.request.received`, `hec.request.succeeded`, `hec.request.failed` |
+| `Component::Auth` | `hec.auth` | authorization header and token checks | `hec.auth.token_required`, `hec.auth.invalid_authorization`, `hec.auth.token_invalid` |
+| `Component::Body` | `hec.body` | content length, body read, gzip decode | `hec.body.too_large`, `hec.body.timeout`, `hec.body.gzip_request`, `hec.body.gzip_failed` |
+| `Component::Parser` | `hec.parser` | event/raw interpretation | `hec.parser.failed`, `hec.parser.events_parsed` |
+| `Component::Sink` | `hec.sink` | `HecEvents` disposition and capture/drop output path | `hec.sink.failed`, `hec.sink.completed` |
+
+Important implementation detail: `tracing` callsite targets must be literals, not dynamic strings. The implementation therefore branches on `Component` and emits through literal targets such as `target: "hec.auth"`. This is mildly repetitive but keeps target-level filtering fast and compatible with `tracing-subscriber::EnvFilter`.
+
+Current filter example:
+
+```sh
+HEC_OBSERVE_LEVEL='debug,hec.receiver=debug,hec.auth=debug,hec.body=debug,hec.parser=debug,hec.sink=debug'
+```
+
+Convenience TOML such as `[observe.sources] hec.auth = "debug"` is still a design target, not implemented. The currently implemented control is the global `observe.level` filter expression.
+
+### C.2 Input Coverage Run
+
+Run directory: `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z`.
+
+Receiver configuration used:
+
+- release binary;
+- capture sink enabled;
+- max HTTP body bytes `30_000_000`;
+- max decoded bytes `60_000_000`;
+- max events `1_000_000`;
+- JSON tracing enabled;
+- console output enabled;
+- all component targets set to debug.
+
+Inputs exercised:
+
+| Input | Source path | Endpoint | Expected result | Observed |
+|-------|-------------|----------|-----------------|----------|
+| syslog sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/syslog` first 200 KB | raw | accepted as raw lines | `200` |
+| auth sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/auth.log` first 200 KB | raw | accepted as raw lines | `200` |
+| Apache LogHub | `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log` | raw | accepted as raw lines | `200` |
+| OpenSSH LogHub | `/Users/walter/Work/Spank/Logs/loghub/OpenSSH_2k.log` | raw | accepted as raw lines | `200` |
+| Windows LogHub | `/Users/walter/Work/Spank/Logs/loghub/Windows_2k.log` | raw | accepted as raw lines | `200` |
+| Vector NDJSON | `/Users/walter/Work/Spank/Logs/vector/vector_log.ndjson` | raw | accepted as raw text lines | `200` |
+| Wazuh NDJSON | `/Users/walter/Work/Spank/Logs/wazuh/state.ndjson` | raw | accepted as raw text lines | `200` |
+| CSV | `/Users/walter/Work/Spank/Logs/prices.csv` | raw | accepted as raw text lines | `200` |
+| CRLF | generated `one\r\ntwo\r\nthree\n` | raw | accepted; CR stripped | `200` |
+| embedded NUL | generated `a\0b\n` | raw | accepted; preserved in JSON string escaping | `200` |
+| invalid UTF-8 | generated `0xff 0xfe \n valid\n` | raw | accepted through lossy text conversion | `200` |
+| blank only | generated LF/CRLF blanks | raw | no data | `400`, `{"text":"No data","code":5}` |
+| gzip syslog | gzip of syslog sample | raw | accepted after decode | `200` |
+| valid HEC JSON | generated envelope | event | accepted | `200` |
+| concatenated HEC JSON | generated two envelopes | event | accepted | `200` |
+| missing event | generated JSON without `event` | event | event field required | `400`, code `12` |
+| syslog to event endpoint | syslog bytes | event | invalid data format | `400`, code `6` |
+| missing auth | generated raw | raw | token required | `401`, code `2` |
+| bad token | generated raw | raw | invalid token | `403`, code `4` |
+| malformed auth | generated raw | raw | invalid authorization | `401`, code `3` |
+| unsupported encoding | generated raw with `Content-Encoding: br` | raw | invalid data / unsupported media | `415`, code `6` |
+| advertised oversize | generated raw with huge `Content-Length` | raw | request too large | `413`, code `6` |
+| parallel Apache | 32 concurrent requests, 8-way client parallelism | raw | all accepted | all `200` |
+
+Summary stats from `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/stats.json`:
+
+```json
+{"requests_total":54,"requests_ok":46,"requests_failed":8,"auth_failures":3,"body_too_large":1,"timeouts":0,"gzip_requests":1,"gzip_failures":0,"parse_failures":3,"wire_bytes":6805324,"decoded_bytes":6986001,"events_observed":73813,"events_drop_sink":0,"events_written":73813,"sink_failures":0,"latency_nanos_total":9151439000,"latency_nanos_max":327345000}
+```
+
+Capture file readback:
+
+- `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/capture.jsonl` contains `73_813` records.
+- The capture count matches `events_written`.
+- The run produced target-separated tracing records: `hec.receiver`, `hec.auth`, `hec.body`, and `hec.parser` were all observed.
+
+### C.3 Output, Reporting, Record, Benchmark, And Profile Permutations
+
+Output permutations exercised in this pass:
+
+| Mode | Configuration | Purpose | Outcome |
+|------|---------------|---------|---------|
+| JSON tracing + console + stats + capture | validation run | verify report fan-out and target mapping under real inputs | worked; component targets observed |
+| tracing off + console off + stats on + drop sink | benchmark run | isolate request/raw parsing and stats from output/capture overhead | worked; no request failures from `ab` |
+| redacted show-config | config validation | verify configured redaction text | worked |
+| passthrough show-config | config validation | verify explicit secret passthrough mode | worked |
+
+Benchmark/profile run directory: `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z`.
+
+Payload:
+
+- `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log`;
+- `171_239` bytes;
+- `1_999` lines/events per request.
+
+`ab` results:
+
+| Run | Complete | Failed | Requests/sec | Mean request time | Notes |
+|-----|----------|--------|--------------|-------------------|-------|
+| `ab -n 500 -c 1` | 500 | 0 | `3250.11` | `0.308 ms` | client-side `ab` summary |
+| `ab -n 2000 -c 16` | 2000 | 0 | `14930.83` | `1.072 ms` | client-side `ab` summary |
+
+Receiver stats after benchmark:
+
+```json
+{"requests_total":2505,"requests_ok":2500,"requests_failed":5,"auth_failures":0,"body_too_large":0,"timeouts":0,"gzip_requests":0,"gzip_failures":0,"parse_failures":0,"wire_bytes":428097500,"decoded_bytes":428097500,"events_observed":5000000,"events_drop_sink":5000000,"events_written":0,"sink_failures":0,"latency_nanos_total":1077444000,"latency_nanos_max":2370000}
+```
+
+Interpretation limits:
+
+- These are smoke benchmarks, not capacity claims.
+- `ab` reports response throughput, not submitted payload throughput, so byte/sec must be computed from receiver stats and elapsed wall time if needed.
+- The run used drop sink and output disabled except stats; capture-file results are intentionally separate.
+- The `requests_failed = 5` counter in the benchmark run is unexplained because `ab` reported zero failed requests and detailed error counters remained zero. This needs a focused repro with tracing enabled and stats snapshots before and after warmup/readiness.
+- macOS `sample` captured a process report at `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z/sample-c16.txt`; the run was too short for deep attribution, but it records a physical footprint around 25.5 MB during the sampled interval.
+
+### C.4 Bugs Fixed During This Pass
+
+| Issue | Symptom | Fix | Regression coverage |
+|-------|---------|-----|---------------------|
+| Raw byte length after lossy UTF-8 | invalid UTF-8 raw lines stored `raw_bytes_len` after replacement-character expansion, not original byte length | added `Event::from_raw_line_with_len` and passed original byte count from raw parser | `parse_raw::lossy_decodes_non_utf8_without_panic` now checks original byte length |
+| Advertised oversize counter missing | huge `Content-Length` returned 413 but `body_too_large` stayed zero | routed advertised oversize through `report_body_error` | `handler::advertised_oversize_increments_body_too_large_counter` |
+| Component target design mismatch | docs described per-component filter targets but Reporter emitted all tracing under one target | branched Reporter tracing emission by component with literal targets | validation run observed `hec.auth`, `hec.body`, `hec.parser`, and `hec.receiver` targets |
+
+### C.5 Obvious Inefficiencies And Poor Implementation Areas
+
+These are observed or strongly suspected from code inspection and the validation runs.
+
+| Area | Current implementation | Risk | Improvement direction |
+|------|------------------------|------|-----------------------|
+| Raw parser allocation | creates a `String` and full `Event` per line immediately | high allocation rate for large raw batches | introduce `RawEventRef`/batch representation or bytes-backed event until sink/store boundary |
+| Raw byte preservation | raw endpoint stores lossy text plus byte length, not original bytes | cannot replay exact binary/log input | add optional raw byte capture or escaped byte field before claiming byte-preserving ingest |
+| Capture sink | opens and flushes file per HEC request group under a mutex | poor high-concurrency write behavior | persistent buffered writer or write path with explicit flush policy |
+| Reporter field serialization | dynamic fields are collapsed into JSON string for tracing | less useful structured filtering/querying in tracing backend | static fields for hot/common fields or custom `valuable`/JSON layer later |
+| Counter labels | counters are flat atomics without reason labels | loses distinction between rejection causes beyond a few coarse counters | introduce bounded reason enums or structured stats snapshot |
+| Request failure accounting | benchmark run showed 5 request failures with no detailed counters | possible unclassified failure path or warmup artifact | add `REQUEST_FAILED` reason field and trace failed responses during benchmark repro |
+| Benchmark method | `ab` client metrics omit submitted bytes/sec and server CPU | misleading throughput interpretation | compute receiver-side bytes/sec/events/sec from stats deltas and wall time; add `time`, `ps`, `sample`, and later `dtrace`/Instruments recipes |
+| Component source config | `observe.level` can express target filters but TOML `[observe.sources]` is not implemented | operator-facing config is less readable | map `[observe.sources]` to an `EnvFilter` directive string during config load |
+
+### C.6 Methodology Outcomes
+
+Useful method choices from this pass:
+
+- Use result directories under `/Users/walter/Work/Spank/HECpoc/results/` with `summary.tsv`, response bodies, server logs, stats, and manifests.
+- Keep real-log raw acceptance separate from HEC JSON event compatibility.
+- Verify counters against response matrix; the advertised-oversize bug was visible only because response and stats were compared.
+- Run output-heavy validation separately from output-light benchmark/profiling.
+- Treat each benchmark as evidence for one configuration, not as a general performance claim.
+
+Method problems to fix:
+
+- The first benchmark script accidentally used bare `wait`, which waited on the server process and required manual cleanup. Future scripts should wait only on explicit short-lived child process IDs.
+- Benchmarks should snapshot stats before and after each run, not only at the end.
+- Benchmark manifests should record binary hash, git status, command line, payload bytes, payload line count, CPU model, OS, and power mode.
+- Validation scripts should become checked-in scripts only after their names, outputs, and failure semantics are stable.
+
+### C.7 Follow-Up Validations And Decisions
+
+| Area | Current Interpretation | Required Action |
+|------|------------------------|-----------------|
+| benchmark failure accounting | five unexplained request failures make performance counters untrustworthy | rerun with `hec.receiver=debug`, stats before/after each `ab` stage, and response capture for non-200s |
+| unsupported encoding observability | response behavior is adequate but reason accounting is too coarse | add `BODY_UNSUPPORTED_ENCODING` or a bounded decode/body reason enum |
+| body-too-large HEC code | current `413/code6` may be an intentional extension or a Splunk mismatch | compare local Splunk and Vector client behavior before changing mapping |
+| raw invalid UTF-8 | lossy acceptance is useful but not replay-grade | document raw text policy and add byte-preserving mode before replay claims |
+| blank raw lines | current no-data behavior needs Splunk comparison | compare Splunk raw HEC behavior and decide skip, preserve, or reject semantics |
+| direct file success | written, flushed, and durable are different claims | define direct-file commit state and make response/reporting use that state |
+| per-component filters | `EnvFilter` handles tracing but not every output | implement TOML-to-EnvFilter first; add Reporter filters only when another output needs them |
+
+### C.8 Pending And Future Work Decomposition
+
+Near-term implementation tasks:
+
+1. Add a validation script that reproduces `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z` without ad hoc shell editing.
+2. Add a benchmark script with explicit stats-before/stats-after snapshots and no bare `wait`.
+3. Add `[observe.sources]` TOML support that composes into `observe.level`/`EnvFilter` directives.
+4. Add failure reason fields to `REQUEST_FAILED` and counters where coarse counters hide cause.
+5. Add `BODY_UNSUPPORTED_ENCODING` reporting or an explicit decode/body reason field.
+6. Add capture sink mode with persistent buffered writer and configurable flush policy.
+7. Add raw-byte preservation design and tests before claiming replay-grade raw ingest.
+
+Validation tasks:
+
+1. Compare the same response matrix against local Splunk Enterprise HEC.
+2. Send with Vector as HEC client into this receiver and inspect request shapes.
+3. Run full-size syslog and auth.log with raised limits and record bytes/sec/events/sec.
+4. Add gzip expansion tests using both valid high-ratio gzip and malformed gzip.
+5. Add slow-body tests to exercise idle and total body timeouts.
+6. Add no-auth/malformed-auth/bad-token load tests to validate auth rejection cost and logging volume.
+
+Design tasks:
+
+1. Decide raw text versus raw bytes as an explicit product policy.
+2. Decide HEC response compatibility for body-too-large, unsupported encoding, ACK disabled, and raw blank-line behavior.
+3. Define sink commit states for drop, capture, flushed, and durable modes.
+4. Define stats schema with bounded reason labels before Prometheus or external metrics.
+5. Decide whether Reporter should own output routing only, or also a source/fact runtime filter table for non-tracing outputs.
+
+### C.9 Performance Comparison — Current HECpoc, Earlier Rust Work, And Vendor Signals
+
+The current HECpoc numbers measure a localhost HTTP receiver using Axum/Tokio/Hyper, bounded body read, raw line splitting, and the drop sink. They do not include durable file or database commit, indexing, ACK, TLS, remote network, or Splunk-compatible storage/search costs.
+
+| Source | Workload | Result | Interpretation |
+|--------|----------|--------|----------------|
+| HECpoc current regular run | Apache raw payload, `171_239` bytes and `1_999` events/request, drop sink, `ab -n 500 -c 1` | about `3,000 req/s`; receiver delta about `6.0M events/s`, `489 MiB/s` | HTTP/request overhead visible; very high event rate only because each request carries many raw lines and sink is drop-only |
+| HECpoc current regular run | same payload, `ab -n 2000 -c 16` | about `17,011 req/s`; receiver delta about `33.9M events/s`, `2.7 GiB/s`; one extra body-read failure from AB tail behavior | useful upper smoke signal for in-memory raw splitting, not production ingest capacity |
+| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 1000 -c 1` | about `11,998 req/s`; `0` server failures | measures request overhead with tiny payload, not parsing throughput |
+| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 5000 -c 50` | about `38,735 req/s`; `0` server failures | shows the server can answer many tiny local HTTP requests when body work is trivial |
+| SpankMax focused parser harness | generated Apache, `100_000` rows, `memchr`, simple tokenizer, null store | about `2.78M events/s`, `362 MiB/s` | cleaner CPU parser/tokenizer/store-null measurement; no HTTP, Axum, auth, body limits, or sink durability |
+| SpankMax focused parser harness | real Apache-ish input, `13_628` rows, `memchr`, simple tokenizer, null store | about `1.49M events/s`, `444 MiB/s` | parser harness remains the better place to study parser/tokenizer layout |
+| SpankMax focused parser harness | syslog, `9_148` rows, simple tokenizer, null store | about `680k events/s`, `125 MiB/s` | syslog/tokenization path is materially heavier than raw-line HEC splitting |
+| Earlier integrated `spank-hec` crate | Axum `Bytes` extractor, mpsc queue, file sender | no comparable retained benchmark artifact found | code is useful design history but not a current performance baseline; it reads whole bodies before HEC-owned limits and uses a different queue/file path |
+
+External vendor signals are not apples-to-apples, but they set order-of-magnitude expectations:
+
+- Splunk Stream HEC HTTP raw tests report `streamfwd` sender rates from `13` to `11,437 events/sec` in a 100K-response HTTP test across 8 Mbps to 10 Gbps, and up to `22,411 events/sec` in a 25K-response HTTP test before drop rates appear at higher rates. Source: [Splunk Independent streamfwd HEC HTTP raw tests](https://help.splunk.com/en/splunk-enterprise/collect-stream-data/install-and-configure-splunk-stream/8.0/splunk-stream-performance-tests-and-considerations/independent-streamfwd-hec-tests---http-raw-events).
+- Splunk HEC troubleshooting/performance guidance emphasizes batching, HTTP versus HTTPS, keep-alive, Monitoring Console dashboards, and persistent queue cost rather than a single universal throughput number. Source: [Splunk HEC troubleshooting](https://docs.splunk.com/Documentation/Splunk/9.4.2/Data/TroubleshootHTTPEventCollector).
+- Vector sizing guidance estimates unstructured logs at about `10 MiB/s/vCPU` and structured logs at about `25 MiB/s/vCPU`, explicitly as conservative sizing starting points that vary by workload. Source: [Vector sizing and capacity planning](https://vector.dev/docs/setup/going-to-prod/sizing/).
+- Vector's public positioning says it is high-performance and claims up to `10x` faster than alternatives, but that is vendor positioning, not a replacement for our local apples-to-apples HEC receiver tests. Source: [Vector GitHub README](https://github.com/vectordotdev/vector).
+
+Current conclusion: HECpoc is already fast enough that the next bottlenecks should be correctness, measurement reliability, and sink/queue design rather than raw Axum/Tokio viability. The parser harness still beats the HEC server as a controlled microbench because it removes HTTP and request lifecycle overhead. Vendor numbers reinforce that batching dominates event/sec comparisons; request/sec without payload size is nearly meaningless.
+
+### C.10 Five-Failure Diagnosis And Benchmark Tooling
+
+The previous `requests_failed = 5` anomaly was reproduced as the same class with a smaller count: AB completed the configured request count successfully, while the server observed one or more extra tail requests that failed during body read with HEC code `6`. After adding `body_read_errors`, the regular run recorded `requests_ok = 2500`, `requests_failed = 1`, and `body_read_errors = 1`; AB still reported `0` failed requests.
+
+Likely interpretation: ApacheBench can leave extra/incomplete POST attempts near the end of a concurrent run. Hyper delivers those as body read errors after the HEC handler has accepted the route and auth context. These should not be mixed into the measured successful-request throughput; they should be reported separately as client/tool tail behavior unless reproduced with another client.
+
+Instrumentation added:
+
+| Script or field | Path | Purpose |
+|-----------------|------|---------|
+| `bench_hec_ab.sh` | `/Users/walter/Work/Spank/HECpoc/scripts/bench_hec_ab.sh` | builds release binary, starts HEC receiver, runs AB single/concurrent stages, captures stats before/after, starts system monitor, writes `summary.json` |
+| `capture_system_stats.sh` | `/Users/walter/Work/Spank/HECpoc/scripts/capture_system_stats.sh` | samples process CPU, memory, thread count, descriptor count, top output, VM stats, netstat, iostat, and thread listing |
+| `analyze_bench_run.py` | `/Users/walter/Work/Spank/HECpoc/scripts/analyze_bench_run.py` | parses AB output and HEC stats deltas into receiver requests/sec, MiB/sec, events/sec, and failure counters |
+| `body_read_errors` | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/stats.rs` | separates malformed/incomplete body stream failures from parser/auth/timeout failures |
+| `failure_reason` | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/report.rs` | includes the HEC response text in failed request reports |
+
+Default benchmark invocation:
+
+```bash
+cd /Users/walter/Work/Spank/HECpoc
+scripts/bench_hec_ab.sh
+```
+
+Useful overrides:
+
+```bash
+PAYLOAD=/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/syslog C1_REQUESTS=1000 CN_REQUESTS=10000 CONCURRENCY=32 PORT=18450 MONITOR_INTERVAL=2 scripts/bench_hec_ab.sh
+```
+
+Long-run policy:
+
+1. Always keep `stats-before.json`, stage stats, AB output, `summary.json`, server logs, and `system/` samples together under one result directory.
+2. Compare AB-reported failures with HEC `requests_failed` and reason counters.
+3. Treat `body_read_errors` during AB as a benchmark-tool artifact until reproduced with `oha`, `wrk`, Vector, or a raw socket harness.
+4. Report both request/sec and event/sec, plus payload bytes/sec. Request/sec alone is misleading when one request can contain one line or two thousand lines.
+5. Use drop sink, capture sink, queue sink, and durable sink as separate benchmark modes; never blend them into one headline number.
 
 
+---
