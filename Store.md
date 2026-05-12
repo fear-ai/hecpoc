@@ -2,6 +2,8 @@
 
 Scope: application-level processing after HEC protocol handling has produced `HecEvents` and before stored evidence is retired. This document owns event disposition, queue topology, `ParseBatch` policy, `WriteBlock` construction, commit states, durability semantics, store layout alternatives, profile-specific tuning, and validation for queue/store behavior.
 
+Mandate: define what happens to accepted HEC events after protocol validation, including queue boundaries, write aggregation, commit-state truthfulness, durable evidence, replay, and retirement. Store does not own HEC request parsing, HTTP mechanics, format grammar details, or generic reporting/configuration machinery.
+
 This is not a database-choice note. The first durable question is what state the receiver can honestly claim for an accepted request. Database selection is a later implementation choice under that state model.
 
 ---

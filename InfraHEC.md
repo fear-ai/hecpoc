@@ -1,1509 +1,365 @@
-# InfraHEC — HECpoc Infrastructure Spine
+# InfraHEC — Infrastructure Spine
 
-This document concentrates the cross-cutting infrastructure plan for the HECpoc Rust implementation: runtime, configuration, errors, outcomes, reporting, public text, metrics, lifecycle, validation, benchmarking, security posture, and operational packaging. It adopts the best layout ideas from:
+This document defines the reusable implementation services that feature modules depend on: configuration, startup, shutdown, error classification, reporting, logging, metrics, validation ledgers, benchmark ledgers, security defaults, and operational packaging.
 
-- `/Users/walter/Work/Spank/infra/Infrastructure.md` — functional layers, scale regimes, protocol selection, and operations framing;
-- `/Users/walter/Work/Spank/spank-py/Infra.md` — problem/benefit/requirements/architecture/decision sections, call-site conventions, metrics/health, security posture, and validation survey style;
-- `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` — Rust-specific mandates for `tracing`, metrics, error taxonomy, `figment`, lifecycle, Tokio runtime, CLI, health, testing, and build tooling.
+Mandate: own the common machinery and conventions, not the product protocol, not log-format grammar, not network-stack mechanics, and not storage policy. Subject documents define their own parameters and behavior; this document defines how those parameters are loaded, validated, reported, redacted, measured, and operated.
 
-This is the current infrastructure reference for implementation services that span multiple feature areas.
-
----
-
-## 1. Purpose And Scope
-
-HECpoc is a focused Rust implementation of a Splunk HEC-compatible receiver for local testing, validation, and later production-quality ingest experiments. Infrastructure means the code and operational machinery that every feature depends on:
-
-- process startup and shutdown;
-- configuration and validation;
-- HTTP/Tokio runtime behavior;
-- errors, HEC outcomes, and message text;
-- logs, metrics, health, readiness, and run ledgers;
-- request buffering, resource limits, backpressure, and resilience;
-- test harnesses, benchmarks, fixtures, and external compatibility checks;
-- build, packaging, and service operation.
-
-InfraHEC subjects, reflected in section layout:
-
-| Subject | Requirement Focus |
-|---|---|
-| operating modes | local fixture, compatibility lab, performance lab, production candidate |
-| Rust infrastructure choices | runtime, HTTP framework, configuration libraries, error libraries, logging, metrics, tests |
-| repository and module shape | crate/module placement for infrastructure code |
-| configuration | file/env/CLI precedence, typed parameters, validation, redaction |
-| errors and outcomes | internal failure classes, HEC response outcomes, mapping rules, message text |
-| reporting/logging/observability | call-site contract, field typing, fan-out, redaction, stats/log outputs |
-| metrics | counters and histograms tied to bounded resources and outcomes |
-| lifecycle | startup order, signal handling, graceful shutdown, panic policy |
-| runtime policy | Tokio worker configuration, CPU/I/O separation, blocking-call boundaries |
-| interfaces | HTTP adapter boundary, sink/queue inspection boundary, backpressure contract |
-| security posture | secrets, hostile input classes, default-safe behavior |
-| benchmark ledger | run metadata, stage timing, resource sampling, evidence files |
-| service operation | build, packaging, service/container expectations |
-
-Placement review:
-
-- lifecycle and runtime policy stay here because every subsystem depends on startup, shutdown, cancellation, and runtime/task budgeting;
-- HEC route behavior, response compatibility, and staged product decisions are not infrastructure and should not be expanded here;
-- socket/kernel mechanics are not infrastructure policy and should not be expanded here;
-- parser grammars and record structures are not infrastructure and should not be expanded here;
-- queue topology, store commit semantics, indexing, and block retirement are not infrastructure except for the generic interface vocabulary and benchmark ledger fields.
-
-Near-term product scope:
+The infrastructure rule is deliberately narrow:
 
 ```text
-HEC HTTP input -> auth/body/content decode/HEC decode -> HecEvents -> capture sink -> inspection/validation
+feature modules own meaning;
+infrastructure owns repeatable mechanism.
 ```
 
-Explicitly outside the initial infrastructure target:
+## 1. Boundary And Inclusion Rules
 
-- hot configuration reload;
-- distributed notification sinks;
-- full Splunk search implementation;
-- per-log-type database partitioning during ingest;
-- production TLS lifecycle;
-- full indexer ACK durability semantics;
-- specialized parser/index/search acceleration except as benchmarked follow-up.
+Infrastructure belongs here only when it is shared by multiple modules or required before a module can safely run.
 
----
+| Topic | Belongs Here | Does Not Belong Here |
+|---|---|---|
+| Configuration | source precedence, typed loading, validation API, redaction, effective-config evidence | domain-specific defaults, token/index rules, parser choices, queue capacities as product decisions |
+| Errors | typed error categories, conversion boundaries, public/private text separation | protocol code tables, wire response matrices, parser-specific status catalogs |
+| Reporting/logging | call-site contract, field typing, redaction, output routing, component filters | semantic definition of every domain event or counter |
+| Metrics | naming conventions, registry/export approach, counter/histogram API expectations | every feature counter and every label value |
+| Lifecycle | startup order, signal handling, graceful shutdown, panic policy | per-subsystem state machines unless they affect process lifecycle |
+| Runtime policy | async/blocking rules, thread configuration surface, benchmark evidence requirements | low-level socket mechanics and HTTP parser behavior |
+| Validation | evidence ledger format, compatibility-run recording, regression structure | protocol-specific truth tables or format-specific fixtures |
+| Security | secret handling, redaction, hostile-input posture, safe failure principles | exact authentication scheme behavior or parser-specific rejection rules |
 
-## 2. Adopted Document Pattern
+Borderline cases must name the owning subject:
 
-The three reviewed infrastructure documents contribute different strengths.
+- A stack byte limit is loaded and validated by infrastructure, but the network/runtime document owns where it fires.
+- A parser timeout is loaded and recorded by infrastructure, but the format document owns why the timeout exists.
+- A queue capacity is loaded and observed by infrastructure, but the store document owns queue topology and commit semantics.
+- A public response is rendered through shared mechanisms, but the protocol document owns its status, code, and text.
 
-| Source | Best Part To Adopt | HECpoc Adaptation |
-| --- | --- | --- |
-| `infra/Infrastructure.md` | Functional layers and scale regimes | Define HEC ingest layers from network edge to sink, with small/mid/large operating modes |
-| `spank-py/Infra.md` | Problem, requirements, architecture, decisions, call-site conventions | Each subsystem section names benefits, requirements, implementation shape, and call-site discipline |
-| `spank-rs/research/Infrust.md` | Rust library mandates and operational patterns | Use `tracing`, `clap`, `figment`, `thiserror`, Tokio Builder, signal handling, nextest/fuzz/bench tooling |
+## 2. Adopted Source Patterns
 
-Preferred section cadence:
+The older Spank documents are retained as sources only where they contribute a specific reusable pattern. A historical document reference is not a design authority by itself.
 
-1. problem and benefit;
-2. requirements;
-3. architecture or implementation shape;
-4. call-site conventions where relevant;
-5. validation and acceptance;
-6. open decisions only when the decision is genuinely not yet made.
+| Source | Material Carried Forward | Why It Remains Useful |
+|---|---|---|
+| `/Users/walter/Work/Spank/infra/Infrastructure.md` | layered view of infrastructure from process/runtime through operations; scale-regime distinction between local, lab, and production use | prevents a one-off receiver from hiding lifecycle, validation, and operations concerns until too late |
+| `/Users/walter/Work/Spank/spank-py/Infra.md` | section cadence: problem, requirements, architecture, decision, call-site form, validation | useful as a writing pattern for infrastructure services; not a source of current implementation choices |
+| `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` | Rust-specific candidate libraries and concerns: `clap`, `figment`, `serde`, `tracing`, typed errors, Tokio lifecycle, test/benchmark tooling | converts previous Rust research into a bounded library-selection checklist |
 
-History and abandoned approaches do not belong in the main flow. They should appear only when they provide evidence for a current decision.
+Use of these documents is intentionally extractive: copy the rule, justification, or pattern that survives review; do not copy history, task status, or abandoned architecture.
 
----
+## 3. Infrastructure Services
 
-## 3. Functional Layers For HECpoc
+The implementation should keep these services visible as explicit modules or submodules. They do not need to become separate crates until they are complete and reusable.
 
-Borrowing the layered discipline from the broad infrastructure document, HECpoc uses functional layers rather than vendor/product layers.
+| Service | Responsibility | Primary API Shape |
+|---|---|---|
+| Config | load defaults, file, CLI, env; validate; expose typed settings; render redacted effective config | `RuntimeConfig::load()` and typed sub-structs |
+| Error | classify startup, config, request, decode, sink, runtime, and internal failures | local enums with `thiserror`; `anyhow` only at binary boundary |
+| Public text | centralize user/client-visible strings and safe terminal output wording | constants or small render functions |
+| Reporting | accept structured facts with component/phase/step/severity and typed fields | `reporter.record(...)` or narrowed call-site helpers |
+| Logging | route reporting records to `tracing` and optional console output | `tracing-subscriber` with `EnvFilter` and JSON/plain formats |
+| Metrics | update counters/histograms/gauges by explicit call-site intent | in-process counters first; Prometheus-compatible backend later |
+| Lifecycle | startup sequence, shutdown signal, graceful drain, panic policy | `run(config).await` plus signal/drain routines |
+| Validation ledger | record command, config, fixture, response, stats, logs, and environment | per-run directory with machine-readable summary |
+| Benchmark ledger | record workload, payload, system state, throughput, latency, CPU/memory/fd/thread stats | JSON/TSV plus raw tool output |
+| Security | secret redaction, hostile-input defaults, safe error text, resource-bound policy | redaction helpers and policy structs |
 
-| Layer | HECpoc Layer | Responsibility | Initial Implementation |
-| --- | --- | --- | --- |
-| 1 | Network edge | TCP accept, peer identity, connection counts, receive buffers | Tokio listener through Axum initially; owned accept instrumentation later |
-| 2 | HTTP envelope | method/path/header/body framing, content-length, timeouts | Axum adapter with explicit body reader |
-| 3 | HEC protocol | route aliases, auth, gzip, raw/event endpoints, HEC outcomes | `src/hec_receiver` protocol modules |
-| 4 | HEC event formation | JSON envelopes, raw line framing, metadata, `HecEvents` | `HecEvent`, `HecEvents`, `LineSplitter` |
-| 5 | Queue/write disposition | bounded queue, capture sink, commit state | direct sink now; bounded queue next |
-| 6 | Inspection and validation | readback, stats, process tests, compatibility ledgers | stats route, capture files, fixtures, benchmark ledgers |
-| 7 | Operations | config, logs, lifecycle, packaging, health, security posture | infrastructure mandates and implementation work items |
+Infrastructure APIs should be boring and inspectable. Avoid generic frameworks that require domain modules to smuggle meaning through stringly maps.
 
-Layering rule:
+## 4. Configuration
+
+Configuration is a production subsystem, not incidental argument parsing.
+
+### 4.1 Source Precedence
+
+Use one deterministic precedence chain:
 
 ```text
-lower layer exposes facts and bounded data; upper layer decides semantics
+compiled defaults < TOML config file < command line < environment
 ```
 
-Examples:
+Recommended library stack:
 
-- TCP does not decide HEC auth.
-- Raw line splitting does not decide tokenization/search semantics.
-- Gzip decode reports decode facts and limits; HEC outcome mapping decides client response.
-- Commit state reports what happened; response policy decides whether success means queued, written, flushed, or durable.
-- Tokio provides socket/runtime primitives; Axum currently owns the server accept loop; Hyper owns HTTP parsing. Detailed accept/read mechanics are ingress-stack design, not generic infrastructure.
+- `serde` for typed config structs;
+- `figment` for layered provider merging;
+- `clap` for CLI parsing and help text;
+- TOML for editable configuration files.
 
----
+The point is not that these crates are magical. The point is to avoid hand-coded merge logic, duplicated defaults, and undocumented environment behavior.
 
-## 4. Operating Modes And Scale Regimes
+### 4.2 Naming Rules
 
-The broad infrastructure document distinguishes small, mid, and large scale. HECpoc should use the same idea to avoid either toy-only design or premature enterprise machinery.
+Every configurable parameter needs four stable names:
 
-| Mode | Intended User | Infrastructure Shape | Success Criteria |
-| --- | --- | --- | --- |
-| Local fixture | developer/CI on one machine | one process, local token, capture file, stats endpoint | deterministic request/response and readback |
-| Compatibility lab | developer comparing clients | local Splunk, Vector, curl/`oha`/`wrk`, fixture ledgers | explain differences by exact request, response, and capture evidence |
-| Performance lab | systems developer | pinned configs, benchmark ledger, host/kernel stats, controlled corpora | bytes/sec, events/sec, latency, CPU/memory evidence by stage |
-| Production candidate | operator | service unit/container, structured logs, health/readiness, bounded resources | predictable startup/shutdown, config validation, overload policy, no crash on hostile input |
+| Context | Form | Example Pattern |
+|---|---|---|
+| Rust field | `snake_case` | `max_http_body_bytes` |
+| TOML key | dotted table/key | `limits.max_http_body_bytes` |
+| CLI flag | kebab case | `--max-http-body-bytes` |
+| Environment | prefix + uppercase | `APP_LIMITS_MAX_HTTP_BODY_BYTES` |
 
-Do not add production machinery before a mode needs it. Do define interfaces so production machinery has somewhere clean to attach.
+The examples are illustrative. Owning subject documents define the actual keys.
 
----
+### 4.3 Validation Rules
 
-## 5. Mainstay Rust Infrastructure Choices
+Every parameter definition must state:
 
-These are the project mainstays unless a later benchmark or protocol proof disproves them.
+- type and unit;
+- compiled default, if any;
+- accepted range or set;
+- invalid-value behavior;
+- whether the value is safe to print;
+- whether changing the value affects compatibility, safety, or performance claims.
 
-| Area | Choice | Reason |
-| --- | --- | --- |
-| Language | Rust-only | Fresh start; avoids Python concurrency limitations and mixed-language uncertainty |
-| Async runtime | Tokio multi-thread | mature ecosystem, Axum/Hyper compatibility, signal/time/fs support |
-| HTTP framework | Axum as thin adapter | practical routing and response conversion while keeping protocol logic ours |
-| Direct HTTP fallback | Hyper + `hyper-util` | escape hatch if Axum blocks exact protocol or accept-loop control |
-| Configuration | `clap` + `figment` + `serde` + TOML | typed layered config without hand-coded merge sprawl |
-| Error definitions | `thiserror` or local typed enums | classify failures without stringly exceptions |
-| Binary-level errors | `anyhow` acceptable only at top-level binary boundary | contextual startup failure without leaking into core protocol code |
-| Logging | `tracing` + `tracing-subscriber` JSON to stderr | standard Rust structured logging path |
-| Metrics | in-process counters first; `metrics`/Prometheus later | avoid premature external interface while preserving names |
-| Testing | `cargo test` now; `nextest` later | current simplicity, production parallelism later |
-| Benchmarks | `criterion` for micro, ledgered external tools for system | separate parser/body/sink timings from end-to-end load |
-| Fuzz/property | `proptest`, `cargo-fuzz` later | high value for parsers and body/framing edge cases |
+Validation happens before sockets are bound, files are opened for append, or background tasks are spawned unless the setting explicitly requires runtime discovery.
 
-Tower middleware rule: avoid Tower for protocol-critical auth, gzip, body limits, and timeouts until our exact HEC behavior is defined and tested. Axum itself remains acceptable as an HTTP adapter.
+### 4.4 Effective Configuration Evidence
 
----
-
-## 6. Repository And Module Shape
-
-Initial single-crate shape:
+Every validation or benchmark run should record a redacted effective configuration:
 
 ```text
-HECpoc/
-  Cargo.toml
-  scripts/
-  fixtures/
-    requests/
-    configs/
-    logs/
-    ledgers/
-  src/
-    main.rs
-    hec_receiver/
-      mod.rs
-      app.rs
-      auth.rs
-      body.rs
-      config.rs
-      error.rs
-      event.rs
-      hec_request.rs
-      health.rs
-      line_splitter.rs
-      outcome.rs
-      parse_event.rs
-      parse_raw.rs
-      report.rs
-      protocol.rs
-      sink.rs
-      stats.rs
+key
+effective value
+source that supplied it
+validation status
+redaction status
 ```
 
-Crate split rule:
+Secrets are never printed by default. A pass-through mode may exist for local debugging, but it must be explicit, named, and recorded.
 
-- Stay one crate until a component is internally complete and separately reusable.
-- Candidate future splits: protocol parser, collector, storage, benchmark harness.
-- Do not split merely to imitate old workspace structure.
+## 5. Error And Public Text
 
-Naming rule:
+Errors need two separate views:
 
-- Use event/source/context/sink/commit vocabulary.
-- Avoid ambiguous ingest names such as `Sender` for a sink or `Row` for a protocol event.
-- Preserve original external names as evidence fields, not behavior keys.
+| View | Audience | Content |
+|---|---|---|
+| Internal error | developers/operators | precise error class, source, context, safe fields |
+| Public text | client/user/terminal | stable, non-secret, compatibility-aware wording |
 
----
+Rules:
 
-## 7. Configuration Management
+- Do not let raw Rust errors become public response bodies.
+- Do not duplicate public strings at call sites.
+- Do not make the reporter infer protocol behavior.
+- Do not make metrics infer error classes from rendered strings.
+- Keep startup/config errors rich enough to fix the problem without reading source.
 
-### 7.1 Problem And Benefit
-
-Configuration is a production infrastructure subsystem, not incidental argument parsing. It must support deterministic local runs, operator-edited files, CI/container overrides, and reproducible benchmark ledgers.
-
-Benefits:
-
-- one typed model;
-- one precedence rule;
-- one validation path;
-- clear error messages before binding sockets;
-- redacted effective config output;
-- no hand-coded source merge drift.
-
-### 7.2 Source Chain
-
-Configuration sources:
-
-1. compiled defaults;
-2. TOML config file;
-3. command-line flags;
-4. environment variables.
-
-Precedence:
+Recommended structure:
 
 ```text
-compiled defaults < TOML file < command line < environment
+error.rs        typed internal failures
+public_text.rs  safe stable external strings
+outcome.rs      feature-owned public result mapping, when a feature needs one
 ```
 
-Implementation:
+`anyhow` is acceptable at the binary boundary for contextual startup failure. Core modules should return typed errors so tests can match behavior without parsing strings.
 
-- `clap` parses CLI and identifies config path plus CLI overrides;
-- `figment` composes providers in precedence order;
-- `serde` extracts typed structs;
-- explicit `validate()` or `validator` checks values after extraction;
-- effective config is logged with secrets redacted.
+## 6. Reporting, Logging, Metrics, And Console Output
 
-Hot reload is not a foreseeable goal. The initial configuration is frozen after startup validation.
+Reporting is the end-to-end subsystem from call-site submission to selected outputs. Logging, console text, metrics, and benchmark rows are outputs or consumers, not separate unrelated call-site families.
 
-### 7.3 Naming
+### 6.1 Call-Site Contract
 
-| Source | Form | Example |
-| --- | --- | --- |
-| Rust field | snake_case | `max_decoded_bytes` |
-| TOML key | section + snake_case | `limits.max_decoded_bytes` |
-| CLI flag | kebab-case | `--max-decoded-bytes` |
-| Env var | upper snake with `HEC_` prefix | `HEC_MAX_DECODED_BYTES` |
-
-Avoid:
-
-- `POC` in config names;
-- `_BODY` when the actual concept is HTTP body bytes or decoded bytes;
-- `_MILLIS`; use duration strings;
-- `_CODE`; protocol result settings are named by outcome.
-
-### 7.4 Core Parameters
-
-| Parameter | TOML key | Env var | CLI flag | Default | Validation |
-| --- | --- | --- | --- | --- | --- |
-| Config file | none | `HEC_CONFIG` | `--config`, `-c` | none | readable TOML |
-| Listen address | `hec.addr` | `HEC_ADDR` | `--addr` | `127.0.0.1:18088` | valid socket address |
-| Token | `hec.token` | `HEC_TOKEN` | `--token` | `dev-token` | non-empty; redacted |
-| Default index | `hec.default_index` | `HEC_DEFAULT_INDEX` | `--default-index` | `main` | Splunk-compatible index syntax; bounded by `limits.max_index_len`; must be allowed when allow-list is configured |
-| Allowed indexes | `hec.allowed_indexes` | `HEC_ALLOWED_INDEXES` | `--allowed-indexes` | `["main"]` | comma-list or TOML list; each value uses index syntax/length policy |
-| Capture path | `hec.capture` | `HEC_CAPTURE` | `--capture` | none | parent exists when required |
-| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_000_000` | positive bounded bytes |
-| Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `--max-decoded-bytes` | `4_000_000` | `>= max_bytes` when gzip enabled |
-| Max events per request | `limits.max_events` | `HEC_MAX_EVENTS` | `--max-events` | `100_000` | positive bounded count |
-| Max index length | `limits.max_index_len` | `HEC_MAX_INDEX_LEN` | `--max-index-len` | `128` | positive byte count |
-| Body idle timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `--idle-timeout` | `5s` | positive duration |
-| Body total timeout | `limits.total_timeout` | `HEC_TOTAL_TIMEOUT` | `--total-timeout` | `30s` | `>= idle_timeout` |
-| Gzip buffer bytes | `limits.gzip_buffer_bytes` | `HEC_GZIP_BUFFER_BYTES` | `--gzip-buffer-bytes` | `8_192` | bounded bytes |
-
-Observation and reporting settings are first-class configuration, not hard-coded debug switches:
-
-| Parameter | TOML key | Env var | CLI flag | Default | Validation |
-| --- | --- | --- | --- | --- | --- |
-| Observe level/filter | `observe.level` | `HEC_OBSERVE_LEVEL` | `--observe-level` | `info` | valid `tracing-subscriber` filter syntax |
-| Observe format | `observe.format` | `HEC_OBSERVE_FORMAT` | `--observe-format` | `compact` | `compact` or `json` |
-| Redaction mode | `observe.redaction_mode` | `HEC_OBSERVE_REDACTION_MODE` | `--observe-redaction-mode` | `redact` | `redact` or `passthrough` |
-| Tracing output | `observe.tracing` | `HEC_OBSERVE_TRACING` | `--observe-tracing <bool>` | `true` | boolean |
-| Console output | `observe.console` | `HEC_OBSERVE_CONSOLE` | `--observe-console <bool>` | `false` | boolean |
-| Stats output | `observe.stats` | `HEC_OBSERVE_STATS` | `--observe-stats <bool>` | `true` | boolean |
-
-Protocol result settings remain configurable but centralized through outcome definitions:
-
-| Outcome | TOML key | Env var | CLI flag | Default code |
-| --- | --- | --- | --- | --- |
-| success | `protocol.success` | `HEC_SUCCESS` | `--protocol-success` | `0` |
-| token required | `protocol.token_required` | `HEC_TOKEN_REQUIRED` | `--protocol-token-required` | `2` |
-| invalid authorization | `protocol.invalid_authorization` | `HEC_INVALID_AUTHORIZATION` | `--protocol-invalid-authorization` | `3` |
-| invalid token | `protocol.invalid_token` | `HEC_INVALID_TOKEN` | `--protocol-invalid-token` | `4` |
-| no data | `protocol.no_data` | `HEC_NO_DATA` | `--protocol-no-data` | `5` |
-| invalid data format | `protocol.invalid_data_format` | `HEC_INVALID_DATA_FORMAT` | `--protocol-invalid-data-format` | `6` |
-| incorrect index | `protocol.incorrect_index` | `HEC_INCORRECT_INDEX` | `--protocol-incorrect-index` | `7` |
-| server busy | `protocol.server_busy` | `HEC_SERVER_BUSY` | `--protocol-server-busy` | `9` |
-| event field required | `protocol.event_field_required` | `HEC_EVENT_FIELD_REQUIRED` | `--protocol-event-field-required` | `12` |
-| event field blank | `protocol.event_field_blank` | `HEC_EVENT_FIELD_BLANK` | `--protocol-event-field-blank` | `13` |
-| ACK disabled | `protocol.ack_disabled` | `HEC_ACK_DISABLED` | `--protocol-ack-disabled` | `14` |
-| handling indexed fields | `protocol.handling_indexed_fields` | `HEC_HANDLING_INDEXED_FIELDS` | `--protocol-handling-indexed-fields` | `15` |
-| query-string authorization disabled | `protocol.query_string_authorization_disabled` | `HEC_QUERY_STRING_AUTHORIZATION_DISABLED` | `--protocol-query-string-authorization-disabled` | `16` |
-| health OK | `protocol.health_ok` | `HEC_HEALTH_OK` | `--protocol-health-ok` | `17` |
-| health unhealthy | `protocol.health_unhealthy` | `HEC_HEALTH_UNHEALTHY` | `--protocol-health-unhealthy` | `18` |
-| shutting down | `protocol.server_shutting_down` | `HEC_SERVER_SHUTTING_DOWN` | `--protocol-server-shutting-down` | `23` |
-
-### 7.5 Growth Parameters
-
-Growth parameters enter only with matching implementation and validation:
-
-- listener backlog, receive/send buffers, nodelay, reuseaddr, reuseport;
-- runtime runtime threads, blocking thread cap, thread names;
-- queue depth and enqueue timeout;
-- global and per-IP connection limits;
-- IPv4/v6 prefix grouping;
-- HTTP header timeout and max header bytes;
-- raw line max bytes and raw line splitter strategy;
-- overflow policies for body, decode, event, queue, sink, and connection limits.
-
-Policy values are enums. Initial families:
-
-| Policy family | Initial values |
-| --- | --- |
-| body/decode/event overflow | `reject`, `close`, `drain_then_reject` |
-| queue full | `busy`, `wait`, `drop_new`, `spill` |
-| sink failure | `busy`, `retry`, `spill`, `degrade` |
-| connection overflow | `reject`, `close_new`, `close_oldest_idle` |
-
-Each policy must define HTTP response, HEC outcome, internal state, stats counter, log severity, and connection usability.
-
-### 7.6 CLI Shape
-
-Initial command:
-
-```text
-hec-receiver [OPTIONS]
-
-Options:
-  -c, --config <PATH>
-      Read TOML configuration file.
-
-      --show-config
-      Print effective merged configuration and exit.
-
-      --check-config
-      Validate configuration and exit.
-
-      --addr <ADDR>
-      Override hec.addr.
-
-      --token <TOKEN>
-      Override hec.token.
-
-      --capture <PATH>
-      Override hec.capture.
-```
-
-Output discipline:
-
-- primary output such as `--show-config` goes to stdout;
-- diagnostics go to stderr;
-- invalid config exits before bind;
-- use sysexits-like meaning where practical: usage/config/tempfail distinctions.
-
-### 7.7 Config Validation
-
-Validation classes:
-
-- **format:** TOML syntax, socket address, duration, integer, path, UTF-8 where required;
-- **known values:** TOML keys, CLI flags, env aliases, enum values, policy values;
-- **bounds:** bytes, counts, queue depths, timeouts, runtime/task counts, port ranges, prefix lengths, protocol codes;
-- **cross-field:** decoded bytes >= HTTP body bytes, total timeout >= idle timeout, per-IP <= global, line max <= decoded max;
-- **canonical/industry:** HEC route aliases, result codes, auth schemes, gzip names, source/sourcetype/index names, IPv4/v6 prefixes;
-- **safety:** redacted secrets, non-zero resource limits unless explicitly disabled, path checks before bind;
-- **reliability:** overflow, slow client, sink failure, decode failure, invalid request behavior defined.
-
-Acceptance:
-
-- every field has default, TOML override, CLI override, env override, validation test, `--show-config` coverage, and `--check-config` coverage;
-- diagnostics include canonical field name and original source name;
-- secrets are redacted by default; explicit `observe.redaction_mode = "passthrough"` is an operator/debugging override and must be visible in the effective config output.
-
-Configuration prompt guardrail:
-
-```text
-When adding any new runtime behavior, add its typed config field, TOML key,
-CLI flag, env var, compiled default, validation rule, redacted show-config
-behavior, and precedence test in the same change. Do not add hidden constants
-or one-off environment reads in domain modules.
-```
-
----
-
-## 8. Error, Outcome, Message, And Status Infrastructure
-
-### 8.1 Problem And Benefit
-
-The receiver must distinguish internal errors from HEC client-visible outcomes. Without centralization, handlers scatter string literals, HTTP statuses, HEC result codes, log labels, and stats reasons. That becomes impossible to compare against Splunk/Vector and hard to validate.
-
-Benefits:
-
-- stable HEC response bodies;
-- typed internal failure classes;
-- compact call sites;
-- centralized redaction;
-- consistent counters and log fields;
-- easier oracle comparison.
-
-### 8.2 Module Boundaries
-
-```text
-src/hec_receiver/
-  error.rs        internal startup/config/runtime error types
-  outcome.rs      HEC client-visible outcomes and response conversion
-  report.rs       Reporter pipeline, redaction, routing, rendering backends
-  public_text.rs  optional home for public text if outcome/report types need it
-  stats.rs        counters and snapshots
-```
-
-Semantic boundary:
-
-- `error.rs` classifies failures;
-- `outcome.rs` defines client responses;
-- `report.rs` implements the Reporter pipeline and consumes domain-owned submitted facts;
-- `public_text.rs` is added only if public text needs a separate module;
-- HTTP handlers convert errors to outcomes at the adapter edge;
-- stats/logging happen through domain submitted facts and outcome mappings, not direct handler updates.
-
-### 8.3 Error Classes
-
-| Class | Examples | Client exposure |
-| --- | --- | --- |
-| `Config` | invalid TOML, unknown field, bad env, invalid bounds | startup diagnostic only |
-| `Startup` | bind failure, capture path failure, runtime construction | startup diagnostic only |
-| `Auth` | missing token, malformed header, bad scheme, invalid token | HEC auth outcomes |
-| `Body` | content-length too large, timeout, read error | HEC/body policy outcome |
-| `Decode` | gzip invalid, decoded limit exceeded, unsupported encoding | invalid data or unsupported encoding policy |
-| `Parse` | invalid JSON, missing/blank event, invalid raw framing | HEC parser outcomes |
-| `Queue` | full queue, enqueue timeout, closed consumer | server busy or configured queue policy |
-| `Sink` | write, flush, durable commit failure | depends on commit state |
-| `Shutdown` | signal, graceful timeout, task join failure | log/status only |
-| `Internal` | invariant violation, unexpected join error | generic server busy or startup failure; detailed log only |
-
-Top-level boundary:
+Preferred call site shape:
 
 ```rust
-#[derive(Debug, thiserror::Error)]
-pub enum Error {
-    #[error("configuration error: {0}")]
-    Config(#[from] ConfigError),
-    #[error("startup error: {0}")]
-    Startup(#[from] StartupError),
-    #[error("request error: {0}")]
-    Request(#[from] RequestError),
-    #[error("sink error: {0}")]
-    Sink(#[from] SinkError),
-}
-```
-
-The actual enum may start smaller, but subsystem boundaries should not collapse into `Box<dyn Error>`.
-
-### 8.4 HEC Outcomes
-
-Central client-visible type:
-
-```rust
-pub struct HecResponse {
-    pub status: StatusCode,
-    pub text: &'static str,
-    pub code: u16,
-    pub ack_id: Option<u64>,
-    pub invalid_event_number: Option<usize>,
-}
-```
-
-Naming decision: use `Outcome` for accepted/rejected/failed/skipped/throttled/recovered operation disposition and `HecResponse` for the client-visible HEC response body/status/code. Do not introduce `HecOutcome` in new code; it conflates protocol response with operation disposition.
-
-Initial constructors:
-
-| Constructor | Text | Code | HTTP status | Notes |
-| --- | --- | --- | --- | --- |
-| `success()` | `Success` | `0` | `200` | accepted according to current sink mode |
-| `success_with_ack_id(id)` | `Success` | `0` | `200` | later ACK support |
-| `token_required()` | `Token required` | `2` | `401` | missing token |
-| `invalid_authorization()` | `Invalid authorization` | `3` | `401` | malformed header or unsupported scheme |
-| `invalid_token()` | `Invalid token` | `4` | measured | unknown token |
-| `no_data()` | `No data` | `5` | `400` | empty body or no events |
-| `invalid_data_format()` | `Invalid data format` | `6` | `400` | JSON/raw/gzip parse class |
-| `server_busy()` | `Server is busy` | `9` | `503` | queue/sink/backpressure |
-| `event_field_required(index)` | `Event field is required` | `12` | `400` | metadata carries index |
-| `event_field_blank(index)` | `Event field cannot be blank` | `13` | `400` | metadata carries index |
-| `handling_indexed_fields()` | `Error in handling indexed fields` | `15` | `400` | fields policy |
-| `health()` | `HEC is healthy` | `17` | `200` | health endpoint |
-| `ack_disabled()` | TBD | TBD | TBD | verify against Splunk/Vector |
-| `unsupported_encoding()` | TBD | TBD | `415` or invalid data | verify against Splunk/Vector |
-| `body_too_large()` | TBD | TBD | `413` or HEC error | verify against Splunk/Vector |
-
-Response body shape:
-
-```json
-{"text":"Invalid data format","code":6}
-```
-
-Client-visible text is fixed. Never include parser exceptions, token values, file paths, Rust error text, or body excerpts in HEC responses.
-
-### 8.5 Mapping Rules
-
-Mapping happens once at the HTTP adapter edge:
-
-```text
-AuthError -> HecResponse
-BodyError -> HecResponse
-DecodeError -> HecResponse
-ParseError -> HecResponse
-QueueError -> HecResponse
-SinkError + commit state -> HecResponse
-```
-
-Target spelling is `HecResponse` in code and documentation. Any remaining `HecOutcome` reference is historical wording to remove, not a type to copy.
-
-Example policy:
-
-| Internal condition | HEC outcome | Counter reason | Default severity |
-| --- | --- | --- | --- |
-| missing auth token | `token_required()` | `token_required` | `warn` |
-| malformed auth header | `invalid_authorization()` | `invalid_authorization` | `warn` |
-| invalid token | `invalid_token()` | `invalid_token` | `warn` |
-| empty body | `no_data()` | `no_data` | `info` |
-| invalid JSON | `invalid_data_format()` | `invalid_json` | `info`/`warn` |
-| gzip decode failed | `invalid_data_format()` | `gzip_decode_failed` | `warn` |
-| queue full | `server_busy()` | `queue_full` | `warn` |
-| sink unavailable before acceptance | `server_busy()` | `sink_unavailable` | `error` |
-
-Every mapped outcome has a central reason, HEC response mapping, counter effect, and submitted fact name/fields. The route code should not independently update stats and logs for the same fact.
-
-Error-handling prompt guardrail:
-
-```text
-For every new failure path, name the internal error, public HEC response,
-operation Outcome, report fact, allowed fields, counter effect, severity,
-and validation test. Do not let the Reporter infer HEC behavior, peer data,
-protocol codes, or counter reasons from generic context.
-```
-
-### 8.6 Central Definitions And Call Sites
-
-Centralized groups:
-
-- endpoint route aliases;
-- endpoint kinds;
-- HEC result text;
-- HEC default codes;
-- HTTP status mappings;
-- config field names;
-- env var names;
-- policy names and values;
-- counter names;
-- log field names;
-- redaction rules.
-
-Preferred call-site style:
-
-```rust
-return Err(AuthError::malformed_header(AuthHeaderProblem::NonText));
-return Err(ParseError::event_field_required().with_event_index(index));
-let outcome = Outcome::Rejected;
-let response = HecResponse::invalid_authorization().with_reason(AuthReason::MalformedHeader);
-report.submit(&ctx, auth::HEADER_MALFORMED, fields![field::auth_problem(AuthHeaderProblem::NonText)]);
-```
-
-Avoid:
-
-```rust
-return (StatusCode::BAD_REQUEST, Json(json!({"text":"Invalid data format","code":6})));
-```
-
-### 8.7 Redaction
-
-Never log or return:
-
-- token values;
-- raw authorization header values;
-- full request bodies;
-- decompressed bodies;
-- full malformed JSON payloads;
-- arbitrary untrusted filesystem paths.
-
-Allowed:
-
-- token presence/absence;
-- token id or hash once token registry exists;
-- route alias;
-- endpoint kind;
-- auth scheme spelling;
-- byte lengths;
-- parse class;
-- safe byte offset;
-- event index;
-- canonical source/sourcetype/index;
-- original operator-provided evidence when safe.
-
----
-
-## 9. Reporting, Logging, And Observability
-
-### 9.1 Communication Layers
-
-Avoid using `message` as the root concept. In this project it can mean a HEC protocol response, an internal error string, a structured log record, a metric update, console text, a benchmark row, or a future notification. Those are related, but they belong to different layers.
-
-Use layers, not another family of `Report*` or `Occurrence*` abstractions:
-
-| Layer | Owned by | Examples | Notes |
-| --- | --- | --- | --- |
-| Domain state/result | Auth, body, parser, queue, sink, lifecycle modules | token invalid, body decoded, queue full, sink commit failed | Specific semantics live here, not in Reporter. |
-| Outcome | Protocol/operation mapping | accepted, rejected, failed, skipped, throttled, recovered | Use `Outcome`; if HEC client response needs a type, prefer `HecResponse` over overloading `Outcome`. |
-| Submission | Call site plus Reporter input adapter | domain fact name, context, fields, duration, outcome | A structured fact handed to Reporter. It should be light and auditable. |
-| Reporter pipeline | Reporting subsystem | filter, redact, route, transform, fan out | End-to-end subsystem from submission to persistence/display. |
-| Output products | Output adapters | log entry, console line, metric update, benchmark row, status record | Multiple products may be derived from one submitted fact. |
-| Backends | Libraries/devices/files | `tracing`, stdout/stderr, JSONL file, stats counters | `tracing` is useful but not exclusive. |
-
-`HEC_AUTH_TOKEN_INVALID` is therefore not a Reporter concept. It is an auth/protocol fact name or domain status. Its allowed fields, HEC response mapping, metrics labels, and reporting use should be bounded by auth/protocol design, while Reporter treats it as a structured submission to filter, redact, route, and render.
-
-### 9.2 Reporter Subsystem
-
-Reporter is the end-to-end subsystem from call-site initiation to persistence and/or display. It owns:
-
-- runtime filtering by component/source, severity, outcome, and output;
-- redaction and field allow/deny policy enforcement;
-- transformation from submitted facts into output-specific products;
-- routing to logs, console, counters, status output, benchmark ledgers, and future notification sinks;
-- backend adapters, including but not limited to `tracing`.
-
-Reporter must not own HEC-specific semantics such as "invalid token means HEC code 4" or "queue full maps to server busy". Those belong in protocol/outcome modules. Reporter may receive those values as fields.
-
-Preferred call-site style:
-
-```rust
-let outcome = Outcome::Rejected;
-let response = HecResponse::invalid_token();
-
-report.submit(
-    &ctx,
-    auth::TOKEN_INVALID,
-    fields![
-        field::outcome(outcome),
-        field::auth_scheme(parsed.scheme()),
-        field::token_present(parsed.token_present()),
-        field::hec_code(response.code()),
-        field::auth_len(parsed.token_len()),
-        field::elapsed_us(started.elapsed()),
-    ],
+reporter.record(
+    component,
+    phase,
+    step,
+    severity,
+    fact,
+    fields,
 );
-
-return response.into_response();
 ```
 
-For diagnostics:
+The concrete API can be adjusted for Rust ergonomics, but the call site must visibly state:
 
-```rust
-report.submit_lazy(&ctx, body::SPLITTER_DETAIL, || {
-    fields![
-        field::line_breaker(splitter.kind()),
-        field::input_class(input_class),
-        field::input_offset(offset),
-    ]
-});
-```
+- component or functional area;
+- phase;
+- step;
+- severity;
+- fact name;
+- typed fields.
 
-The exact Rust representation may be plain structs, constants, macros, or generated tables. The stable point is the layer boundary: domain modules name and bound their statuses/results; Reporter receives structured submissions and handles output.
+Avoid a proliferation of per-module facades such as one logger per subsystem. Per-component filtering belongs in configuration and backend routing, not in dozens of distinct call-site APIs.
 
-`submit_lazy` is for expensive or highly verbose diagnostic paths. The fact name appears once, and field construction is skipped when the fact is disabled.
+### 6.2 Field Typing
 
-Fact constants should not construct a heap object at runtime. Use either a small copyable id into a static registry or a reference to static metadata:
+Fields must carry primitive type and rendering policy:
 
-```rust
-pub const TOKEN_INVALID: FactId = FactId(17);
+| Type | Use |
+|---|---|
+| string | identifiers, labels, finite text |
+| integer | counts, lengths, codes |
+| float | rates and ratios |
+| bool | flags |
+| duration | elapsed time with explicit unit |
+| bytes | byte counts with explicit unit |
+| secret | redacted unless pass-through is explicitly enabled |
 
-pub static FACTS: &[FactSpec] = &[
-    FactSpec {
-        id: TOKEN_INVALID,
-        name: "hec.auth.token_invalid",
-        phase: Phase::Ingress,
-        component: Component::Auth,
-        step: Step::Authorize,
-        level: Severity::Warn,
-        outputs: outputs::LOG | outputs::CONSOLE | outputs::STATS,
-        counters: &[counter::REQUESTS_REJECTED_TOTAL.with_reason(reason::INVALID_TOKEN)],
-        fields: &[field::OUTCOME, field::AUTH_SCHEME, field::TOKEN_PRESENT, field::HEC_CODE, field::AUTH_LEN, field::ELAPSED_US],
-    },
-];
-```
+Domain modules submit fields. Reporter does not look up network peer addresses, route names, parser status, or sink state on its own.
 
-The call site passes `FactId` plus typed field values. Reporter uses the registry for metadata, routing, allowed fields, default outputs, and counter mapping.
+### 6.3 Backends
 
-### 9.3 Fan-Out Semantics
+Initial outputs:
 
-One submitted fact can produce several output products:
+- `tracing` JSON or compact text to stderr;
+- optional console/plain output for local interactive runs;
+- in-memory counters exposed by an existing inspection route or test hook;
+- benchmark ledger files written by scripts.
 
-```text
-auth token invalid submission
-  -> structured log entry
-  -> requests_rejected_total counter update
-  -> console warning when enabled
-  -> benchmark/security ledger row when enabled
-```
+Future outputs:
 
-That is one submission and multiple rendered/output records. It is not four separate submissions.
+- Prometheus/OpenMetrics endpoint;
+- structured run artifacts for long benchmarks;
+- external notification or incident channels.
 
-Separate submissions are appropriate when separate facts are observed at different points:
+`tracing` is the first backend because it is the standard Rust structured-event path and supports target/module filtering through `tracing-subscriber::EnvFilter`. It is not the entire reporting architecture.
 
-```text
-request arrived
-body decoded
-auth token invalid
-request completed
-```
+### 6.4 Per-Component Filters
 
-These may share request id, peer address, route alias, and timing context, but they are distinct submissions because they correspond to different processing steps.
-
-### 9.4 Backends And Outputs
-
-Use `tracing` and `tracing-subscriber` as the first structured logging/tracing backend because they are the Rust ecosystem's standard substrate for levels, structured fields, spans, subscribers, compact output, and JSON output. This is an implementation backend choice, not the reporting model.
-
-Initial output support:
-
-- `tracing` compact or JSON logs;
-- console output to stdout or stderr;
-- in-process counters/stats;
-- status output for direct commands such as `--show-config` and `--check-config`;
-- benchmark/performance JSONL ledger when enabled.
-
-Config shape:
+Configuration must support a global default and overrides by component or target:
 
 ```toml
 [observe]
 level = "info"
-format = "compact"
-redaction_mode = "redact"
-redaction_text = "<redacted>"
+format = "json"
+console = false
+redacted_text = "<redacted>"
+allow_secret_passthrough = false
 
-[observe.sources]
-hec.auth = "debug"
-hec.body = "info"
-hec.queue = "warn"
-hec.sink = "debug"
-
-[observe.outputs]
-tracing = true
-console = true
-stats = true
-status = true
-benchmark_ledger = false
-
-[observe.console]
-stream = "stderr"
-format = "compact"
-color = "auto"
-interactive = false
+[observe.components]
+network = "debug"
+body = "info"
+store = "warn"
 ```
 
-Console output is an output option, not a special call-site API. It becomes a separate interactive subsystem only if prompts, paging, refresh, terminal capabilities, or user sessions are introduced.
+The exact component names belong to the implementation. The infrastructure requirement is that filtering is runtime configuration, not compile-time feature selection.
 
-Initial library choices and adapter syntax:
+## 7. Metrics
 
-| Output | Library / mechanism | Adapter call, not product call site |
-| --- | --- | --- |
-| tracing log | `tracing`, `tracing-subscriber` | `tracing::event!(target: fact.target(), level, name = fact.name(), request_id = %ctx.request_id(), fields = %record.redacted_json())` |
-| console | `std::io::{stdout, stderr}` initially; `anstream` only if color portability is needed | `writeln!(console.stream(), "{}", render_console(record))` |
-| stats counters | current `Stats` with `AtomicU64`; `metrics`/Prometheus later | `stats.increment(counter_id, labels)` from fact counter mapping |
-| status command output | `std::io` plus existing TOML/JSON renderers | `output.write(CommandResponse::EffectiveConfig(config.redacted()))` |
-| benchmark ledger | `serde`, `serde_json`, file writer or background Tokio writer | `serde_json::to_writer(&mut ledger, &BenchmarkRow::from(record))` |
+Metrics should be explicit and mechanically tied to state changes.
 
-The product call site remains `report.submit(...)`; output adapters are internal Reporter implementation.
+Rules:
 
-Current implementation state:
+- A counter increment must name the condition it records.
+- Gauges must define ownership and update points.
+- Histograms must define unit and bucket rationale.
+- Labels must have bounded cardinality unless explicitly approved.
+- Metrics and logs may share facts, but one must not silently synthesize the other.
 
-- `RuntimeConfig.observe` carries level, format, redaction mode/text, and output booleans.
-- `main.rs` initializes `tracing-subscriber` after configuration load and before socket bind.
-- `AppState` constructs `Reporter` from configured output booleans.
-- `Reporter` routes each submitted fact to enabled tracing, console, and stats outputs according to registry defaults and runtime output toggles.
-- `ReportContext` currently carries only a request id; route aliases, endpoint kind, HEC code, HTTP status, byte lengths, and elapsed duration are explicit submitted fields.
+Initial backend can be simple atomics and snapshots. The API should not prevent later export through `metrics`, Prometheus, or OpenTelemetry.
 
-Example translation for `auth::TOKEN_INVALID`:
+## 8. Lifecycle And Runtime Policy
+
+### 8.1 Startup
+
+Startup sequence:
 
 ```text
-call site:
-  report.submit(ctx, auth::TOKEN_INVALID, [outcome=Rejected, hec_code=4, auth_scheme=Splunk])
-
-registry lookup:
-  name=hec.auth.token_invalid
-  component=Auth
-  step=Authorize
-  severity=Warn
-  outputs=LOG|CONSOLE|STATS
-  counters=requests_rejected_total{reason=invalid_token}
-
-Reporter fan-out:
-  tracing: event target="hec.auth" level=WARN name="hec.auth.token_invalid" hec_code=4 auth_scheme="Splunk"
-  console: "WARN hec.auth.token_invalid phase=ingress component=auth step=authorize request=<id> fields={...}"
-  stats: increment requests_rejected_total with reason=invalid_token
-  ledger: no row unless benchmark/security ledger output enabled
+load config
+validate config
+initialize reporting
+emit redacted effective config when requested
+initialize metrics
+open required sinks/files
+bind network listeners
+start serving tasks
+wait for shutdown signal
+drain and close
+emit shutdown summary
 ```
 
-### 9.5 Fields, Context, And Domain Fact Names
+Do not spawn background tasks before configuration and reporting are initialized enough to explain failures.
 
-Common fields should be bounded and typed. Prefer specialized field constructors over generic string-key fields:
+### 8.2 Shutdown
 
-- `name`, such as `hec.auth.token_invalid`;
-- `phase`, `component`, and `step`;
-- `outcome`, such as accepted, rejected, failed, skipped, throttled, recovered, informational;
-- `severity`;
-- `request_id` when available;
-- `peer_addr`;
-- `method`;
-- `route_alias`;
-- `endpoint_kind`;
-- `status`;
-- `hec_code`;
-- `reason`;
-- `http_body_len`;
-- `decoded_len`;
-- `event_count`;
-- `elapsed_us`;
-- `state_from` and `state_to` for true state transitions;
-- `sink_commit_state` when reached.
+Shutdown must define:
 
-Field primitive type, interpretation, serialization, and formatting are not decided at each call site:
+- signal sources;
+- whether new work is refused;
+- how in-flight work is drained or aborted;
+- maximum drain time;
+- sink flush behavior;
+- final metric/report summary;
+- process exit code.
 
-| Layer | Responsibility |
-| --- | --- |
-| `field::*` constructor | Converts a Rust value into a typed `FieldValue`. |
-| field registry | Defines field id, name, primitive type, unit, redaction policy, and display hint. |
-| Reporter validation | Verifies the fact permits the field and redacts forbidden values. |
-| output adapter | Serializes and formats the field for tracing, console, JSONL, stats, or benchmark output. |
+### 8.3 Tokio And Blocking Work
 
-Example field definitions:
+Tokio should run I/O tasks. CPU-heavy parse, compression, indexing, or database work should not be hidden inside arbitrary async handlers once measured cost becomes material.
 
-```rust
-pub const HTTP_BODY_LEN: FieldSpec = FieldSpec::u64("http_body_len").unit(Unit::Bytes);
-pub const DECODED_LEN: FieldSpec = FieldSpec::u64("decoded_len").unit(Unit::Bytes);
-pub const EVENT_COUNT: FieldSpec = FieldSpec::u64("event_count").unit(Unit::Count);
-pub const ELAPSED_US: FieldSpec = FieldSpec::duration_us("elapsed_us");
-pub const INPUT_OFFSET: FieldSpec = FieldSpec::u64("input_offset").unit(Unit::Bytes);
-pub const INPUT_CLASS: FieldSpec = FieldSpec::enum_("input_class", &["lf", "crlf", "nul", "control", "non_ascii", "invalid_utf8"]);
-```
+Rules:
 
-Example field constructors:
+- keep request/I/O tasks bounded;
+- use explicit queues for work transfer;
+- treat `spawn_blocking` as a temporary bridge, not a general CPU scheduler;
+- record worker/thread counts in benchmark ledgers;
+- justify a separate CPU runtime or thread pool with measurement.
 
-```rust
-field::http_body_len(http_body.len())
-field::decoded_len(decoded.len())
-field::event_count(events.len())
-field::elapsed_us(started.elapsed())
-field::input_class(InputClass::Nul)
-field::input_offset(offset)
-```
+## 9. Validation And Benchmark Ledgers
 
-`input_class` replaces the vague `byte_class`. It classifies a notable input/framing condition for diagnostics. Initial values should be explicit and finite: `Lf`, `Crlf`, `Nul`, `Control`, `NonAscii`, `InvalidUtf8`, `Oversize`, and `Other`.
+Validation artifacts must be reproducible without trusting a prose summary.
 
-`ReportContext` should be explicit, not nebulous. Initial request context fields:
+Each validation run should capture:
 
-- `request_id`;
-- optional domain/adapter fields explicitly submitted by HEC/HTTP code, such as route alias or endpoint kind;
-- token id or token hash later, never raw token;
-- runtime thread id later only if a subsystem measures and submits it.
+- command line;
+- config file and effective config;
+- binary build/profile/git state when available;
+- fixture names and generated payload summary;
+- raw responses;
+- application logs;
+- stats snapshots before and after;
+- system stats when performance is measured;
+- pass/fail summary with exact comparison criteria.
 
-Do not let generic Reporter code look up network-specific fields such as peer address, method, endpoint kind, route alias, host, or path. If an output needs those values, the HTTP/HEC adapter submits them as typed fields.
+Benchmarks additionally capture:
 
-`Instant` decision:
+- client tool and version;
+- concurrency, connection reuse, request count, payload size, compression;
+- CPU model, core count, power mode, OS version;
+- process memory, file descriptors, thread count;
+- per-stage throughput and latency where available.
 
-- use `std::time::Instant` for local elapsed-time measurement because it is monotonic and not affected by wall-clock jumps;
-- do not store `Instant` in `ReportContext`, persisted records, ledgers, or public output;
-- submit elapsed durations as typed fields, such as `field::elapsed_us(started.elapsed())`, only from the subsystem that measured the interval;
-- use wall-clock timestamps only for logs/ledgers that need event time, and obtain them at the Reporter/output layer or as an explicit submitted field;
-- apply this consistently to request handling, body read/decode, parser timing, sink timing, startup steps, and benchmarks.
+## 10. Security Defaults
 
-Instant pros:
+Security-sensitive infrastructure rules:
 
-- correct for elapsed latency and timeout measurement because it is monotonic;
-- cheap and local;
-- immune to NTP, manual clock changes, daylight savings, and wall-clock jumps;
-- expresses "how long did this step take" without implying event time.
+- redact secrets by default in logs, config dumps, panic contexts, and test artifacts;
+- separate public text from internal error detail;
+- bound memory, body, decode, parser, and queue work where the owning subject defines a limit;
+- log enough to diagnose hostile inputs without echoing payloads by default;
+- make pass-through debugging explicit and auditable;
+- fail closed for invalid configuration.
 
-Instant cons:
+## 11. Implementation Sequence
 
-- not serializable in a meaningful way;
-- not comparable across processes, restarts, hosts, or benchmark runs;
-- not suitable for event timestamps, file timestamps, ledger timestamps, or protocol time;
-- easy to misuse if hidden inside generic context and later rendered as if it were wall time.
+The infrastructure sequence should support feature work without turning into ceremony:
 
-Universal rule: store `Instant` only in the measuring scope, convert to `Duration` at the boundary, and submit/output an explicit unit-bearing field such as `elapsed_us`. Use wall-clock time only for "when did this happen" records.
+1. Typed configuration with source precedence, validation, and redacted effective-config output.
+2. Typed errors and public text separation at startup and request boundaries.
+3. Reporting call-site API with `tracing` backend, console option, redaction, and component filters.
+4. Metrics snapshot API with explicit counters/gauges/histograms.
+5. Validation ledger conventions used by compatibility scripts.
+6. Benchmark ledger conventions used by load scripts and system monitors.
+7. Lifecycle drain policy and final shutdown summaries.
+8. Service packaging only after process behavior is stable.
 
-Phase, component, step, default severity, default outputs, and default field policy should be attached to the domain fact constant, not repeated at every call site:
+## 12. References
 
-```rust
-pub const TOKEN_INVALID: FactId = FactId(17);
-```
+### Local Pattern Sources
 
-Function-specific values such as `splitter.kind()` are acceptable as domain fields. They are supplied by the raw/body subsystem and rendered generically by Reporter.
+- `/Users/walter/Work/Spank/infra/Infrastructure.md` — cited only for layered infrastructure framing and scale-regime separation.
+- `/Users/walter/Work/Spank/spank-py/Infra.md` — cited only for the reusable section cadence that ties problem, decision, call-site shape, and validation together.
+- `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` — cited only for Rust infrastructure library candidates and validation concerns.
 
-Performance and duration data must remain structured rather than text-only. Hot-path diagnostics should use `submit_lazy` before expensive field construction.
+### External Project And Standards References
 
-### 9.6 Call-Site Contract
-
-Call sites should be easy to audit:
-
-- submit product-significant facts through `report.submit(&ctx, domain::FACT, fields![...])`;
-- use domain-owned names/constants such as `auth::TOKEN_INVALID`;
-- return typed errors or HEC responses separately from report rendering;
-- avoid raw public text at protocol and infrastructure call sites;
-- avoid direct output writes except at final command-output adapters;
-- avoid direct counter updates when the submitted fact already has a counter effect;
-- do not call `tracing::info!`, `println!`, `eprintln!`, or benchmark writers directly for product-significant facts.
-
-Prompt guardrail for future design and implementation:
-
-```text
-Design generic reporting infrastructure with no built-in knowledge of HTTP, HEC,
-auth, peer addresses, endpoints, paths, request timing, protocol codes, or counters.
-For every proposed Reporter API, mark each symbol as one of:
-generic reporting, HEC domain, HTTP adapter, stats subsystem, output backend.
-Reject the design if generic reporting references symbols outside its layer.
-Domain modules pass all domain/context fields explicitly.
-Reporter filters, redacts, serializes, routes, and dispatches only from submitted
-fields and registered output bindings.
-```
-
-### 9.7 Implementation Direction
-
-Likely implementation steps:
-
-1. Define `Reporter`, `ReportContext`, `FactId`, `FactSpec`, `FieldSpec`, `FieldValue`, `Phase`, `Component`, `Step`, `Outcome`, and `Severity`.
-2. Keep fact constants near owning modules: auth, body, gzip, parser, queue, sink, lifecycle.
-3. Rename or separate HEC client response terminology so generic `Outcome` is not confused with protocol response bodies.
-4. Add Reporter output adapters for `tracing`, console, stats counters, command/status output, and benchmark ledger.
-5. Add runtime-configured source filters, output toggles, and redaction.
-6. Add tests for redaction, output fan-out, disabled diagnostics, output routing, typed fields, and outcome-to-HEC-response mapping.
-
-Cross-cutting infrastructure review rule:
-
-```text
-Before implementing a new component, write its boundary in the same vocabulary:
-config knobs, internal errors, public response if any, operation Outcome,
-report facts, typed fields, counter effects, redaction behavior, validation
-cases, and benchmark/ledger fields if timing or throughput is claimed.
-Then implement the smallest code path that exercises those definitions.
-```
-
-### 9.8 Health And Readiness
-
-Initial same-port stats route exists. Production direction separates observability from data plane when needed.
-
-Minimum endpoints:
-
-| Path | Purpose | Initial status |
-| --- | --- | --- |
-| `/hec/stats` | current JSON counters | implemented/current shape |
-| `/healthz` | liveness | planned |
-| `/readyz` | readiness | planned |
-| `/metrics` | Prometheus exposition | later |
-| `/metrics/json` | compact JSON metrics | later |
-
-Readiness should reflect subsystem state: listener, config, sink, queue, and shutdown/drain state.
-
----
-
-## 10. Metrics And Counters
-
-Initial counters use canonical names and bounded labels.
-
-Required counters:
-
-- `requests_total`;
-- `requests_accepted_total`;
-- `requests_rejected_total` by reason;
-- `http_body_bytes_total`;
-- `bytes_decoded_total`;
-- `events_accepted_total`;
-- `events_written_total`;
-- `body_read_errors_total`;
-- `gzip_errors_total`;
-- `parse_errors_total`;
-- `auth_errors_total`;
-- `queue_full_total`;
-- `sink_failures_total`;
-- `connections_current`;
-- `connections_accepted_total`;
-- `connections_closed_total`;
-- `connections_rejected_total`;
-- `connections_max`.
-
-Counter arithmetic:
-
-```text
-connections_current = connections_accepted_total - connections_closed_total - active_rejected_after_accept_adjustments
-connections_max = high_watermark(connections_current)
-```
-
-Labels:
-
-- endpoint kind;
-- reason enum;
-- sink kind;
-- commit state;
-- parser/splitter kind.
-
-Avoid labels containing token values, raw source paths, raw messages, or arbitrary error text.
-
-Prometheus later uses the same counter names. The in-process stats route should not invent a separate vocabulary.
-
----
-
-## 11. Process Lifecycle And Signals
-
-### 11.1 Startup Sequence
-
-```text
-parse CLI -> compose config -> validate -> init tracing -> install panic hook -> build runtime -> build sink -> bind listener -> install routes -> log ready -> serve
-```
-
-Startup fails before bind for invalid config, missing required files/directories, invalid runtime settings, or required sink initialization failure.
-
-### 11.2 Signals
-
-Use Tokio signal handling:
-
-- SIGINT: developer interrupt, graceful shutdown;
-- SIGTERM: service/container stop, graceful shutdown;
-- SIGHUP: no hot reload for foreseeable future; either log unsupported or use supervisor-level restart semantics later.
-
-Use a root cancellation token when subsystems exist. Each subsystem receives a child token.
-
-### 11.3 Graceful Shutdown
-
-Shutdown phases:
-
-1. stop accepting new work;
-2. allow in-flight requests to finish within timeout;
-3. stop queue intake;
-4. drain queue according to policy;
-5. flush sink if configured;
-6. log final counters;
-7. exit with appropriate status.
-
-If Axum's basic graceful shutdown lacks required timeout/control, adopt `axum-server` or an owned Hyper accept loop.
-
-### 11.4 Panic Policy
-
-Production candidate policy:
-
-- install panic hook that logs panic location and backtrace through `tracing`;
-- release profile may use `panic = "abort"` after tests and service supervision are established;
-- no attempt to recover from unknown panics in request handlers without explicit isolation.
-
----
-
-## 12. Tokio Runtime And Concurrency
-
-Use a Tokio multi-thread runtime.
-
-Initial runtime may use `#[tokio::main]`; production direction is explicit `tokio::runtime::Builder` so config can drive runtime/task counts and thread names.
-
-Runtime knobs:
-
-- `runtime.worker_threads`;
-- `runtime.max_blocking_threads` for short blocking operations only;
-- optional `runtime.cpu_worker_threads` or separate CPU runtime size when parse/index work is moved off request tasks;
-- `runtime.thread_stack_size` only if measurement warrants;
-- thread name prefix such as `hec-runtime`.
-
-Concurrency design:
-
-```text
-network concurrency: Tokio/Axum request tasks
-sink concurrency: bounded queue plus one or more write-path tasks
-CPU-heavy parsing/indexing: batch-sized explicit execution boundary later, not casual tokio::spawn
-blocking filesystem: isolated through write-path tasks or spawn_blocking/tokio::fs with measurement
-```
-
-Scheduling policy:
-
-1. Keep network accept, HTTP body reads, auth, health, stats, and timeout handling on the I/O runtime.
-2. Permit bounded gzip/JSON/raw splitting on request tasks only while body limits are small and benchmark evidence shows no I/O starvation.
-3. Move parse, normalize, tokenize, index construction, compression expansion, and durable write-path grouping behind an explicit CPU or write-path execution boundary when they exceed a measured per-request budget or affect health/latency under load.
-4. Do not use `spawn_blocking` as a generic CPU pool. Tokio documents `spawn_blocking` for blocking operations that finish; many CPU tasks need semaphores or a specialized executor, and started `spawn_blocking` tasks cannot be aborted.
-5. If a separate CPU Tokio runtime is used, size and name it explicitly and keep I/O work on the I/O runtime. DataFusion/InfluxDB experience shows this can work, but only when I/O is deliberately routed away from CPU-heavy pools.
-6. If Rayon or a dedicated pool is used, bridge results through bounded channels or oneshot replies and record queue depth, wait time, and cancellation semantics.
-7. Long-running CPU loops must be batch-granular and cancellation-aware. A loop that never yields or never checks cancellation can starve health, shutdown, and connection handling even when machine CPU utilization looks below saturation.
-
-No shared mutable state unless message passing is worse. Use `Arc` for shared immutable/config/state handles; use locks only for small stats/snapshots until contention is measured.
-
-References used for this policy:
-
-- Andrew Lamb, *Using Tokio for CPU-Bound Tasks (Works Really Well)*, Tokio Conf 2026 slides — DataFusion-style dataflow, batching, separate CPU runtime, and traps around mixed I/O/CPU pools.
-- Tokio docs, `tokio::task::spawn_blocking` — blocking thread pool behavior, large default cap, semaphore/specialized executor warning, and non-abortability.
-- Tokio issue `tokio-rs/tokio#8085` — request for better CPU/I/O prioritization, with production discussion of separate CPU and I/O runtimes.
-- Apache DataFusion issue `apache/datafusion#13692` — documents I/O starvation before visible resource exhaustion and explores moving or wrapping CPU work.
-- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/src/app.rs` — explicit multi-thread runtime builder, configurable worker count, named runtime threads.
-- Vector local source, `/Users/walter/Work/Spank/sOSS/vector/lib/vector-buffers/src/lib.rs` — buffer-full policy as a first-class backpressure decision: block, drop, or overflow.
-
----
-
-## 13. HTTP Stack Interface
-
-Infrastructure decision: start with Tokio plus Axum, with Axum kept at the HTTP adapter boundary. Protocol-critical behavior remains in HECpoc modules, not Tower middleware.
-
-Boundary contract:
-
-| Concern | Infrastructure Owns | Ingress-Stack Design Owns |
-| --- | --- | --- |
-| Runtime choice | Tokio + Axum as starting infrastructure | exact Tokio/Axum/Hyper accept and body mechanics |
-| HTTP adapter | route to handler, expose request facts, convert final outcome | framework limitations, extractor hazards, Hyper fallback evidence |
-| Protocol-critical controls | auth/body/decode/parse/outcome must be explicit HEC code paths | detailed auth/gzip/body-limit/timeout mechanics |
-| Request phase names | stable phase vocabulary for logs, stats, validation | byte and buffer behavior by phase |
-
-Request phase contract:
-
-```text
-route alias -> endpoint kind -> auth -> bounded body -> optional content decode -> HEC decode/framing -> HecEvents -> write or queue disposition -> HecResponse
-```
-
-Infrastructure should not duplicate crate-source findings, kernel details, copy/buffer analysis, or accept-loop research.
-
-## 14. Sink, Queue, And Inspection Interface
-
-Infrastructure decision: the first correctness sink is local capture; queue and durable states are introduced only when the current phase needs them.
-
-Commit-state vocabulary shared by implementation, logs, stats, and validation:
-
-| State | Meaning |
-| --- | --- |
-| accepted | HEC validation produced valid `HecEvents` |
-| queued | `HecEvents` entered a bounded queue |
-| written | sink/store write returned |
-| flushed | userspace writer flushed |
-| durable | fsync/DB durable commit complete |
-
-Interface rules:
-
-- HTTP success must not imply a stronger commit state than the selected sink mode reaches.
-- Direct capture is acceptable for fixture mode.
-- Bounded queue is required before advertising backpressure behavior beyond request/body rejection.
-- Inspection starts from capture evidence, not from a search/index abstraction.
-- ACK is request/HEC-batch scoped and must name its selected commit boundary. `queued` is acceptable for explicit benchmark mode; production ACK should wait for `durable` or a similarly tested DB/file commit boundary.
-- Durable storage and production ACK wait until `durable` has a real implementation and tests.
-
-Detailed file format, buffering, sink backpressure, and store mechanics are outside this interface section. This section only defines shared state names and the infrastructure expectations that call sites must satisfy.
-
-## 15. Backpressure And Resilience Interface
-
-Infrastructure decision: resource limits and overload behavior must be named, configurable where appropriate, visible in outcomes, and counted.
-
-Required contract:
-
-- each bounded layer has a limit name, failure reason, outcome mapping, counter, and log severity;
-- initial bounded layers are HTTP body bytes, decoded bytes, event count, body read time, and queue/write disposition once queue exists;
-- future bounded layers include listener backlog, connection count, per-IP contribution, line bytes, field count, and durable sink pressure;
-- default behavior is explicit rejection or server-busy response, not indefinite wait or silent drop;
-- hostile input must not crash the process.
-
-Deep mechanics remain outside generic infrastructure: network buffer chains, kernel/runtime knobs, ingress resilience policy, raw splitting semantics, and store pressure algorithms each need subject-specific design and tests.
-
-## 16. Security Posture
-
-Initial security scope:
-
-- token auth only;
-- no token values in logs or responses;
-- strict header parsing;
-- body/gzip limits to resist memory expansion;
-- parser must not panic on malformed bytes or JSON;
-- request logs avoid raw body content;
-- local bind default until deliberate exposure;
-- external TLS/encryption postponed but route design must not prevent it.
-
-Later hardening:
-
-- TLS/rustls;
-- token registry with IDs, enabled/disabled state, default index, ACK policy, query-token policy, and allowed indexes;
-- per-IP admission;
-- rate limits;
-- separate observability listener;
-- systemd hardening;
-- fuzz corpus for auth/body/gzip/parser.
-
----
-
-## 17. Validation And Test Harness
-
-### 17.1 Test Layers
-
-| Layer | Tooling | Purpose |
-| --- | --- | --- |
-| Unit | `cargo test` / `#[tokio::test]` | auth, body, gzip, parser, outcome, config validation |
-| Handler | Axum request/response tests | HTTP status/body/header behavior without socket |
-| Process | binary + curl/fixtures | startup, bind, real request flow, capture files |
-| Compatibility | Splunk Enterprise, Vector | compare external behavior |
-| Corpus | local tutorial/prod logs, LogHub, attack corpora | realistic input variation |
-| Hostile | radamsa, SecLists, PayloadsAllTheThings, slow clients | malformed/DoS scenarios |
-| Benchmark | `oha`, `wrk`, `ab`, custom scripts | throughput, latency, concurrency |
-
-### 17.2 Fixture Layout
-
-```text
-fixtures/
-  requests/
-    event_valid.json
-    event_missing_event.json
-    event_blank_event.json
-    raw_crlf.txt
-    raw_nul.bin
-    gzip_valid.bin
-    gzip_invalid.bin
-  configs/
-    minimal.toml
-    invalid_unknown_field.toml
-    invalid_bounds.toml
-  logs/
-    README.md
-  ledgers/
-    README.md
-```
-
-Large corpora are referenced by absolute path or manifest, not copied into the repo by default.
-
-### 17.3 Config Tests
-
-Every field requires:
-
-1. default exists;
-2. TOML overrides default;
-3. CLI overrides TOML;
-4. env overrides CLI;
-5. invalid format fails;
-6. invalid value fails;
-7. cross-field failure is reported;
-8. `--show-config` redacts secrets;
-9. `--check-config` does not bind sockets.
-
-### 17.4 Error/Outcome Tests
-
-- every outcome constructor serializes expected JSON;
-- status/code/text mappings are stable;
-- internal errors map to expected outcomes;
-- redaction removes secrets/body values;
-- stats increment for success and rejection classes;
-- request logs include bounded canonical fields.
-
-### 17.5 HEC Protocol Tests
-
-- endpoint aliases;
-- missing/malformed/invalid auth;
-- empty body;
-- JSON object/array/number/string/boolean event values;
-- absent/null/blank `event`;
-- malformed JSON and late invalid concatenated JSON;
-- raw LF/CRLF/NUL/control/invalid UTF-8 cases;
-- gzip valid/invalid/oversize cases;
-- health route;
-- ACK disabled behavior.
-
-### 17.6 External Validation
-
-Record:
-
-- command;
-- config;
-- git revision;
-- input path/hash;
-- tool and version;
-- expected response;
-- actual response;
-- capture path;
-- accepted/rejected/written counts;
-- notes comparing Splunk/Vector.
-
----
-
-## 18. Benchmarking And Performance Recording
-
-Benchmarking must name the stage being measured.
-
-Timing points:
-
-```text
-accept -> headers/auth -> body read -> gzip decode -> parse/framing -> enqueue -> sink write -> flush/durable state
-```
-
-Run metadata:
-
-- git revision;
-- binary version;
-- build profile;
-- OS/kernel;
-- CPU model, core count, cache when available;
-- memory size;
-- effective config with redacted secrets;
-- selected listener/splitter/gzip/parser/queue/sink;
-- tool and version;
-- corpus path/hash;
-- start/end timestamps;
-- bytes/sec;
-- events/sec;
-- latency percentiles;
-- error counts split by auth, body-read, body-size, timeout, gzip, parse, sink, and queue classes;
-- process CPU, RSS, virtual size, thread count, descriptor count, and elapsed time samples;
-- system CPU/load, VM, network socket, and IO snapshots when available.
-
-Current scripts:
-
-- `/Users/walter/Work/Spank/HECpoc/scripts/bench_hec_ab.sh` runs repeatable AB stages with HEC stats snapshots.
-- `/Users/walter/Work/Spank/HECpoc/scripts/capture_system_stats.sh` samples process and host statistics during long runs.
-- `/Users/walter/Work/Spank/HECpoc/scripts/analyze_bench_run.py` derives request/sec, MiB/sec, event/sec, and failure summaries from a result directory.
-
-Ledger format:
-
-- append-only JSONL preferred;
-- CSV acceptable for quick throughput tables;
-- human summaries are derived output, not the source of truth.
-
-Optimization admission rule:
-
-```text
-keep scalar correctness path -> add optimized variant -> agreement tests -> benchmark stage -> default only after correctness and measured value
-```
-
-Applies to raw splitting, JSON parser alternatives, tokenization, write-path grouping, and storage layout.
-
----
-
-## 19. Build, Packaging, And Service Operation
-
-Near-term:
-
-- `cargo fmt` and `cargo clippy` once conventions settle;
-- `cargo test` for unit/integration;
-- release build for benchmarks;
-- local scripts for process tests and host observation.
-
-Production candidate:
-
-- explicit `Cargo.toml` metadata;
-- static-ish release binary where practical;
-- systemd unit or container entrypoint;
-- stderr JSON logs;
-- `RUST_BACKTRACE=1` in service environment;
-- graceful SIGTERM;
-- optional `sd_notify` later;
-- health/readiness endpoints;
-- documented config file path and examples;
-- shell completions generated by `clap_complete` later.
-
-Systemd hardening later:
-
-```text
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ProtectHome=true
-ReadWritePaths=<capture/store paths>
-Restart=on-failure
-```
-
-Do not over-harden before paths, sinks, and service mode are clear.
-
----
-
-## 20. Implementation Sequence
-
-The implementation can proceed in phases without defining every production detail first.
-
-### Phase 1 — Mainstay Configuration Infrastructure
-
-- Done: add `clap`, `figment`, and `thiserror`.
-- Done: replace config loader with provider chain.
-- Done: implement `--config`, `--show-config`, `--check-config`.
-- Done: add validation and redacted config output.
-- Done: add config precedence tests.
-- Done: add observe/reporting config for tracing, console, stats, format, level/filter, and redaction text/mode.
-
-Implemented configuration state:
-
-- provider precedence is compiled defaults < TOML config file < CLI flags < environment variables;
-- `--config` selects the config file, with environment support for configured deployment paths;
-- `--show-config` prints redacted effective TOML;
-- `--check-config` runs the same validation path without starting the receiver;
-- validation covers token, bind address, byte/event limits, duration bounds, gzip buffer range, and environment parse failures.
-- observation config covers tracing/console/stats toggles, compact/json tracing format, filter syntax, and configurable redaction text.
-
-Relevant files:
-
-- `/Users/walter/Work/Spank/HECpoc/Cargo.toml` — `clap`, `figment`, and `thiserror`;
-- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/config.rs` — layered config implementation and tests;
-- `/Users/walter/Work/Spank/HECpoc/src/main.rs` — config action handling;
-- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` — old environment parsing removed;
-- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/mod.rs` — `ConfigAction` export.
-
-Validation evidence saved under `/Users/walter/Work/Spank/HECpoc/results/`:
-
-- `test-list-20260504T021751Z.txt` — 34 tests listed;
-- `test-output-20260504T021751Z.txt` — 34 tests passed;
-- `test-output-20260504T232623Z.txt` — 40 tests passed after observe/reporting config and `HecResponse` alignment;
-- `test-output-20260504T232708Z.txt` — 40 tests passed after warning cleanup;
-- `check-config-20260504T021804Z.log` — `--check-config` output;
-- `check-config-20260504T232708Z.log` — warning-free `--check-config` output after observe/reporting config;
-- `show-config-20260504T021804Z.log` — redacted `--show-config` output;
-- `startup-20260504T021804Z.log` — startup status output;
-- `bench-ab-single-20260504T021828Z.txt` — local `ab -n 1000 -c 1` smoke output;
-- `bench-ab-c50-20260504T021828Z.txt` — local `ab -n 5000 -c 50` smoke output;
-- `bench-stats-20260504T021828Z.json` — stats after smoke runs.
-
-Smoke results are not capacity claims. They only prove the receiver starts, accepts raw HEC traffic locally, and counters remain clean under small release-mode `ab` runs.
-
-### Phase 2 — Reporting, Error, And Outcome Spine
-
-- Done initial: add `report.rs` with `Reporter`, `ReportContext`, `FactId`, `FactSpec`, typed `FieldValue`, `Outcome`, `Severity`, output routing, and stats/tracing/console adapters.
-- Done initial: route existing request counters through Reporter-owned stats sink rather than direct handler counter writes.
-- Done initial: add fact registry and typed fields for request, auth, body, parser, and sink paths.
-- Done initial: apply `Instant` rule by keeping `Instant` local to request handling and submitting `elapsed_us` to Reporter.
-- Done initial: rename the concrete client-visible response type to `HecResponse`.
-- Done initial: wire runtime observe config into `tracing-subscriber`, `Reporter` output toggles, and redacted effective config output.
-- Continue: move fact constants closer to owning modules once module boundaries are stable.
-- Add controlled dynamic diagnostic support for investigation-specific records that still use source, phase, component, severity, redaction, and output routing.
-- Avoid a generic `messages.rs` dumping ground. Add `public_text.rs`, `render.rs`, or `output.rs` only if public text and command-output rendering need a separate home after report/outcome types exist.
-- Continue: remove stale `HecOutcome` wording from historical notes when those files are edited for other reasons.
-- Continue: add `error.rs` classes for config/startup/request/sink beyond current `HecError`.
-- Continue: add outcome serialization and mapping tests.
-- Continue: add redaction, routing, fan-out, console output, and output-rendering tests beyond current stats and disabled-diagnostic tests.
-- Continue: add per-source/component filters after the initial global observe filter proves insufficient.
-
-### Phase 3 — Raw Framing And Hostile Input
-
-- Add `line_splitter.rs` with scalar behavior.
-- Add tests for LF, CRLF, NUL, controls, non-ASCII, invalid UTF-8, long lines, no-final-newline.
-- Preserve original and canonical evidence where relevant.
-
-### Phase 4 — Queue And Write-Path Separation
-
-- Define `HecEvents`, commit-state enum, queue policy, and write-path loop.
-- Add queue-full and sink-failure outcomes.
-- Add counters and process tests.
-
-### Phase 5 — Observability And Benchmark Ledger
-
-- Expand reporter outputs for structured startup/request/shutdown events.
-- Stabilize stats names.
-- Add benchmark ledger schema.
-- Run single-stream and concurrent load tests.
-
-### Phase 6 — External Compatibility
-
-- Compare selected cases with local Splunk Enterprise.
-- Validate Vector as HEC client.
-- Record compatibility differences in ledgers.
-
----
-
-## 21. Acceptance Criteria For Infrastructure Phase
-
-The first infrastructure phase is accepted when:
-
-- config is loaded through `clap` + `figment`, not hand-coded merge logic;
-- defaults, file, CLI, and env precedence are tested;
-- config validation fails before bind;
-- `--show-config` redacts secrets;
-- `--check-config` uses the same validation path;
-- observe/logging/reporting output toggles are configured by defaults, TOML, CLI, and env;
-- handlers no longer scatter HEC response text/code;
-- product-significant call sites use domain-owned fact constants and `Reporter::submit(...)` rather than direct backend logging calls;
-- rejected and failed outcomes are represented as `Outcome` values, not separate messaging APIs;
-- request rejection classes have central outcomes, counters, and reporting fields;
-- raw splitter behavior is explicit and tested;
-- benchmark and validation runs can be recorded with reproducible metadata.
-
----
-
-## 22. Open Decisions
-
-These are allowed to remain open while early phases proceed.
-
-| Area | Decision Needed | Blocking? |
-| --- | --- | --- |
-| Exact invalid-token HTTP status | compare Splunk/Vector | no for config phase |
-| Body-too-large HEC code/text | compare Splunk/Vector | no for config phase |
-| ACK disabled response | compare Splunk/Vector | no until ACK route is used |
-| JSON partial success vs all-or-nothing | compare Splunk and durability preference | no for config phase; yes before event parser finalization |
-| Prometheus adoption | external metrics requirement | no |
-| Dedicated observability port | production operation mode | no |
-| Direct Hyper accept loop | Axum limitation evidence | no |
-| Durable sink format | ACK/replay requirement | no |
-
----
-
-## 23. References
-
-Reviewed infrastructure source patterns:
-
-- `/Users/walter/Work/Spank/infra/Infrastructure.md` — operations layers and scale framing;
-- `/Users/walter/Work/Spank/spank-py/Infra.md` — cross-cutting infrastructure requirements and call-site conventions;
-- `/Users/walter/Work/Spank/spank-rs/research/Infrust.md` — Rust infrastructure mandates.
+- [clap documentation](https://docs.rs/clap/latest/clap/) — CLI parsing and typed argument definitions.
+- [figment documentation](https://docs.rs/figment/latest/figment/) — layered configuration providers and extraction into typed structs.
+- [Serde documentation](https://serde.rs/) — typed serialization/deserialization used by config and structured output.
+- [thiserror documentation](https://docs.rs/thiserror/latest/thiserror/) — derive-based typed error definitions.
+- [anyhow documentation](https://docs.rs/anyhow/latest/anyhow/) — contextual top-level binary errors.
+- [tracing documentation](https://docs.rs/tracing/latest/tracing/) — structured application events.
+- [tracing-subscriber documentation](https://docs.rs/tracing-subscriber/latest/tracing_subscriber/) — filtering, formatting, and subscriber setup.
+- [Tokio runtime builder](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html) — runtime thread and blocking-pool configuration.
+- [Tokio `spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — blocking bridge behavior and cancellation caveats.
+- [Twelve-Factor App: Config](https://12factor.net/config) — environment-based configuration motivation; used as background, not as a complete design.

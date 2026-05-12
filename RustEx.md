@@ -1,9 +1,14 @@
+# RustEx — Rust Idiom And Architecture Notes
 
-## 7. Rust Observations And Examples
+This document captures Rust-specific examples, idiom pressure, and ecosystem habits that can distort architecture choices if copied uncritically.
+
+Mandate: keep Rust syntax, crate, macro, trait, logging, and abstraction notes separate from the product and subsystem specifications. RustEx may explain why a Rust trope is risky or useful, but implementation decisions belong in the owning design document and code review.
+
+## 1. Rust Observations And Examples
 
 This section captures the influence of Rust examples, idioms, and ecosystem defaults on model behavior. It is not a rejection of Rust. It is a warning that Rust teaching examples and crate documentation often optimize for local clarity, not system architecture.
 
-### 7.1 Direct Logging Macros
+### 1.1 Direct Logging Macros
 
 Canonical Rust examples often show:
 
@@ -27,7 +32,7 @@ report.emit(HEC_AUTH_TOKEN_INVALID
     .outcome(&outcome));
 ```
 
-### 7.2 Trait And `dyn` Gravity
+### 1.2 Trait And `dyn` Gravity
 
 Canonical examples often introduce traits early:
 
@@ -51,7 +56,7 @@ Preferred project approach:
 - introduce traits when at least two real implementations, tests, or replacement seams exist;
 - keep hot-path ownership and allocation visible.
 
-### 7.3 Enum Localism
+### 1.3 Enum Localism
 
 Canonical examples often encourage local enums and `match`:
 
@@ -74,7 +79,7 @@ Preferred project approach:
 - centralize mappings at adapter boundaries;
 - test mappings directly.
 
-### 7.4 Tower And Middleware Defaults
+### 1.4 Tower And Middleware Defaults
 
 Rust web examples often imply:
 
@@ -96,7 +101,7 @@ Preferred project approach:
 - own protocol-critical auth, gzip, body limit, error mapping, and hostile-input handling;
 - keep Hyper/hyper-util fallback available if accept-loop or body behavior requires it.
 
-### 7.5 Module Fragmentation
+### 1.5 Module Fragmentation
 
 Canonical Rust projects often split many small files early.
 
@@ -112,7 +117,7 @@ Preferred project approach:
 - split only when the boundary makes code review or testing clearer;
 - avoid generic names such as `messages.rs` until the real responsibility is known.
 
-### 7.6 Standard Crate Boundary Leakage
+### 1.6 Standard Crate Boundary Leakage
 
 Canonical Rust examples often import standard ecosystem crates directly in every module:
 

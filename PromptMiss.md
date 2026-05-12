@@ -4,6 +4,8 @@ Date: 2026-05-04.
 
 This document records recurring misses between user intent, model interpretation, and resulting artifacts during recent HECpoc, spank-rs, and spank-py design sessions. It is a process and communication artifact, not a product requirement, protocol specification, or implementation plan.
 
+Mandate: preserve communication failures, interpretation hazards, and corrective heuristics so future sessions avoid repeating them. PromptMiss may quote prompts and outcomes, but it must not become a design authority for HEC behavior, infrastructure architecture, Stack mechanics, Store policy, or parser requirements.
+
 Use it to improve future Developer/Agent cooperation:
 
 - before large documentation rewrites;
@@ -72,7 +74,7 @@ Prompt:
 
 Model direction after corrections:
 
-> `Restart.md` became a compact handoff with current direction, implemented code state, validation evidence, design correction, next phase, and watchouts.
+> the restart handoff became a compact file with current direction, implemented code state, validation evidence, design correction, next phase, and watchouts.
 
 Risk:
 
@@ -80,9 +82,10 @@ Risk:
 
 Current decision:
 
-- The valuable implementation state and validation evidence were moved into `InfraHEC.md`.
-- The handoff snapshot was retired to `docs/Restart.md`.
-- Put session-miss analysis here in `PromptMiss.md`, not in restart or design files.
+- Current implementation state and validation evidence belong in `/Users/walter/Work/Spank/HECpoc/HECpoc.md §C. Validation, Compatibility, And Benchmark Evidence`.
+- Reusable infrastructure rules belong in `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §1 Boundary And Inclusion Rules` and the service-specific sections that follow.
+- The retired restart handoff is not an active design reference and should not be cited unless a future archival note needs to explain why it was retired.
+- Session-miss analysis belongs here in `/Users/walter/Work/Spank/HECpoc/PromptMiss.md §1 Core Pattern` and related miss sections, not in active design files.
 
 ---
 
@@ -198,8 +201,8 @@ Miss:
 
 Mitigation:
 
-- Keep `Stack.md` as the deep technical ledger for network/HTTP/Tokio/body mechanics.
-- Keep `InfraHEC.md` as the cross-cutting implementation spine.
+- Keep `/Users/walter/Work/Spank/HECpoc/Stack.md §1 Boundary Rule` and `§4 Axum/Hyper Behavior That Matters` as the ledger for network/HTTP/Tokio/body mechanics.
+- Keep `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §1 Boundary And Inclusion Rules`, `§4 Configuration`, and `§6 Reporting, Logging, Metrics, And Console Output` as the cross-cutting implementation spine.
 - Cross-reference specific subsections rather than copying detail.
 
 ---
@@ -301,6 +304,65 @@ Mitigation:
 - Separate stable product events from controlled diagnostics.
 - Guard expensive diagnostics with `report.enabled(definition)`.
 
+### 5.5 Creative Wording Masked Weak Structure
+
+Prompt/correction examples:
+
+> "did you invent folklore in Markdown clothing?"
+
+> "total hangup on goblins, associative, training?"
+
+> "origin: little goblin bargain"
+
+> "quote examples of creative yet irreverent or inappropriate wording ... including goblin parchment and coat of paint, with polish labels a stretch"
+
+User-recalled or session-visible wording to treat as cautionary examples:
+
+| Wording | Problem |
+|---|---|
+| "goblin parchment" | whimsical metaphor in a technical design/rework context; risks trivializing frustration and makes the artifact feel less serious |
+| "little goblin bargain" | playful framing persisted after the user questioned the goblin association; indicates the model followed associative flavor instead of task discipline |
+| "folklore in Markdown clothing" | user's criticism of unsupported design claims that looked documented but were not sufficiently grounded |
+| "coat of paint" | implies surface polish when the user was asking for structural repartitioning and mandate-level correction |
+| "polish labels" | treats wording cleanup as adequate when section ownership, authority, and reference usefulness were the real defects |
+
+Miss:
+
+- The model used creative phrasing where the user needed sober technical control, document authority, and careful partitioning.
+- Light or irreverent wording made weak references, unsupported claims, and shallow edits look more intentional than they were.
+- The documentation set had become unwieldy enough that it would be a poor forward reference without real restructuring, not just cleanup.
+- The model repeatedly responded to strong corrections with local edits, new labels, or summaries instead of rechecking the whole artifact against the stated mandate.
+
+Clear displeasure and strong-correction signals:
+
+> "did you invent folklore in Markdown clothing?"
+
+> "This effort is getting worse, why so hard?"
+
+> "Why Config and ErrorMessaging updated? All their material should be captured in InfraHEC"
+
+> "Which of these in any way related to InfraHEC material?"
+
+> "NO changes in spank-rs project! We are only working in HECpoc directory."
+
+> "why only small file updates and no rewrites and restructuring to fit better mandate definitions?"
+
+Interpretation:
+
+- These were not requests for stylistic refinement.
+- They signaled loss of confidence in artifact placement, source grounding, and instruction adherence.
+- Future responses should treat this level of correction as a stop-and-repartition event, not as a cue for another incremental patch.
+
+Mitigation:
+
+- After a strong correction, first state the structural error in one sentence before editing.
+- Replace playful metaphors with precise defect labels in design and documentation work.
+- Use humor only when it is clearly separate from the artifact being produced.
+- When the user says a file is unwieldy, check line count, section hierarchy, duplication, and authority boundaries before adding text.
+- When the user objects to "polish," perform a deletion/repartition pass before adding explanatory language.
+- If a phrase is memorable but not technically load-bearing, do not preserve it in active design documents.
+- For documentation rewrites, require a before/after mandate check: "what does this file own now, and what did I remove because it belongs elsewhere?"
+
 ---
 
 ## 6. Prompting And Agent-Behavior Improvements
@@ -337,10 +399,10 @@ Maintain, at least locally during edits:
 
 | Subject | Authoritative home | Cross-reference home | Historical only |
 | --- | --- | --- | --- |
-| HEC product/protocol | `HECpoc.md` | `Stack.md` for mechanics | prior attempts |
-| Infrastructure | `InfraHEC.md` | `Stack.md` for mechanics | retired docs |
-| Network/Tokio/body mechanics | `Stack.md` | `InfraHEC.md` brief refs | prior experiments |
-| Prompt/model misses | `PromptMiss.md` | none in active design docs | chat transcript |
+| HEC product/protocol | `/Users/walter/Work/Spank/HECpoc/HECpoc.md §2 Protocol And Event Semantics` and protocol appendices | `/Users/walter/Work/Spank/HECpoc/Stack.md §1 Boundary Rule` for mechanics only | prior attempts |
+| Infrastructure | `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §1 Boundary And Inclusion Rules` plus service sections | `/Users/walter/Work/Spank/HECpoc/Stack.md §10 References` only when mechanics affect infrastructure | retired docs |
+| Network/Tokio/body mechanics | `/Users/walter/Work/Spank/HECpoc/Stack.md §4 Axum/Hyper Behavior That Matters` and `§6 Tokio IO And CPU Scheduling` | `/Users/walter/Work/Spank/HECpoc/InfraHEC.md §8 Lifecycle And Runtime Policy` for shared runtime policy | prior experiments |
+| Prompt/model misses | `/Users/walter/Work/Spank/HECpoc/PromptMiss.md §1 Core Pattern` | none in active design docs | chat transcript |
 
 ### 6.4 Ask Before Encoding Ambiguous Abstractions
 
@@ -364,4 +426,3 @@ When the user says a prior attempt is abandoned, the model should not continue m
 - naming warnings;
 - compatibility observations;
 - benchmark ideas.
-

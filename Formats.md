@@ -2,6 +2,8 @@
 
 Scope: log and record formats that Spank HECpoc must preserve, parse, classify, normalize, tokenize, index, validate, and eventually search. This document owns format origins, structural examples, parser choices, edge cases, exception handling, and source-specific technical nuance. It does not own HEC wire behavior, Tokio/Axum mechanics, configuration infrastructure, or project status.
 
+Mandate: define record-format knowledge and parser-facing requirements after an input has become a candidate record or event. Formats owns format examples, parser capability, field extraction, malformed-record policy, aliases, and parser validation; it does not own request acceptance, transport limits, queue/storage commitment, or infrastructure services.
+
 Primary local source carried forward: `/Users/walter/Work/Spank/spank-py/Logs.md`, especially the format taxonomy, timestamp problem, syslog/auth.log validation, Apache access inventory, Vector coverage model, Sigma context, parser dispatch alternatives, and auth.log corpus expansion findings. This document restates only the material needed for the Rust HECpoc direction.
 
 ---
@@ -35,6 +37,20 @@ record bytes or text
 ```
 
 Format validation is parser validation: the parser accepts expected records, rejects or marks malformed records, preserves raw evidence, and emits stable field names and parse reasons. End-to-end ingest, store, queue, and OS behavior are validated elsewhere.
+
+### 1.1 Local Source Findings Brought Forward
+
+`/Users/walter/Work/Spank/spank-py/Logs.md` is cited because it contains concrete format findings, not because the old Python implementation is authoritative. The following details are carried forward into this document:
+
+| Finding From `Logs.md` | Technical Detail Preserved Here | Why It Matters |
+|---|---|---|
+| Syslog file timestamps differ from syslog wire standards | Ubuntu/rsyslog file outputs can use ISO timestamps while RFC 3164 wire examples use `Mmm dd HH:MM:SS` without year/timezone | parser must support both prefixes and must not equate local file format with network protocol |
+| Auth logs require security-specific subparsing | SSH/PAM/sudo lines share syslog framing but encode different user, source address, result, and method fields inside the message | one syslog parser is insufficient for useful security fields |
+| Apache access parsing has known regex traps | quoted request/user-agent fields, embedded spaces, custom `LogFormat`, and `-` null values change parser strategy | generic whitespace splitting or a single combined-log regex is too brittle |
+| Apache/nginx error logs are not syslog | `error.log` carries bracketed timestamps, module/severity fields, pid/tid/client fragments, and server-specific codes | filename-only classification to syslog loses useful fields |
+| Sourcetype and content type are separate signals | HTTP content type, configured source type, and record content can disagree | parser dispatch must be explicit and replayable instead of inferred once at transport ingress |
+| Shippers usually require explicit sourcetype | Vector, Fluent Bit, Fluentd, Logstash, rsyslog, syslog-ng, and OTel examples generally require operator-set sourcetype or field mapping | automatic filename inference is useful locally but must not be treated as industry-default behavior |
+| Parser architecture needs tiers | fixed byte scanning, format-specific parsers, structured decoders, and fallback extraction have different correctness and performance profiles | lets Rust implementation benchmark parser paths separately and avoid one giant regex policy |
 
 ## 2. Format Traditions And Consequences
 
@@ -623,14 +639,15 @@ Open format gaps:
 
 Local:
 
-- `/Users/walter/Work/Spank/spank-py/Logs.md` — format landscape, syslog/auth.log validation, Apache access inventory, parser dispatch alternatives, Vector coverage model, and normalization comparison.
-- `/Users/walter/Work/Spank/sOSS/sigma` — local Sigma rule corpus used for logsource counts.
-- `/Users/walter/Work/Spank/sOSS/vector` — local Vector implementation and docs.
+- `/Users/walter/Work/Spank/spank-py/Logs.md` — justified by `§1.1`; contributes concrete findings on syslog/auth timestamps, Apache access/error parser traps, source-type dispatch, shipper behavior, and parser-tier design.
+- `/Users/walter/Work/Spank/sOSS/sigma` — local rule corpus used only for the logsource counts in `§3.3`; not used as a universal feature-priority oracle.
+- `/Users/walter/Work/Spank/sOSS/vector` — local implementation reference for parser function coverage and source/sink behavior; design lessons are restated in `§3.2` rather than assumed by reference.
 
 External:
 
 - [Splunk: Why source types matter](https://help.splunk.com/en/splunk-enterprise/get-started/get-data-in/9.2/configure-source-types/why-source-types-matter).
 - [Splunk `props.conf`](https://docs.splunk.com/Documentation/Splunk/latest/admin/propsconf).
+- [Splunk Common Information Model overview](https://docs.splunk.com/Documentation/CIM/latest/User/Overview).
 - [Sigma logsources](https://sigmahq.io/docs/basics/log-sources.html).
 - [Sigma taxonomy](https://sigmahq.io/sigma-specification/specification/sigma-appendix-taxonomy.html).
 - [Vector VRL functions](https://vector.dev/docs/reference/vrl/functions/).
@@ -639,4 +656,7 @@ External:
 - [Apache log files](https://httpd.apache.org/docs/current/logs.html).
 - [NGINX access logs](https://docs.nginx.com/waf/logging/access-logs/).
 - [NGINX Ingress Controller logging](https://docs.nginx.com/nginx-ingress-controller/logging-and-monitoring/logging/).
+- [Elastic Common Schema reference](https://www.elastic.co/guide/en/ecs/current/ecs-reference.html).
+- [OpenTelemetry semantic conventions](https://opentelemetry.io/docs/specs/semconv/).
+- [RFC 3164 — The BSD Syslog Protocol](https://www.rfc-editor.org/rfc/rfc3164.html).
 - [RFC 5424 — The Syslog Protocol](https://www.rfc-editor.org/rfc/rfc5424.html).

@@ -2,6 +2,8 @@
 
 Scope: technical behavior of the HECpoc network and HTTP ingress stack: OS sockets, Tokio runtime behavior, Axum routing, Hyper request parsing, body streaming, buffering, timeouts, concurrency, and future accept-loop control. This document does not define application protocol response codes, authentication semantics, event fields, index rules, ACK behavior, or Splunk compatibility matrices; those belong in `HECpoc.md`.
 
+Mandate: explain what the network/runtime stack does before, during, and around request handling, including which failures reach application code and which are absorbed by OS/Hyper/Axum mechanics. Stack may name stack-adjacent configuration categories, but authoritative parameter catalogs belong to the owning subject document or the configuration machinery in `InfraHEC.md`.
+
 ## 1. Boundary Rule
 
 `Stack.md` owns mechanics below and around the HTTP handler. `HECpoc.md` owns what the handler decides those mechanics mean to a client.
@@ -12,7 +14,7 @@ Scope: technical behavior of the HECpoc network and HTTP ingress stack: OS socke
 | Connection acceptance | who accepts sockets, how connection counts could be collected, where peer address is available | whether to reject work, report busy, or classify source |
 | HTTP parsing | Hyper/Axum behavior for method/path/header/body framing | protocol route set, error body, status/code mapping |
 | Body streaming | chunk/frame read loop, byte caps, idle/total timers, read errors | endpoint-specific body meaning and response mapping |
-| Content decode mechanics | gzip implementation, decode buffer, expansion cap | whether a decoded payload is a valid HEC input |
+| Content decode mechanics | gzip implementation, decode buffer, expansion cap | whether decoded content is valid application input |
 | Concurrency | Tokio runtime, request tasks, future CPU/write-pool split | event validation, queue policy, commit-state truthfulness |
 | Observability hooks | possible socket/request timing and byte counters | domain facts, response codes, reason labels |
 
@@ -20,7 +22,7 @@ Practical rule:
 
 ```text
 Stack says: "Hyper rejected a malformed header before route code ran."
-HECpoc says: "That condition cannot currently produce a HEC JSON response."
+HECpoc says: "That condition cannot currently produce an application-owned response body."
 ```
 
 ## 2. Current Runtime Path
@@ -48,18 +50,17 @@ Implementation anchors:
 | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/body.rs` | body byte limits, timeout wrappers, content-encoding parsing, gzip decode |
 | `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/config.rs` | configured stack-adjacent limits: body bytes, decoded bytes, timeouts, gzip buffer |
 
-## 3. Axum And Tower Status
+## 3. Axum And Hyper Status
 
-Axum remains the HTTP adapter. Direct Tower or `tower-http` middleware is not used for protocol-critical request handling.
+Axum remains the HTTP adapter and Hyper remains the HTTP parser/server substrate reached through Axum.
 
 This is still accurate after the latest implementation:
 
-- Axum itself depends on Tower concepts internally; using Axum means accepting that dependency graph.
-- HECpoc source does not need `tower::ServiceBuilder`, `tower_http::auth`, `tower_http::decompression`, `tower_http::limit`, or `tower_http::timeout` for current request handling.
+- `axum::serve` is simple and sufficient for the current path.
+- Hyper can reject malformed HTTP framing before route handlers run.
+- Direct Hyper or `hyper-util` remains the fallback if connection lifecycle, socket options, header limits, or malformed-framing behavior require lower-level control.
 - Middleware may be considered later for non-protocol concerns only after it is proven not to hide body consumption, error body shape, timing, or counters.
 - The current direct handler path is useful because it makes ordering inspectable: phase check, query/header checks, content-encoding check, advertised length check, body read, decode, endpoint decode, sink disposition.
-
-Tower remains relevant as an implementation ecosystem fact, not as the place where application semantics should live.
 
 ## 4. Axum/Hyper Behavior That Matters
 
@@ -76,9 +77,9 @@ Important consequences:
 | Actual body exceeds configured cap without useful length | handler body reader | application-owned response and reporting possible |
 | Malformed HTTP header syntax | Hyper parser before route | handler does not run |
 | Malformed `Content-Length` rejected by Hyper | Hyper parser before route | current response is Hyper-generated, not application-owned |
-| Partial headers or slowloris before request formation | Hyper/socket layer | current HEC body timers do not apply |
+| Partial headers or slowloris before request formation | Hyper/socket layer | current application body timers do not apply |
 
-This is the main reason an owned Hyper/hyper-util accept path may eventually be needed: not for normal HEC correctness, but for connection accounting, peer culling, header timeouts, header-size policy, and exact treatment of malformed framing that never becomes an Axum request.
+This is the main reason an owned Hyper/hyper-util accept path may eventually be needed: not for normal application correctness, but for connection accounting, peer culling, header timeouts, header-size policy, and exact treatment of malformed framing that never becomes an Axum request.
 
 ## 5. Body Read And Decode Mechanics
 
@@ -122,7 +123,7 @@ Current rule: keep request tasks short, bounded, and mostly I/O-oriented. Do not
 | header checks and route dispatch | Axum request task | no change unless direct Hyper path is selected |
 | bounded body read | request task | body read latency or fairness degrades under load |
 | bounded gzip decode | request task | CPU samples show gzip dominates runtime threads |
-| JSON/raw HEC decode | request task | parser CPU dominates or delays health/body progress |
+| application body decode | request task | parser CPU dominates or delays health/body progress |
 | format parsing/tokenization/indexing | not in current hot path | feature is added; move behind explicit CPU pipeline |
 | file/database commit | direct sink now; queue/write path later | commit state or throughput requires isolation |
 
@@ -135,7 +136,7 @@ Tokio-specific cautions:
 
 ## 7. Future Accept Loop
 
-The current `axum::serve(listener, app)` path is simple and correct enough for initial HEC behavior. Replace it only for specific mechanical needs.
+The current `axum::serve(listener, app)` path is simple and correct enough for initial request behavior. Replace it only for specific mechanical needs.
 
 Reasons to own the accept path:
 
@@ -192,13 +193,45 @@ Stack validation proves mechanics, not application semantics.
 
 Application response matrices belong in `HECpoc.md`; Stack should only explain whether the request reached application code and what mechanical limit fired.
 
+## Appendix A. HTTP Without Direct Tower Middleware
+
+This appendix preserves the still-valid Tower analysis without making it part of the main stack flow.
+
+Current conclusion:
+
+- Axum integrates with Tower; using Axum means Tower concepts exist in the dependency graph.
+- Current source does not need direct `tower::ServiceBuilder`, `tower_http::auth`, `tower_http::decompression`, `tower_http::limit`, or `tower_http::timeout` calls for current request handling.
+- Direct Tower or `tower-http` middleware remains inappropriate for protocol-critical request handling until tests prove it preserves ordering, body consumption behavior, response shape, redaction, counters, and timeout semantics.
+- Tower middleware may still be useful later for generic non-protocol concerns, such as outer tracing after redaction is proven or auxiliary routes if those appear.
+
+Why this remains accurate:
+
+- Axum documentation states that Axum integrates with Tower rather than owning a bespoke middleware system.
+- Axum middleware documentation recommends `tower::ServiceBuilder` when applying multiple middleware, which confirms Tower is the normal Axum middleware substrate.
+- `tower-http` deprecated the simple `require_authorization` helper as too basic for real-world applications, matching our concern that exact-header auth helpers are not a protocol-compatibility layer.
+
 ## 10. References
 
-- [Axum crate documentation](https://docs.rs/axum/latest/axum/) — router, extractors, responses, and Axum/Tower relationship.
-- [Axum `serve`](https://docs.rs/axum/latest/axum/fn.serve.html) — intentionally simple serving helper and reason to use Hyper/hyper-util for lower-level control.
-- [Hyper documentation](https://docs.rs/hyper/latest/hyper/) — HTTP implementation underneath Axum.
-- [hyper-util documentation](https://docs.rs/hyper-util/latest/hyper_util/) — lower-level server utilities for custom connection serving.
+### Local Document References
+
+- `/Users/walter/Work/Spank/HECpoc/HECpoc.md` — referenced only to define the boundary between stack mechanics and application-visible protocol decisions.
+- `/Users/walter/Work/Spank/HECpoc/InfraHEC.md` — referenced only for shared configuration/reporting machinery; Stack owns the mechanical meaning of stack-adjacent limits and failures.
+
+### External Project And Standards References
+
+- [Axum crate documentation](https://docs.rs/axum/latest/axum/) — confirms Axum routing/extractor/response model, Tokio/Hyper compatibility, and the Axum/Tower relationship.
+- [Axum middleware documentation](https://docs.rs/axum/latest/axum/middleware/) — confirms Tower middleware integration, ordering concerns, `ServiceBuilder` guidance, and middleware error-handling behavior.
+- [Axum `serve`](https://docs.rs/axum/latest/axum/fn.serve.html) — documents the intentionally simple serving helper; lower-level control requires a different path.
+- [Hyper documentation](https://docs.rs/hyper/latest/hyper/) — HTTP parser/server substrate underneath Axum.
+- [hyper-util documentation](https://docs.rs/hyper-util/latest/hyper_util/) — lower-level utilities for custom connection serving if the accept loop must be owned.
+- [tower-http auth module](https://docs.rs/tower-http/latest/tower_http/auth/) — documents current authorization middleware surface and deprecated simple authorization helper.
+- [tower-http changelog](https://docs.rs/crate/tower-http/latest/source/CHANGELOG.md) — records the deprecation context for simple authorization helpers.
+- [Tokio `TcpSocket`](https://docs.rs/tokio/latest/tokio/net/struct.TcpSocket.html) — socket construction surface for future bind/listen/socket-option experiments.
 - [Tokio `spawn_blocking`](https://docs.rs/tokio/latest/tokio/task/fn.spawn_blocking.html) — blocking pool behavior and cancellation caveats.
 - [Tokio runtime builder](https://docs.rs/tokio/latest/tokio/runtime/struct.Builder.html) — worker thread and blocking-thread configuration.
-- [Tokio issue 8085](https://github.com/tokio-rs/tokio/issues/8085) — current discussion context around scheduling behavior.
-- [Apache DataFusion issue 13692](https://github.com/apache/datafusion/issues/13692) — CPU/I/O runtime separation discussion relevant to ingest pipelines.
+- [Tokio issue 8085](https://github.com/tokio-rs/tokio/issues/8085) — current discussion context around scheduling behavior under CPU-heavy workloads.
+- [Apache DataFusion issue 13692](https://github.com/apache/datafusion/issues/13692) — practical CPU/I/O runtime separation discussion relevant to ingest pipelines.
+- [Linux `socket(7)`](https://man7.org/linux/man-pages/man7/socket.7.html) — socket option and buffer behavior background.
+- [Linux `tcp(7)`](https://man7.org/linux/man-pages/man7/tcp.7.html) — TCP buffering, backlog, keepalive, and protocol tuning background.
+- [Linux `epoll(7)`](https://man7.org/linux/man-pages/man7/epoll.7.html) — Linux readiness notification mechanism relevant to async networking.
+- [Apple `kqueue(2)` man page](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/kqueue.2.html) — macOS/BSD event notification mechanism relevant to async networking.
