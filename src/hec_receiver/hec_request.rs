@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::Request,
+    http::{Request, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
@@ -65,6 +65,15 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
 
 pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
     Json(state.reporter.stats_snapshot()).into_response()
+}
+
+pub async fn not_found() -> Response {
+    HecResponse::new(
+        StatusCode::NOT_FOUND,
+        "The requested URL was not found on this server.",
+        404,
+    )
+    .into_response()
 }
 
 async fn process_ack_request(state: Arc<AppState>, request: Request<Body>) -> Response {
@@ -820,6 +829,62 @@ mod tests {
         assert_eq!(
             body.as_ref(),
             br#"{"text":"Error in handling indexed fields","code":15,"invalid-event-number":0}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn array_indexed_field_value_is_accepted() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/event")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .body(Body::from(r#"{"event":"x","fields":{"roles":["admin"]}}"#))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Event).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"{"text":"Success","code":0}"#);
+    }
+
+    #[tokio::test]
+    async fn fields_array_returns_invalid_data_format_code_6() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/event")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .body(Body::from(r#"{"event":"x","fields":["not","object"]}"#))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Event).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"text":"Invalid data format","code":6,"invalid-event-number":0}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_route_returns_splunk_style_json_404() {
+        let response = not_found().await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"text":"The requested URL was not found on this server.","code":404}"#
         );
     }
 }

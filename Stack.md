@@ -1454,7 +1454,11 @@ This section records the current Axum/Hyper boundary and what must move into our
 
 ### 39.1 Axum 404 Challenge
 
-`axum::serve` routes only registered paths through our handlers. Unknown routes are answered by Axum's fallback behavior, not by `HecResponse`. That means today an incorrect `/services/collector/...` path can return a framework-shaped `404` with no HEC code, no HEC JSON body, and no HEC-specific metric.
+`axum::serve` routes only registered paths through our request functions. HECpoc now installs an Axum fallback that returns the Splunk-observed JSON body for unknown paths:
+
+```json
+{"text":"The requested URL was not found on this server.","code":404}
+```
 
 Incorrect HEC paths are paths that look like Splunk HEC traffic but do not match the registered route set. Examples:
 
@@ -1464,7 +1468,7 @@ Incorrect HEC paths are paths that look like Splunk HEC traffic but do not match
 - `/services/collector/foo`
 - `/services/collector/raw/extra`
 
-Decision for now: keep Axum default `404` until Splunk verification shows whether incorrect HEC paths should produce HEC JSON or only HTTP status. If compatibility or observability requires it, add an explicit fallback route under `/services/collector/*path` that returns a controlled response and records an incorrect-path counter.
+Decision for now: return the Splunk-style JSON `404` for every unknown route. This is simple and matches the local Splunk oracle for `/services/collector/not-a-real-endpoint`. If broader non-HEC routes need different treatment later, split the fallback into an HEC-path fallback and a generic application fallback.
 
 ### 39.2 Axum And Hyper Limits Compared With Current HEC Limits
 
@@ -1527,9 +1531,9 @@ Some invalid requests never reach our HEC code:
 | too many headers | Hyper HTTP parser/default limit | likely `431`, no HEC counter | direct Hyper/Axum socket test |
 | huge header bytes | Hyper buffer/header limits | no HEC counter | direct Hyper/Axum socket test |
 | non-text `Authorization` value that reaches handler | HEC auth parser | `401/code3` | unit test exists |
-| non-text `Content-Encoding` value that reaches handler | HEC body parser | `415/code6` current | add handler test |
+| non-text `Content-Encoding` value that reaches handler | HEC body parser | `415/code6` current; Splunk oracle returned generic HTML `415` for unsupported `br` | decide compatibility mode before changing body shape |
 | duplicate headers | HTTP layer stores header map semantics; HEC code currently reads effective values | unclear | staged malicious-input test |
-| conflicting `Content-Length`/chunked | Hyper parser/body machinery | likely before HEC handler or body error | raw socket test later |
+| conflicting or malformed `Content-Length`/chunked | Hyper parser/body machinery | can be rejected before HEC request code; curl-based Splunk script produced `413` HTML, HECpoc produced an empty `400` for the same scripted case, and neither proves raw `Content-Length: nope` behavior | raw socket test later |
 
 Stage 1 tests should stay at handler level for values that can be represented by `Request::builder()`. Stage 2 should use `curl` and `nc`/small Python sockets against the running server for malformed wire input. Stage 3 should wait for owned Hyper accept loop if we need exact header timeout, max header, and malformed-header policy.
 

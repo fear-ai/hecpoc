@@ -180,6 +180,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(hec_request::health).post(hec_request::health),
         )
         .route("/hec/stats", get(hec_request::stats))
+        .fallback(hec_request::not_found)
         .with_state(state)
 }
 

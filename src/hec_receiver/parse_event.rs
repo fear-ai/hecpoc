@@ -63,7 +63,7 @@ pub fn parse_event_body(
             .map_err(|_| event_error(HecError::IncorrectIndex, index, protocol))?;
 
         let fields = validate_fields(envelope.fields)
-            .map_err(|_| event_error(HecError::HandlingIndexedFields, index, protocol))?;
+            .map_err(|error| event_error(error, index, protocol))?;
 
         let raw_bytes_len = raw.len();
         events.push(Event {
@@ -96,18 +96,15 @@ fn validate_index(index: Option<&str>, max_index_len: usize) -> Result<(), ()> {
     Ok(())
 }
 
-fn validate_fields(fields: Option<Value>) -> Result<Option<Value>, ()> {
+fn validate_fields(fields: Option<Value>) -> Result<Option<Value>, HecError> {
     let Some(fields) = fields else {
         return Ok(None);
     };
     let Value::Object(map) = &fields else {
-        return Err(());
+        return Err(HecError::InvalidDataFormat);
     };
-    if map
-        .values()
-        .any(|value| matches!(value, Value::Object(_) | Value::Array(_)))
-    {
-        return Err(());
+    if map.values().any(|value| matches!(value, Value::Object(_))) {
+        return Err(HecError::HandlingIndexedFields);
     }
     Ok(Some(fields))
 }
@@ -190,21 +187,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_array_field_values() {
+    fn accepts_array_field_values() {
         let body = Bytes::from_static(br#"{"event":"x","fields":{"roles":["admin"]}}"#);
-        let outcome = parse_event_body(
+        let events = parse_event_body(
             &body,
             10,
             128,
             None,
             &super::super::protocol::Protocol::default(),
         )
-        .unwrap_err();
-        assert_eq!(outcome.code, 15);
+        .unwrap();
+        assert_eq!(events[0].fields.as_ref().unwrap()["roles"][0], "admin");
     }
 
     #[test]
-    fn rejects_fields_that_are_not_an_object() {
+    fn rejects_fields_that_are_not_an_object_as_invalid_data() {
         let body = Bytes::from_static(br#"{"event":"x","fields":["not","object"]}"#);
         let outcome = parse_event_body(
             &body,
@@ -214,7 +211,7 @@ mod tests {
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
-        assert_eq!(outcome.code, 15);
+        assert_eq!(outcome.code, 6);
     }
 
     #[test]
