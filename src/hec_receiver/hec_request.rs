@@ -540,9 +540,39 @@ mod tests {
             .unwrap();
 
         let response = process_hec_request(state.clone(), request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
 
-        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(parts.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(body.starts_with(b"<!doctype html>"));
+        assert!(body
+            .windows(b"The request your client sent was too large.".len())
+            .any(|window| window == b"The request your client sent was too large."));
         assert_eq!(state.reporter.stats_snapshot().body_too_large, 1);
+    }
+
+    #[tokio::test]
+    async fn unsupported_encoding_returns_splunk_style_html() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/raw")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .header(axum::http::header::CONTENT_ENCODING, "br")
+            .body(Body::from("abc"))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(body.starts_with(b"<!doctype html>"));
+        assert!(body
+            .windows(b"The requested URL does not support the media type sent.".len())
+            .any(|window| window == b"The requested URL does not support the media type sent."));
     }
 
     #[tokio::test]

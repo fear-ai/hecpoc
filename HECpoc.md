@@ -416,11 +416,11 @@ Splunk's current troubleshooting table assigns particular meaning to HEC respons
 | `503 Service Unavailable` | code `9` server busy; codes `18`/`19`/`20` unhealthy; code `23` shutting down | server busy is used for health admission failure, event-count limit, and sink failure; health unhealthy returns `503` with code `18` | split busy, queue-full, shutting-down, and ACK-unavailable when those states exist |
 | `429 Too Many Requests` | code `26` queue at capacity; code `27` ACK channel at capacity | not generated | preferred future mapping for hard queue saturation, instead of overloading `503`/code `9` |
 | `408 Request Timeout` | not listed in Splunk HEC table | body idle/total timeout maps to `408`/code `9` | defensible HTTP, but Splunk-incompatible unless local Splunk proves similar behavior; add slow-client tests and decide |
-| `413 Payload Too Large` | not listed in current Splunk HEC table | advertised or actual over-limit body maps to `413` with HEC code `6` | defensible HTTP, but Splunk-incompatible; test local Splunk before deciding whether to map to `400`/`6`, `429`/`26`, or keep `413` |
-| `415 Unsupported Media Type` | not listed in Splunk HEC table | unsupported `Content-Encoding` maps to `415` with HEC code `6` | defensible HTTP, but Splunk-incompatible; test local Splunk with `br`, malformed gzip, and bad content-type/header values |
+| `413 Payload Too Large` | Splunk local oracle returns generic HTML, not HEC JSON | advertised or actual over-limit body maps to `413` with Splunk-style generic HTML | HEC code remains internal/reporting only, not serialized |
+| `415 Unsupported Media Type` | Splunk local oracle returns generic HTML, not HEC JSON | unsupported `Content-Encoding` maps to `415` with Splunk-style generic HTML | HEC code remains internal/reporting only, not serialized |
 | `404 Not Found` | incorrect path | Axum will return default `404` for unregistered paths, not a deliberate HEC JSON outcome | add explicit 404 route if compatibility requires JSON body or metrics for incorrect URL |
 
-Important conclusion: the current receiver is HEC-shaped but not yet Splunk-status-compatible for all failure classes. The strongest mismatch candidates are body too large, unsupported encoding, timeout, unhealthy health status, and incorrect-path handling.
+Important conclusion: the current receiver is HEC-shaped and now follows the measured Splunk body-shape split for key controlled cases: HEC protocol failures return HEC JSON, while unsupported encoding and body-size failures return generic HTML. Remaining gray areas include timeout, unhealthy health status, malformed wire headers, and ACK/channel behavior.
 
 ### A.2 HEC Return Code Coverage
 
@@ -434,7 +434,7 @@ The current Splunk table lists HEC codes `0` through `27`, with some gaps in fea
 | `3` | `401 Invalid authorization` | `HecError::InvalidAuthorization` | auth unit tests cover parser error; handler test asserts malformed auth response body | covered for wrong scheme; add non-text header handler test if needed |
 | `4` | `403 Invalid token` | `HecError::InvalidToken` | auth unit test covers token-store error; handler test asserts invalid-token response body | covered |
 | `5` | `400 No data` | `HecError::NoData` | raw unit covers blank-only body; handler test asserts blank raw body response | add event empty-body handler test |
-| `6` | `400 Invalid data format` | malformed JSON/body stream/gzip decode; top-level `fields` non-object maps here; internal body-limit paths still reuse code `6` | parser unit covers trailing garbage and fields-array rejection; handler tests assert malformed JSON and top-level fields-array responses; Splunk oracle showed unsupported encoding/body-too-large use non-HEC HTML responses | decide whether body-too-large/unsupported-encoding should intentionally diverge or gain Splunk-style non-HEC bodies |
+| `6` | `400 Invalid data format` | malformed JSON/body stream/gzip decode; top-level `fields` non-object maps here; unsupported encoding/body-too-large keep internal code `6` for reporting but serialize generic HTML like Splunk | parser unit covers trailing garbage and fields-array rejection; handler tests assert malformed JSON, top-level fields-array, unsupported encoding HTML, and body-too-large HTML responses | add raw socket tests for malformed HTTP headers that never reach HEC code |
 | `7` | `400 Incorrect index` | `index` syntax/length validation implemented; allow-list validation absent | parser and handler tests cover invalid syntax and configured length | add token allowed-index policy later |
 | `8` | `500 Internal server error` | absent | none | define when sink/runtime failures should become code `8` instead of `9` |
 | `9` | `503 Server is busy` | max-event limit, health not admitting work, sink failure, timeout uses code `9` | parser unit and handler test cover event-count limit; timeout not covered; handler sink/health busy not covered | add slow-body tests; add health busy and sink-failure response tests; reconsider mapping of max-events and timeout |
@@ -460,9 +460,9 @@ The current Splunk table lists HEC codes `0` through `27`, with some gaps in fea
 Actionable distinction:
 
 - Implemented and handler-tested now: `0`, `2`, `3`, `4`, `5`, `6`, `7`, `9`, `12`, `13`, `14`, `15`, and Splunk-style unknown-route `404`.
-- Implemented and unit/validation-covered but not fully handler-body-covered for every subcase: body stream errors, unsupported encoding, gzip decode failure, body-too-large response body.
+- Implemented and unit/validation-covered but not fully handler-body-covered for every subcase: body stream errors, gzip decode failure, and raw malformed-header cases.
 - Implemented and handler-tested: health codes `17`, `18`, and shutdown code `23`.
-- Present as code paths but weakly invokable or untested at handler level: timeout, health unhealthy, sink failure, unsupported encoding body, body too large body.
+- Present as code paths but weakly invokable or untested at handler level: timeout, health unhealthy, sink failure, and malformed wire-header behavior.
 - Not addressed by design yet: disabled tokens, index allow-list, ACK registry/channel status, query-string auth, queue capacity states, internal-error state, incorrect-path metrics.
 
 ### A.3 Size, Transfer, And Buffer Bounds
@@ -648,7 +648,7 @@ Current and planned outcomes should be described by server state first, then map
 | disabled token | future token lookup with token state | not implemented | future `AUTH_TOKEN_DISABLED`, disabled-token counter | add enabled/disabled token metadata before response mapping |
 | no data | empty event body or raw body with no nonblank lines | `400/code5 No data` | `PARSE_FAILED` for raw blank/no-data path only where currently wired; `REQUEST_FAILED` | add handler-body tests and event-empty test |
 | malformed JSON or bad HEC event body | event decode/validation | `400/code6 Invalid data format` with invalid event number where applicable | `PARSE_FAILED`, `REQUEST_FAILED` | covered by parser tests; add handler matrix |
-| malformed or unsupported body/header encoding | content/header/body/decode stage | malformed content length `400/code6`; unsupported encoding currently `415/code6`; too large currently `413/code6` | `BODY_READ_FAILED`, `BODY_TOO_LARGE`, `GZIP_FAILED` where matched; unsupported encoding lacks a dedicated fact | add `BODY_UNSUPPORTED_ENCODING`; verify Splunk before choosing `400` versus `415` |
+| malformed or unsupported body/header encoding | content/header/body/decode stage | malformed content length may be rejected by HTTP stack before HEC code; unsupported encoding returns `415` generic HTML; too large returns `413` generic HTML | `BODY_READ_FAILED`, `BODY_TOO_LARGE`, `GZIP_FAILED` where matched; unsupported encoding lacks a dedicated fact | add `BODY_UNSUPPORTED_ENCODING`; add raw socket tests for malformed header cases |
 | incorrect index | HEC event metadata validation and startup config validation | `400/code7 Incorrect index` for invalid event syntax, reserved `kvstore`, leading `_`/`-`, empty, or over configured length; configured `hec.default_index` is rejected at startup if invalid; allow-list absent | `REQUEST_FAILED`; currently parse failure fact does not distinguish index reason | add `EVENT_INDEX_INVALID` and token allow-list policy |
 | internal server error | future invariant/config/runtime fault class | not implemented | future sanitized internal-error fact and counter | reserve code `8` for non-policy, non-capacity failures |
 | transient server capacity/dependency pressure | phase not accepting, sink transient failure, future bounded wait/resource pressure | current `503/code9 Server is busy`; timeout currently `408/code9`; max-events currently also `503/code9` | `REQUEST_FAILED`; `SINK_FAILED` for sink path; timeout fact where body timeout occurs | keep code `9` for transient retryable server pressure; move max-events to a policy error after verification |
@@ -669,7 +669,7 @@ Focused tests to add next:
 
 | Test group | Cases |
 |------------|-------|
-| Handler response matrix | event success; event empty body; unsupported encoding body; body too large body; timeout; health busy; sink failure; incorrect path |
+| Handler response matrix | event success; event empty body; unsupported encoding HTML; body too large HTML; timeout; health busy; sink failure; incorrect path |
 | Splunk compatibility probes | local Splunk response for oversized body, unsupported encoding, timeout/slow body, JSON array rejection, raw blank lines, basic auth, query auth disabled, missing channel with ACK disabled/enabled |
 | JSON parser edges | concatenated-object batch, top-level array rejection, scalar top-level, fields top-level non-object, fields null/scalar/object/array values, invalid UTF-8 JSON, huge strings, nesting depth |
 | Raw parser edges | final line no LF, CR-only separators, interior CR, NUL, other C0 controls, invalid UTF-8, very long line, blank-line policy |
@@ -680,7 +680,7 @@ Focused tests to add next:
 Implementation priorities implied by this review:
 
 1. Expand tests before changing response mappings; the receiver needs a stable compatibility baseline.
-2. Compare the same matrix against local Splunk Enterprise before deciding whether `408`, `413`, and `415` remain intentional extensions.
+2. Compare the same matrix against local Splunk Enterprise before deciding whether `408` and malformed wire-header behavior need additional mimicry.
 3. Preserve concatenated-object batches and health-code split because they are direct Splunk-documented behavior and low conceptual risk.
 4. Postpone ACK/channel codes until the ACK feature is real; avoid fake compatibility.
 5. Add raw-byte policy and per-line limits before claiming production resilience.
@@ -713,7 +713,7 @@ Immediate Splunk verification cases:
 | Event required/blank | missing `event`, blank string `event` | validates codes `12` and `13` |
 | Indexed `fields` | flat scalar object, nested object, array value, top-level array | determines code `15` boundaries and whether scalar/null values are accepted |
 | Raw blank behavior | empty/blank raw body | determines whether Splunk indexes zero events or returns `No data` |
-| Oversize/encoding | advertised oversize, unsupported `Content-Encoding`, malformed content length | determines whether our `413`/`415` choices match or intentionally diverge |
+| Oversize/encoding | advertised oversize, unsupported `Content-Encoding`, malformed content length | verifies generic HTML for `413`/`415` and distinguishes handler-owned errors from HTTP parser rejection |
 | Incorrect HEC path | wrong HEC-looking `/services/collector/...` URL | determines plain Axum-style `404` versus HEC JSON or metric behavior |
 
 Postponed Splunk verification cases:
@@ -774,7 +774,7 @@ These prove bounded request processing, not end-to-end queue backpressure. The f
 
 | Area | Current State | What is blocked | Next concrete step |
 |------|--------|-----------------|--------------------|
-| Splunk response gray areas | open | final mapping for `408`, `413`, `415`, unknown route, raw blanks, malformed JSON details | run `scripts/verify_splunk_hec.sh` and record local Splunk version |
+| Splunk response gray areas | partly resolved | final mapping for `408`, ACK/channel states, malformed wire headers, and health subconditions | extend `scripts/verify_splunk_hec.sh` with slow-body and raw-socket probes |
 | Raw policy | open | replay-grade ingest and binary safety claims | decide strict UTF-8, lossy text, or byte-preserving raw event representation |
 | Observability | partially implemented | complete failure reason accounting and benchmark ledger | add bounded reason fields for every `REQUEST_FAILED` path |
 | Lifecycle | handler-level `Phase::Stopping` implemented | graceful drain semantics, shutdown request behavior, accepted-work completion | add graceful-shutdown system test harness |
@@ -1110,8 +1110,8 @@ Inputs exercised:
 | missing auth | generated raw | raw | token required | `401`, code `2` |
 | bad token | generated raw | raw | invalid token | `403`, code `4` |
 | malformed auth | generated raw | raw | invalid authorization | `401`, code `3` |
-| unsupported encoding | generated raw with `Content-Encoding: br` | raw | invalid data / unsupported media | `415`, code `6` |
-| advertised oversize | generated raw with huge `Content-Length` | raw | request too large | `413`, code `6` |
+| unsupported encoding | generated raw with `Content-Encoding: br` | raw | unsupported media | `415`, generic HTML body |
+| advertised oversize | generated raw with huge `Content-Length` | raw | request too large | `413`, generic HTML body |
 | parallel Apache | 32 concurrent requests, 8-way client parallelism | raw | all accepted | all `200` |
 
 Summary stats from `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/stats.json`:
@@ -1170,6 +1170,7 @@ Interpretation limits:
 
 | Issue | Symptom | Fix | Regression coverage |
 |-------|---------|-----|---------------------|
+| Splunk oracle body shape for `413`/`415` | HECpoc returned HEC JSON for unsupported encoding and body-too-large, while local Splunk returned generic HTML | changed `UnsupportedEncoding` and `BodyTooLarge` outcomes to serialize Splunk-style HTML bodies while preserving status and internal reporting facts | `hec_request::unsupported_encoding_returns_splunk_style_html`, `hec_request::advertised_oversize_increments_body_too_large_counter` |
 | Splunk oracle `fields` semantics | local Splunk accepted direct array values in `fields`, rejected nested object values as code `15`, and rejected top-level `fields` array as code `6` | changed field validation to accept direct arrays, reject nested object values with indexed-fields error, and map non-object `fields` to invalid-data | `parse_event::accepts_array_field_values`, `parse_event::rejects_fields_that_are_not_an_object_as_invalid_data`, `hec_request::array_indexed_field_value_is_accepted`, `hec_request::fields_array_returns_invalid_data_format_code_6` |
 | Unknown HEC route body mismatch | local Splunk returned JSON `404` body for `/services/collector/not-a-real-endpoint`; Axum default did not produce the Splunk body | added route fallback returning `{"text":"The requested URL was not found on this server.","code":404}` | `hec_request::unknown_route_returns_splunk_style_json_404` |
 | Raw byte length after lossy UTF-8 | invalid UTF-8 raw lines stored `raw_bytes_len` after replacement-character expansion, not original byte length | added `Event::from_raw_line_with_len` and passed original byte count from raw parser | `parse_raw::lossy_decodes_non_utf8_without_panic` now checks original byte length |
@@ -1213,7 +1214,7 @@ Method problems to fix:
 ### C.7.1 Splunk Oracle Run 2026-05-12
 
 Local Splunk Enterprise HEC was verified by `/Users/walter/Work/Spank/HECpoc/scripts/verify_splunk_hec.sh` with results under `/Users/walter/Work/Spank/HECpoc/results/splunk-verify-20260512T082128Z`.
-After code updates, the same script was run against HECpoc with results under `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T082952Z`.
+After code updates, the same script was run against HECpoc with results under `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T084259Z`.
 
 | Case | Splunk result | Implementation status |
 |------|---------------|-----------------------|
@@ -1231,15 +1232,15 @@ After code updates, the same script was run against HECpoc with results under `/
 | raw final line without LF | `200/code0` | matched |
 | ACK query when ACK disabled | `400/code14` | matched |
 | unknown HEC path | `404`, `{"text":"The requested URL was not found on this server.","code":404}` | fixed to match body/status |
-| unsupported content encoding | `415` HTML body | known divergence: HECpoc returns HEC JSON body today |
-| huge/conflicting `Content-Length` | `413` HTML body; script case is not a true malformed-header test | known divergence and script limitation; HECpoc returns JSON for advertised oversize and an Axum/Hyper empty `400` for the curl malformed-content-length case |
+| unsupported content encoding | `415` HTML body | fixed to match generic HTML body |
+| huge/conflicting `Content-Length` | `413` HTML body; script case is not a true malformed-header test | advertised oversize fixed to generic HTML; malformed/conflicting header remains a script limitation requiring raw socket tests |
 
 | Area | Current Interpretation | Required Action |
 |------|------------------------|-----------------|
 | Splunk oracle replay | one local run now gives concrete behavior for fields, stacked JSON, raw blank/final-line, ACK-disabled, unknown path, 413, and 415 | keep result directory; rerun after changing body-limit/encoding response policy |
 | benchmark failure accounting | five unexplained request failures make performance counters untrustworthy | rerun with `hec.receiver=debug`, stats before/after each `ab` stage, and response capture for non-200s |
-| unsupported encoding response | Splunk returns generic HTML `415`; HECpoc returns JSON `415/code6` | decide whether compatibility mode should emit non-HEC HTML or keep JSON as product behavior |
-| body-too-large response | Splunk returns generic HTML `413`; HECpoc returns JSON `413/code6` | decide whether compatibility mode should emit non-HEC HTML; add raw socket tests for malformed header cases |
+| unsupported encoding response | Splunk returns generic HTML `415`; HECpoc now does too for handler-owned unsupported encoding | add reason-specific reporting fact if needed |
+| body-too-large response | Splunk returns generic HTML `413`; HECpoc now does too for handler-owned body-too-large | add raw socket tests for malformed header cases |
 | raw invalid UTF-8 | lossy acceptance is useful but not replay-grade | document raw text policy and add byte-preserving mode before replay claims |
 | blank raw lines | current no-data behavior needs Splunk comparison | compare Splunk raw HEC behavior and decide skip, preserve, or reject semantics |
 | direct file success | written, flushed, and durable are different claims | define direct-file commit state and make response/reporting use that state |
@@ -1269,7 +1270,7 @@ Validation tasks:
 Design tasks:
 
 1. Decide raw text versus raw bytes as an explicit product policy.
-2. Decide HEC response compatibility for body-too-large, unsupported encoding, ACK disabled, and raw blank-line behavior.
+2. Decide HEC response compatibility for timeout, malformed wire headers, ACK channel states, and raw blank-line edge cases not covered by the current oracle run.
 3. Define sink commit states for drop, capture, flushed, and durable modes.
 4. Define stats schema with bounded reason labels before Prometheus or external metrics.
 5. Decide whether Reporter should own output routing only, or also a source/fact runtime filter table for non-tracing outputs.

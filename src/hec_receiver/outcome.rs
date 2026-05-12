@@ -1,6 +1,6 @@
 use axum::{
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{Html, IntoResponse, Response},
     Json,
 };
 use serde::Serialize;
@@ -80,15 +80,21 @@ impl HecError {
                 "Error in handling indexed fields",
                 protocol.handling_indexed_fields,
             ),
-            Self::UnsupportedEncoding => HecResponse::new(
+            Self::UnsupportedEncoding => HecResponse::html(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "Invalid data format",
+                "Unsupported Media Type",
                 protocol.invalid_data_format,
+                "415 Unsupported Media Type",
+                "Unsupported Media Type",
+                "The requested URL does not support the media type sent.",
             ),
-            Self::BodyTooLarge => HecResponse::new(
+            Self::BodyTooLarge => HecResponse::html(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Request entity too large",
                 protocol.invalid_data_format,
+                "413 Payload Too Large",
+                "Payload Too Large",
+                "The request your client sent was too large.",
             ),
             Self::Timeout => HecResponse::new(
                 StatusCode::REQUEST_TIMEOUT,
@@ -110,6 +116,8 @@ pub struct HecResponse {
     pub status: StatusCode,
     pub text: &'static str,
     pub code: u16,
+    #[serde(skip)]
+    body: ResponseBody,
     #[serde(skip_serializing_if = "Option::is_none", rename = "ackId")]
     pub ack_id: Option<u64>,
     #[serde(
@@ -119,12 +127,45 @@ pub struct HecResponse {
     pub invalid_event_number: Option<usize>,
 }
 
+#[derive(Debug, Clone)]
+enum ResponseBody {
+    HecJson,
+    Html {
+        title: &'static str,
+        heading: &'static str,
+        message: &'static str,
+    },
+}
+
 impl HecResponse {
     pub fn new(status: StatusCode, text: &'static str, code: u16) -> Self {
         Self {
             status,
             text,
             code,
+            body: ResponseBody::HecJson,
+            ack_id: None,
+            invalid_event_number: None,
+        }
+    }
+
+    fn html(
+        status: StatusCode,
+        text: &'static str,
+        code: u16,
+        title: &'static str,
+        heading: &'static str,
+        message: &'static str,
+    ) -> Self {
+        Self {
+            status,
+            text,
+            code,
+            body: ResponseBody::Html {
+                title,
+                heading,
+                message,
+            },
             ack_id: None,
             invalid_event_number: None,
         }
@@ -143,6 +184,19 @@ impl HecResponse {
 impl IntoResponse for HecResponse {
     fn into_response(self) -> Response {
         let status = self.status;
-        (status, Json(self)).into_response()
+        match self.body {
+            ResponseBody::HecJson => (status, Json(self)).into_response(),
+            ResponseBody::Html {
+                title,
+                heading,
+                message,
+            } => (
+                status,
+                Html(format!(
+                    "<!doctype html><html><head><meta http-equiv=\"content-type\" content=\"text/html; charset=UTF-8\"><title>{title}</title></head><body><h1>{heading}</h1><p>{message}</p></body></html>\r\n"
+                )),
+            )
+                .into_response(),
+        }
     }
 }

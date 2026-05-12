@@ -1531,9 +1531,9 @@ Some invalid requests never reach our HEC code:
 | too many headers | Hyper HTTP parser/default limit | likely `431`, no HEC counter | direct Hyper/Axum socket test |
 | huge header bytes | Hyper buffer/header limits | no HEC counter | direct Hyper/Axum socket test |
 | non-text `Authorization` value that reaches handler | HEC auth parser | `401/code3` | unit test exists |
-| non-text `Content-Encoding` value that reaches handler | HEC body parser | `415/code6` current; Splunk oracle returned generic HTML `415` for unsupported `br` | decide compatibility mode before changing body shape |
+| non-text or unsupported `Content-Encoding` value that reaches request code | HEC body parser | unsupported `br` returns Splunk-style generic HTML `415`; non-text header bytes still map through parser rejection when representable | add dedicated reporting reason if needed |
 | duplicate headers | HTTP layer stores header map semantics; HEC code currently reads effective values | unclear | staged malicious-input test |
-| conflicting or malformed `Content-Length`/chunked | Hyper parser/body machinery | can be rejected before HEC request code; curl-based Splunk script produced `413` HTML, HECpoc produced an empty `400` for the same scripted case, and neither proves raw `Content-Length: nope` behavior | raw socket test later |
+| conflicting or malformed `Content-Length`/chunked | Hyper parser/body machinery | can be rejected before HEC request code; curl-based Splunk script produced `413` HTML, HECpoc may produce parser-level empty `400` for malformed/conflicting cases, and handler-owned oversize now returns generic HTML `413` | raw socket test later |
 
 Stage 1 tests should stay at handler level for values that can be represented by `Request::builder()`. Stage 2 should use `curl` and `nc`/small Python sockets against the running server for malformed wire input. Stage 3 should wait for owned Hyper accept loop if we need exact header timeout, max header, and malformed-header policy.
 
