@@ -3,8 +3,9 @@ mod auth;
 mod body;
 mod config;
 mod event;
-mod handler;
 mod health;
+mod hec_request;
+mod index;
 mod outcome;
 mod parse_event;
 mod parse_raw;
@@ -14,4 +15,6 @@ mod sink;
 mod stats;
 
 pub use app::{router, AppState};
+pub use auth::TokenRegistry;
 pub use config::{ConfigAction, ObserveConfig, ObserveFormat, RuntimeConfig};
+pub use health::Phase;

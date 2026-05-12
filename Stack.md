@@ -78,7 +78,7 @@ accept socket
 Two details are important:
 
 1. The handler must not use Axum's `Bytes` extractor for HEC event/raw endpoints. `Bytes` means Axum has already collected the whole body before auth and body-limit decisions are made.
-2. The body reader must enforce both wire-byte and decoded-byte limits. Gzip turns "body size" into two separate resources.
+2. The body reader must enforce both HTTP-body-byte and decoded-byte limits. Gzip turns "body size" into two separate resources.
 
 ## 5. Proposed Source Layout
 
@@ -90,7 +90,7 @@ src/
   hec_receiver/
     mod.rs
     app.rs          # Axum router assembly and State
-    handler.rs      # HEC request phase orchestration
+    hec_request.rs  # route adapters and HEC request phase orchestration
     auth.rs         # Authorization parser and token validation
     body.rs         # bounded read, gzip decode, timeout helpers
     outcome.rs      # HEC response codes and JSON response builder
@@ -101,7 +101,7 @@ src/
     health.rs       # HEC phase and health response
 ```
 
-The key design constraint is that `handler.rs` owns the ordering. Helpers should not secretly consume request bodies, mutate response status, or call the sink.
+The key design constraint is that `hec_request.rs` owns the ordering. Helpers should not secretly consume request bodies, mutate response status, or call the sink.
 
 ## 6. Tokio Use
 
@@ -234,7 +234,7 @@ Tower's deprecated `RequireAuthorization` / built-in Bearer helper is too small 
 
 That omits HEC's `Splunk` scheme, HEC JSON response body, missing-vs-malformed-vs-invalid-token distinction, token metadata, disabled-token state, index constraints, and token redaction policy.
 
-`AsyncRequireAuthorizationLayer` is more flexible and can attach request extensions, but it still makes auth a Tower layer. For HECpoc, an explicit `auth::authenticate(&HeaderMap, &TokenStore) -> Result<AuthContext, HecError>` is easier to test and reason about.
+`AsyncRequireAuthorizationLayer` is more flexible and can attach request extensions, but it still makes auth a Tower layer. For HECpoc, an explicit `auth::authenticate(&HeaderMap, &TokenRegistry) -> Result<AuthContext, HecError>` is easier to test and reason about.
 
 ### 9.3 What Other Projects Do
 
@@ -261,7 +261,7 @@ HEC gzip support should:
 - reject malformed gzip;
 - enforce decompressed-size limit;
 - avoid unbounded allocation;
-- avoid leaking decompressor errors into wire responses.
+- avoid leaking decompressor errors into HTTP responses.
 
 ### 10.2 Why Not `tower_http::RequestDecompression`
 
@@ -289,13 +289,13 @@ fn parse_content_encoding(headers: &HeaderMap) -> Result<Encoding, HecError>;
 
 async fn read_limited_body(
     body: Body,
-    max_wire_bytes: usize,
+    max_http_body_bytes: usize,
     idle_timeout: Duration,
     total_timeout: Duration,
 ) -> Result<Bytes, HecError>;
 
 fn decode_body_limited(
-    wire: Bytes,
+    http_body: Bytes,
     encoding: Encoding,
     max_decoded_bytes: usize,
 ) -> Result<Bytes, HecError>;
@@ -312,7 +312,7 @@ HECpoc needs at least three body-related limits:
 | Limit | Applies to | Reason |
 |---|---|---|
 | `max_content_length` | advertised `Content-Length` | cheap early rejection |
-| `max_wire_body_bytes` | actual bytes read from HTTP body | chunked/no-length defense |
+| `max_http_body_bytes` | actual bytes read from HTTP body | chunked/no-length defense |
 | `max_decoded_body_bytes` | decompressed bytes | gzip bomb defense |
 
 A fourth limit may be useful later:
@@ -374,7 +374,7 @@ Use direct Tokio timeouts:
 
 ```rust
 let body = tokio::time::timeout(total_body_timeout, async {
-    read_body_with_idle_timeout(body, max_wire_bytes, idle_timeout).await
+    read_body_with_idle_timeout(body, max_http_body_bytes, idle_timeout).await
 }).await;
 ```
 
@@ -802,10 +802,12 @@ compiled defaults < TOML file < command line < environment
 | Config file | none | `HEC_CONFIG` | none | Optional TOML file path. |
 | Listen address | `hec.addr` | `HEC_ADDR` | `127.0.0.1:18088` | Socket address for the receiver. Supports IPv4 or IPv6 socket syntax. |
 | Token | `hec.token` | `HEC_TOKEN`, fallback `SPANK_HEC_TOKEN` | `dev-token` | Accepted Splunk HEC token. |
+| Default index | `hec.default_index` | `HEC_DEFAULT_INDEX` | none | Token-scoped default applied when event/raw input omits `index`. |
 | Capture path | `hec.capture` | `HEC_CAPTURE` | none | Optional JSONL accepted-event capture sink. Absence uses drop sink. |
-| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `1_048_576` | Maximum advertised and actually read request bytes before decompression. |
-| Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `4_194_304` | Maximum bytes after gzip decompression. |
+| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `1_000_000` | Maximum advertised and actually read request bytes before decompression. |
+| Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `4_000_000` | Maximum bytes after gzip decompression. |
 | Max events | `limits.max_events` | `HEC_MAX_EVENTS` | `100_000` | Maximum HEC events in one request body. |
+| Max index length | `limits.max_index_len` | `HEC_MAX_INDEX_LEN` | `128` | Maximum byte length for event `index` and configured default index. |
 | Idle body timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `5s` | Maximum time waiting for a body frame. |
 | Total body timeout | `limits.total_timeout` | `HEC_TOTAL_TIMEOUT` | `30s` | Maximum wall time to read the request body. |
 | Gzip buffer bytes | `limits.gzip_buffer_bytes` | `HEC_GZIP_BUFFER_BYTES` | `8_192` | Scratch buffer used while decoding gzip. |
@@ -993,7 +995,7 @@ loop {
 
 That fallback is useful later, but the current Axum layer avoids hand-written HTTP serving while protocol-critical HEC behavior remains in our handler code.
 
-`/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` owns the application receive pipeline:
+`/Users/walter/Work/Spank/HECpoc/src/hec_receiver/hec_request.rs` owns the application receive pipeline:
 
 1. health capacity;
 2. auth header parse and token check;
@@ -1218,7 +1220,7 @@ Policy must include both values and actions. Suggested policy dimensions:
 | Sink failure | sink retry policy | 503, retry bounded, spill, drop with counter | 503 for request-scoped failure. |
 | Parser optional fields | schema policy | preserve raw only, parse shallow, parse deep later | preserve raw plus shallow HEC fields. |
 
-These policies should be represented as data, not hidden in routine names such as `drop_only`. Names such as `SinkMode::Drop`, `SinkMode::CaptureFile`, `CapacityPolicy`, `OverflowAction`, and `MalformedEventPolicy` are preferable because the source, token, thread, or flow can carry flags for later interpretation.
+These policies should be represented as data, not hidden in incidental routine names. Names such as `SinkMode::DropEvents`, `SinkMode::CaptureFile`, `CapacityPolicy`, `OverflowAction`, and `MalformedEventPolicy` are preferable because the source, token, thread, or flow can carry flags for later interpretation.
 
 ## 32. Stack Output After Auth And Content Decode
 
@@ -1470,16 +1472,16 @@ Current HECpoc request body policy is implemented inside the HEC handler:
 
 | Layer | Current method | Current/default value | Why it exists |
 |-------|----------------|-----------------------|---------------|
-| Advertised body | `Content-Length` parse and cap | `HEC_MAX_BYTES=1_048_576` | reject before reading known oversized bodies |
-| Wire body | bounded accumulation while polling body frames | `HEC_MAX_BYTES=1_048_576` | stop unknown-length/chunked bodies from growing unbounded |
-| Decoded body | identity/gzip decoded cap | `HEC_MAX_DECODED_BYTES=4_194_304` | stop gzip expansion attacks |
+| Advertised body | `Content-Length` parse and cap | `HEC_MAX_BYTES=1_000_000` | reject before reading known oversized bodies |
+| HTTP body | bounded accumulation while polling body frames | `HEC_MAX_BYTES=1_000_000` | stop unknown-length/chunked bodies from growing unbounded |
+| Decoded body | identity/gzip decoded cap | `HEC_MAX_DECODED_BYTES=4_000_000` | stop gzip expansion attacks |
 | Event count | parser count cap | `HEC_MAX_EVENTS=100_000` | stop tiny-event amplification |
 | Body idle timeout | timeout around each body frame | `HEC_IDLE_TIMEOUT=5s` | stop stalled body senders |
 | Body total timeout | timeout around full body read | `HEC_TOTAL_TIMEOUT=30s` | stop indefinitely slow large requests |
 
 Axum's `serve` is intentionally simple and does not expose connection/server configuration knobs. Hyper direct HTTP/1 serving exposes useful controls such as `max_headers`, `header_read_timeout`, `max_buf_size`, `keep_alive`, and malformed-header behavior. Tower HTTP's `RequestBodyLimitLayer` can generate `413` before a handler runs when `Content-Length` is too large, and can wrap unknown-length bodies with a limiting body.
 
-Recommendation: keep HEC-owned body limits for now. They produce HEC-shaped JSON outcomes, distinguish advertised/wire/decoded limits, and keep gzip policy explicit. Do not replace them with generic Tower body limits until Splunk status/code mapping is decided. Move to owned Hyper/hyper-util serving when header timeout, header count, socket backlog, peer accounting, or connection culling become P0 requirements.
+Recommendation: keep HEC-owned body limits for now. They produce HEC-shaped JSON outcomes, distinguish advertised/HTTP body/decoded limits, and keep gzip policy explicit. Do not replace them with generic Tower body limits until Splunk status/code mapping is decided. Move to owned Hyper/hyper-util serving when header timeout, header count, socket backlog, peer accounting, or connection culling become P0 requirements.
 
 ### 39.3 Timeout Classes
 
@@ -1556,10 +1558,10 @@ Practical policy for HECpoc:
 
 | Case | Initial behavior | Future compatibility behavior |
 |------|------------------|-------------------------------|
-| no `index` supplied | keep `event.index = None`; sink/store may apply a configured default later | per-token default index if configured; otherwise receiver default such as `main` only if product policy wants Splunk-like defaulting |
+| no `index` supplied | apply token-scoped `hec.default_index` when configured; otherwise keep `event.index = None` | per-token default index remains metadata, not a storage-path decision; optional platform default such as `main` requires an explicit product policy |
 | `index` supplied and no allow-list configured | accept and preserve the exact value | same, unless product mode requires strict known-index validation |
 | `index` supplied and allow-list configured | not implemented yet | accept only if exact/canonical index is allowed for the token; reject unknown/empty/disallowed values with `400/code7` |
-| index naming syntax | not validated yet | add conservative syntax and length bounds only after local Splunk verification; do not invent stricter names than Splunk unless explicitly running in Spank-strict mode |
+| index naming syntax | validates Splunk-compatible syntax and configurable byte length, default `128`; `hec.default_index` is validated at startup with the same helper | keep `128` configurable; enforce allow-list separately when token metadata exists |
 | physical storage routing | not tied to `index` yet | keep logical `index` separate from bucket/file layout; use it for metadata pruning and later sealed-bucket indexing, not as a mandatory ingest-time database split |
 
 External references:
@@ -1572,8 +1574,12 @@ External references:
 Implementation status:
 
 - `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/event.rs` stores `index: Option<String>`.
-- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_event.rs` parses event-envelope `index` but does not validate it.
-- Code `7` is not yet represented in `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` or `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs`.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/auth.rs` represents the configured token as a token record with the HEC token secret and token-scoped `default_index`.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/index.rs` owns shared index-name validation for config and event parsing.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_event.rs` parses event-envelope `index`, falls back to token default index when absent, and validates syntax/length before accepting the event.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_raw.rs` applies token default index to raw endpoint events when configured.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/config.rs` exposes `hec.default_index` and `limits.max_index_len`, default `128`.
+- Code `7` is represented in `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` and `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs`; tests cover parser and handler paths.
 
 ### 40.2 Shippers, Vendors, And What They Exercise
 
@@ -1667,7 +1673,7 @@ Code `23` is now implemented at the handler phase boundary:
 
 - `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/protocol.rs` defines `server_shutting_down = 23`.
 - `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/outcome.rs` maps `HecError::ServerShuttingDown` to `503` and text `Server is shutting down`.
-- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/handler.rs` maps `Phase::Stopping` to code `23` for health and new ingest requests.
+- `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/hec_request.rs` maps `Phase::Stopping` to code `23` for health and new ingest requests.
 
 Remaining validation: a real-server graceful-shutdown test must prove that new requests receive `503/code23` while already accepted requests are drained to the chosen commit boundary.
 

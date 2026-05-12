@@ -7,13 +7,14 @@ use serde::{Deserialize, Serialize};
 use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 use thiserror::Error;
 
-use super::{app::Limits, protocol::Protocol, report::ReportOutputs};
+use super::{app::Limits, index::is_valid_index_name, protocol::Protocol, report::ReportOutputs};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:18088";
 const DEFAULT_TOKEN: &str = "dev-token";
-const DEFAULT_MAX_BYTES: usize = 1_048_576;
+const DEFAULT_MAX_BYTES: usize = 1_000_000;
 const DEFAULT_MAX_DECODED_BYTES: usize = 4 * DEFAULT_MAX_BYTES;
 const DEFAULT_MAX_EVENTS: usize = 100_000;
+const DEFAULT_MAX_INDEX_LEN: usize = 128;
 const DEFAULT_IDLE_TIMEOUT: &str = "5s";
 const DEFAULT_TOTAL_TIMEOUT: &str = "30s";
 const DEFAULT_GZIP_BUFFER_BYTES: usize = 8_192;
@@ -24,10 +25,12 @@ const ENV_CONFIG: &str = "HEC_CONFIG";
 const ENV_ADDR: &str = "HEC_ADDR";
 const ENV_TOKEN: &str = "HEC_TOKEN";
 const ENV_SPANK_TOKEN: &str = "SPANK_HEC_TOKEN";
+const ENV_DEFAULT_INDEX: &str = "HEC_DEFAULT_INDEX";
 const ENV_CAPTURE: &str = "HEC_CAPTURE";
 const ENV_MAX_BYTES: &str = "HEC_MAX_BYTES";
 const ENV_MAX_DECODED_BYTES: &str = "HEC_MAX_DECODED_BYTES";
 const ENV_MAX_EVENTS: &str = "HEC_MAX_EVENTS";
+const ENV_MAX_INDEX_LEN: &str = "HEC_MAX_INDEX_LEN";
 const ENV_IDLE_TIMEOUT: &str = "HEC_IDLE_TIMEOUT";
 const ENV_TOTAL_TIMEOUT: &str = "HEC_TOTAL_TIMEOUT";
 const ENV_GZIP_BUFFER_BYTES: &str = "HEC_GZIP_BUFFER_BYTES";
@@ -48,6 +51,7 @@ const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
 pub struct RuntimeConfig {
     pub addr: SocketAddr,
     pub token: String,
+    pub default_index: Option<String>,
     pub capture_path: Option<String>,
     pub limits: Limits,
     pub protocol: Protocol,
@@ -152,6 +156,9 @@ pub struct Cli {
     pub token: Option<String>,
 
     #[arg(long)]
+    pub default_index: Option<String>,
+
+    #[arg(long)]
     pub capture: Option<String>,
 
     #[arg(long)]
@@ -162,6 +169,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub max_events: Option<usize>,
+
+    #[arg(long)]
+    pub max_index_len: Option<usize>,
 
     #[arg(long)]
     pub idle_timeout: Option<String>,
@@ -191,6 +201,9 @@ pub struct Cli {
     pub protocol_invalid_data_format: Option<u16>,
 
     #[arg(long)]
+    pub protocol_incorrect_index: Option<u16>,
+
+    #[arg(long)]
     pub protocol_server_busy: Option<u16>,
 
     #[arg(long)]
@@ -198,6 +211,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub protocol_event_field_blank: Option<u16>,
+
+    #[arg(long)]
+    pub protocol_ack_disabled: Option<u16>,
 
     #[arg(long)]
     pub protocol_handling_indexed_fields: Option<u16>,
@@ -287,6 +303,7 @@ impl Cli {
             hec: Some(HecDoc {
                 addr: self.addr.clone(),
                 token: self.token.clone(),
+                default_index: self.default_index.clone(),
                 capture: self.capture.clone(),
             })
             .filter(has_hec_values),
@@ -294,6 +311,7 @@ impl Cli {
                 max_bytes: self.max_bytes,
                 max_decoded_bytes: self.max_decoded_bytes,
                 max_events: self.max_events,
+                max_index_len: self.max_index_len,
                 idle_timeout: self.idle_timeout.clone(),
                 total_timeout: self.total_timeout.clone(),
                 gzip_buffer_bytes: self.gzip_buffer_bytes,
@@ -306,9 +324,11 @@ impl Cli {
                 invalid_token: self.protocol_invalid_token,
                 no_data: self.protocol_no_data,
                 invalid_data_format: self.protocol_invalid_data_format,
+                incorrect_index: self.protocol_incorrect_index,
                 server_busy: self.protocol_server_busy,
                 event_field_required: self.protocol_event_field_required,
                 event_field_blank: self.protocol_event_field_blank,
+                ack_disabled: self.protocol_ack_disabled,
                 handling_indexed_fields: self.protocol_handling_indexed_fields,
                 health_ok: self.protocol_health_ok,
                 health_unhealthy: self.protocol_health_unhealthy,
@@ -348,12 +368,14 @@ impl ConfigDoc {
             hec: Some(HecDoc {
                 addr: Some(DEFAULT_ADDR.to_string()),
                 token: Some(DEFAULT_TOKEN.to_string()),
+                default_index: None,
                 capture: None,
             }),
             limits: Some(LimitsDoc {
                 max_bytes: Some(DEFAULT_MAX_BYTES),
                 max_decoded_bytes: Some(DEFAULT_MAX_DECODED_BYTES),
                 max_events: Some(DEFAULT_MAX_EVENTS),
+                max_index_len: Some(DEFAULT_MAX_INDEX_LEN),
                 idle_timeout: Some(DEFAULT_IDLE_TIMEOUT.to_string()),
                 total_timeout: Some(DEFAULT_TOTAL_TIMEOUT.to_string()),
                 gzip_buffer_bytes: Some(DEFAULT_GZIP_BUFFER_BYTES),
@@ -376,6 +398,7 @@ impl ConfigDoc {
             hec: Some(HecDoc {
                 addr: env_string(ENV_ADDR),
                 token: env_string(ENV_TOKEN).or_else(|| env_string(ENV_SPANK_TOKEN)),
+                default_index: env_string(ENV_DEFAULT_INDEX),
                 capture: env_string(ENV_CAPTURE),
             })
             .filter(has_hec_values),
@@ -383,6 +406,7 @@ impl ConfigDoc {
                 max_bytes: env_parse(ENV_MAX_BYTES, "limits.max_bytes")?,
                 max_decoded_bytes: env_parse(ENV_MAX_DECODED_BYTES, "limits.max_decoded_bytes")?,
                 max_events: env_parse(ENV_MAX_EVENTS, "limits.max_events")?,
+                max_index_len: env_parse(ENV_MAX_INDEX_LEN, "limits.max_index_len")?,
                 idle_timeout: env_string(ENV_IDLE_TIMEOUT),
                 total_timeout: env_string(ENV_TOTAL_TIMEOUT),
                 gzip_buffer_bytes: env_parse(ENV_GZIP_BUFFER_BYTES, "limits.gzip_buffer_bytes")?,
@@ -401,6 +425,7 @@ impl ConfigDoc {
                     "HEC_INVALID_DATA_FORMAT",
                     "protocol.invalid_data_format",
                 )?,
+                incorrect_index: env_parse("HEC_INCORRECT_INDEX", "protocol.incorrect_index")?,
                 server_busy: env_parse("HEC_SERVER_BUSY", "protocol.server_busy")?,
                 event_field_required: env_parse(
                     "HEC_EVENT_FIELD_REQUIRED",
@@ -410,6 +435,7 @@ impl ConfigDoc {
                     "HEC_EVENT_FIELD_BLANK",
                     "protocol.event_field_blank",
                 )?,
+                ack_disabled: env_parse("HEC_ACK_DISABLED", "protocol.ack_disabled")?,
                 handling_indexed_fields: env_parse(
                     "HEC_HANDLING_INDEXED_FIELDS",
                     "protocol.handling_indexed_fields",
@@ -444,12 +470,14 @@ impl ConfigDoc {
                 } else {
                     config.token.clone()
                 }),
+                default_index: config.default_index.clone(),
                 capture: config.capture_path.clone(),
             }),
             limits: Some(LimitsDoc {
-                max_bytes: Some(config.limits.max_wire_body_bytes),
+                max_bytes: Some(config.limits.max_http_body_bytes),
                 max_decoded_bytes: Some(config.limits.max_decoded_body_bytes),
                 max_events: Some(config.limits.max_events_per_request),
+                max_index_len: Some(config.limits.max_index_len),
                 idle_timeout: Some(
                     humantime::format_duration(config.limits.body_idle_timeout).to_string(),
                 ),
@@ -482,6 +510,9 @@ impl ConfigDoc {
 
         let token = required(hec.token, "hec.token")?;
         validate_token(&token)?;
+        if matches!(hec.default_index.as_deref(), Some("")) {
+            return invalid("hec.default_index", "default index cannot be empty");
+        }
         if matches!(hec.capture.as_deref(), Some("")) {
             return invalid("hec.capture", "capture path cannot be empty");
         }
@@ -489,6 +520,7 @@ impl ConfigDoc {
         let max_bytes = required(limits.max_bytes, "limits.max_bytes")?;
         let max_decoded_bytes = required(limits.max_decoded_bytes, "limits.max_decoded_bytes")?;
         let max_events = required(limits.max_events, "limits.max_events")?;
+        let max_index_len = required(limits.max_index_len, "limits.max_index_len")?;
         let idle_timeout = parse_duration(
             required(limits.idle_timeout, "limits.idle_timeout")?,
             "limits.idle_timeout",
@@ -511,6 +543,17 @@ impl ConfigDoc {
         if max_events == 0 {
             return invalid("limits.max_events", "must be greater than zero");
         }
+        if max_index_len == 0 {
+            return invalid("limits.max_index_len", "must be greater than zero");
+        }
+        if let Some(default_index) = hec.default_index.as_deref() {
+            if !is_valid_index_name(default_index, max_index_len) {
+                return invalid(
+                    "hec.default_index",
+                    "must use lowercase ASCII letters, digits, underscore, or dash; cannot start with '_' or '-'; cannot contain 'kvstore'; cannot exceed limits.max_index_len",
+                );
+            }
+        }
         if idle_timeout.is_zero() {
             return invalid("limits.idle_timeout", "must be greater than zero");
         }
@@ -531,12 +574,14 @@ impl ConfigDoc {
         Ok(RuntimeConfig {
             addr,
             token,
+            default_index: hec.default_index,
             capture_path: hec.capture,
             limits: Limits {
                 max_content_length: max_bytes,
-                max_wire_body_bytes: max_bytes,
+                max_http_body_bytes: max_bytes,
                 max_decoded_body_bytes: max_decoded_bytes,
                 max_events_per_request: max_events,
+                max_index_len,
                 body_idle_timeout: idle_timeout,
                 body_total_timeout: total_timeout,
                 gzip_buffer_bytes,
@@ -555,6 +600,8 @@ struct HecDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    default_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     capture: Option<String>,
 }
 
@@ -567,6 +614,8 @@ struct LimitsDoc {
     max_decoded_bytes: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_events: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_index_len: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     idle_timeout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -591,11 +640,15 @@ struct ProtocolDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     invalid_data_format: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    incorrect_index: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     server_busy: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     event_field_required: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     event_field_blank: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_disabled: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     handling_indexed_fields: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -687,9 +740,11 @@ impl ProtocolDoc {
             invalid_token: Some(protocol.invalid_token),
             no_data: Some(protocol.no_data),
             invalid_data_format: Some(protocol.invalid_data_format),
+            incorrect_index: Some(protocol.incorrect_index),
             server_busy: Some(protocol.server_busy),
             event_field_required: Some(protocol.event_field_required),
             event_field_blank: Some(protocol.event_field_blank),
+            ack_disabled: Some(protocol.ack_disabled),
             handling_indexed_fields: Some(protocol.handling_indexed_fields),
             health_ok: Some(protocol.health_ok),
             health_unhealthy: Some(protocol.health_unhealthy),
@@ -711,6 +766,9 @@ impl ProtocolDoc {
             invalid_data_format: self
                 .invalid_data_format
                 .expect("default protocol invalid_data_format"),
+            incorrect_index: self
+                .incorrect_index
+                .expect("default protocol incorrect_index"),
             server_busy: self.server_busy.expect("default protocol server_busy"),
             event_field_required: self
                 .event_field_required
@@ -718,6 +776,7 @@ impl ProtocolDoc {
             event_field_blank: self
                 .event_field_blank
                 .expect("default protocol event_field_blank"),
+            ack_disabled: self.ack_disabled.expect("default protocol ack_disabled"),
             handling_indexed_fields: self
                 .handling_indexed_fields
                 .expect("default protocol handling_indexed_fields"),
@@ -733,13 +792,17 @@ impl ProtocolDoc {
 }
 
 fn has_hec_values(value: &HecDoc) -> bool {
-    value.addr.is_some() || value.token.is_some() || value.capture.is_some()
+    value.addr.is_some()
+        || value.token.is_some()
+        || value.default_index.is_some()
+        || value.capture.is_some()
 }
 
 fn has_limit_values(value: &LimitsDoc) -> bool {
     value.max_bytes.is_some()
         || value.max_decoded_bytes.is_some()
         || value.max_events.is_some()
+        || value.max_index_len.is_some()
         || value.idle_timeout.is_some()
         || value.total_timeout.is_some()
         || value.gzip_buffer_bytes.is_some()
@@ -752,9 +815,11 @@ fn has_protocol_values(value: &ProtocolDoc) -> bool {
         || value.invalid_token.is_some()
         || value.no_data.is_some()
         || value.invalid_data_format.is_some()
+        || value.incorrect_index.is_some()
         || value.server_busy.is_some()
         || value.event_field_required.is_some()
         || value.event_field_blank.is_some()
+        || value.ack_disabled.is_some()
         || value.handling_indexed_fields.is_some()
         || value.health_ok.is_some()
         || value.health_unhealthy.is_some()
@@ -849,10 +914,12 @@ mod tests {
         "HEC_ADDR",
         "HEC_TOKEN",
         "SPANK_HEC_TOKEN",
+        "HEC_DEFAULT_INDEX",
         "HEC_CAPTURE",
         "HEC_MAX_BYTES",
         "HEC_MAX_DECODED_BYTES",
         "HEC_MAX_EVENTS",
+        "HEC_MAX_INDEX_LEN",
         "HEC_IDLE_TIMEOUT",
         "HEC_TOTAL_TIMEOUT",
         "HEC_GZIP_BUFFER_BYTES",
@@ -869,9 +936,11 @@ mod tests {
         "HEC_INVALID_TOKEN",
         "HEC_NO_DATA",
         "HEC_INVALID_DATA_FORMAT",
+        "HEC_INCORRECT_INDEX",
         "HEC_SERVER_BUSY",
         "HEC_EVENT_FIELD_REQUIRED",
         "HEC_EVENT_FIELD_BLANK",
+        "HEC_ACK_DISABLED",
         "HEC_HANDLING_INDEXED_FIELDS",
         "HEC_HEALTH_OK",
         "HEC_HEALTH_UNHEALTHY",
@@ -886,6 +955,7 @@ mod tests {
 [hec]
 addr = "127.0.0.1:18111"
 token = "file-token"
+default_index = "app_logs"
 capture = "/tmp/hec-events.jsonl"
 
 [limits]
@@ -920,12 +990,13 @@ stats = true
 
         assert_eq!(config.addr.to_string(), "127.0.0.1:18111");
         assert_eq!(config.token, "file-token");
+        assert_eq!(config.default_index.as_deref(), Some("app_logs"));
         assert_eq!(
             config.capture_path.as_deref(),
             Some("/tmp/hec-events.jsonl")
         );
         assert_eq!(config.limits.max_content_length, 12345);
-        assert_eq!(config.limits.max_wire_body_bytes, 12345);
+        assert_eq!(config.limits.max_http_body_bytes, 12345);
         assert_eq!(config.limits.max_decoded_body_bytes, 23456);
         assert_eq!(config.limits.max_events_per_request, 345);
         assert_eq!(config.limits.body_idle_timeout.as_millis(), 250);
@@ -957,6 +1028,7 @@ max_events = 10
 "#,
         );
         env::set_var("HEC_TOKEN", "env-token");
+        env::set_var("HEC_DEFAULT_INDEX", "env_index");
         env::set_var("HEC_MAX_EVENTS", "30");
         env::set_var("HEC_OBSERVE_CONSOLE", "true");
 
@@ -971,6 +1043,7 @@ max_events = 10
 
         assert_eq!(loaded.config.addr.to_string(), "127.0.0.1:18112");
         assert_eq!(loaded.config.token, "env-token");
+        assert_eq!(loaded.config.default_index.as_deref(), Some("env_index"));
         assert_eq!(loaded.config.limits.max_content_length, 1000);
         assert_eq!(loaded.config.limits.max_events_per_request, 30);
         assert!(loaded.config.observe.console);
@@ -1062,7 +1135,7 @@ token = "env-file-token"
     }
 
     #[test]
-    fn validation_rejects_decoded_limit_below_wire_limit() {
+    fn validation_rejects_decoded_limit_below_http_body_limit() {
         let _guard = env_guard();
         let error = RuntimeConfig::load_with_cli(Cli {
             max_bytes: Some(2000),
@@ -1084,6 +1157,30 @@ token = "env-file-token"
         .expect_err("invalid config");
 
         assert!(error.to_string().contains("hec.token"));
+    }
+
+    #[test]
+    fn validation_rejects_zero_index_length() {
+        let _guard = env_guard();
+        let error = RuntimeConfig::load_with_cli(Cli {
+            max_index_len: Some(0),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("limits.max_index_len"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_default_index() {
+        let _guard = env_guard();
+        let error = RuntimeConfig::load_with_cli(Cli {
+            default_index: Some("Bad.Index".to_string()),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("hec.default_index"));
     }
 
     #[test]

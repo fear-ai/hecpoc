@@ -4,6 +4,7 @@ use serde_json::Value;
 
 use super::{
     event::{Endpoint, Event},
+    index::is_valid_index_name,
     outcome::{HecError, HecResponse},
     protocol::Protocol,
 };
@@ -22,6 +23,8 @@ struct HecEnvelope {
 pub fn parse_event_body(
     body: &Bytes,
     max_events: usize,
+    max_index_len: usize,
+    default_index: Option<&str>,
     protocol: &Protocol,
 ) -> Result<Vec<Event>, HecResponse> {
     if body.is_empty() {
@@ -53,6 +56,12 @@ pub fn parse_event_body(
             other => other.to_string(),
         };
 
+        let event_index = envelope
+            .index
+            .or_else(|| default_index.map(ToOwned::to_owned));
+        validate_index(event_index.as_deref(), max_index_len)
+            .map_err(|_| event_error(HecError::IncorrectIndex, index, protocol))?;
+
         let fields = validate_fields(envelope.fields)
             .map_err(|_| event_error(HecError::HandlingIndexedFields, index, protocol))?;
 
@@ -64,7 +73,7 @@ pub fn parse_event_body(
             host: envelope.host,
             source: envelope.source,
             sourcetype: envelope.sourcetype,
-            index: envelope.index,
+            index: event_index,
             fields,
             endpoint: Endpoint::Event,
         });
@@ -75,6 +84,16 @@ pub fn parse_event_body(
     } else {
         Ok(events)
     }
+}
+
+fn validate_index(index: Option<&str>, max_index_len: usize) -> Result<(), ()> {
+    let Some(index) = index else {
+        return Ok(());
+    };
+    if !is_valid_index_name(index, max_index_len) {
+        return Err(());
+    }
+    Ok(())
 }
 
 fn validate_fields(fields: Option<Value>) -> Result<Option<Value>, ()> {
@@ -112,8 +131,14 @@ mod tests {
     #[test]
     fn parses_concatenated_json_events() {
         let body = Bytes::from_static(br#"{"event":"one"}{"event":{"k":"two"}}"#);
-        let events =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap();
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].raw, "one");
         assert_eq!(events[1].raw, r#"{"k":"two"}"#);
@@ -124,8 +149,14 @@ mod tests {
         let body = Bytes::from_static(
             br#"{"event":"x","fields":{"text":"v","n":7,"flag":true,"none":null}}"#,
         );
-        let events =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap();
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
         assert_eq!(events.len(), 1);
         assert!(events[0].fields.is_some());
     }
@@ -133,56 +164,98 @@ mod tests {
     #[test]
     fn rejects_blank_event() {
         let body = Bytes::from_static(br#"{"event":""}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 13);
     }
 
     #[test]
     fn rejects_nested_fields() {
         let body = Bytes::from_static(br#"{"event":"x","fields":{"nested":{"x":1}}}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 15);
     }
 
     #[test]
     fn rejects_array_field_values() {
         let body = Bytes::from_static(br#"{"event":"x","fields":{"roles":["admin"]}}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 15);
     }
 
     #[test]
     fn rejects_fields_that_are_not_an_object() {
         let body = Bytes::from_static(br#"{"event":"x","fields":["not","object"]}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 15);
     }
 
     #[test]
     fn rejects_missing_event() {
         let body = Bytes::from_static(br#"{"host":"h"}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 12);
     }
 
     #[test]
     fn rejects_null_event() {
         let body = Bytes::from_static(br#"{"event":null}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 12);
     }
 
     #[test]
     fn rejects_trailing_garbage() {
         let body = Bytes::from_static(br#"{"event":"ok"}xyz"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 6);
         assert_eq!(outcome.invalid_event_number, Some(1));
     }
@@ -190,8 +263,14 @@ mod tests {
     #[test]
     fn rejects_unclosed_json_object() {
         let body = Bytes::from_static(br#"{"event":"x""#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 6);
         assert_eq!(outcome.invalid_event_number, Some(0));
     }
@@ -199,8 +278,14 @@ mod tests {
     #[test]
     fn rejects_unclosed_json_string() {
         let body = Bytes::from_static(br#"{"event":"x}"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 6);
         assert_eq!(outcome.invalid_event_number, Some(0));
     }
@@ -208,8 +293,14 @@ mod tests {
     #[test]
     fn rejects_json_array_batch() {
         let body = Bytes::from_static(br#"[{"event":"one"},{"event":"two"}]"#);
-        let outcome =
-            parse_event_body(&body, 10, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 6);
         assert_eq!(outcome.invalid_event_number, Some(0));
     }
@@ -217,8 +308,98 @@ mod tests {
     #[test]
     fn rejects_event_count_over_limit() {
         let body = Bytes::from_static(br#"{"event":"one"}{"event":"two"}"#);
-        let outcome =
-            parse_event_body(&body, 1, &super::super::protocol::Protocol::default()).unwrap_err();
+        let outcome = parse_event_body(
+            &body,
+            1,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
         assert_eq!(outcome.code, 9);
+    }
+
+    #[test]
+    fn accepts_splunk_style_index_name() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"app_logs-1"}"#);
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
+        assert_eq!(events[0].index.as_deref(), Some("app_logs-1"));
+    }
+
+    #[test]
+    fn applies_default_index_when_event_omits_index() {
+        let body = Bytes::from_static(br#"{"event":"x"}"#);
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            Some("app_logs"),
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
+        assert_eq!(events[0].index.as_deref(), Some("app_logs"));
+    }
+
+    #[test]
+    fn event_index_overrides_default_index() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"event_logs"}"#);
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            Some("default_logs"),
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
+        assert_eq!(events[0].index.as_deref(), Some("event_logs"));
+    }
+
+    #[test]
+    fn rejects_index_over_configured_length() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"abcd"}"#);
+        let outcome = parse_event_body(
+            &body,
+            10,
+            3,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
+        assert_eq!(outcome.code, 7);
+    }
+
+    #[test]
+    fn rejects_index_with_invalid_splunk_syntax() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"Bad.Index"}"#);
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
+        assert_eq!(outcome.code, 7);
+    }
+
+    #[test]
+    fn rejects_index_with_reserved_kvstore_word() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"my_kvstore_logs"}"#);
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
+        assert_eq!(outcome.code, 7);
     }
 }

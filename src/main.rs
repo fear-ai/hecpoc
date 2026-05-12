@@ -1,6 +1,8 @@
 mod hec_receiver;
 
-use hec_receiver::{AppState, ConfigAction, ObserveConfig, ObserveFormat, RuntimeConfig};
+use hec_receiver::{
+    AppState, ConfigAction, ObserveConfig, ObserveFormat, Phase, RuntimeConfig, TokenRegistry,
+};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing_subscriber::EnvFilter;
@@ -24,23 +26,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = loaded.config;
     let addr = config.addr;
     let report_outputs = config.observe.report_outputs();
+    let tokens = TokenRegistry::single(config.token, config.default_index);
     let state = Arc::new(
         match config.capture_path {
-            Some(path) => AppState::capture_file_with_report_outputs(
-                vec![config.token],
-                config.limits,
-                path,
-                report_outputs,
-            ),
-            None => AppState::drop_only_with_report_outputs(
-                vec![config.token],
-                config.limits,
-                report_outputs,
-            ),
+            Some(path) => {
+                AppState::capture_file_with_registry(tokens, config.limits, path, report_outputs)
+            }
+            None => AppState::drop_events_with_registry(tokens, config.limits, report_outputs),
         }
         .with_protocol(config.protocol),
     );
-    let app = hec_receiver::router(state);
+    let app = hec_receiver::router(Arc::clone(&state));
     let listener = TcpListener::bind(addr).await?;
 
     eprintln!("hec receiver listening on http://{addr}");
@@ -48,14 +44,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("hec config tools: --config, --show-config, --check-config");
 
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(shutdown_signal(Arc::clone(&state)))
         .await?;
 
     Ok(())
 }
 
-async fn shutdown_signal() {
+async fn shutdown_signal(state: Arc<AppState>) {
     let _ = tokio::signal::ctrl_c().await;
+    state.health.set_phase(Phase::Stopping);
 }
 
 fn init_tracing(observe: &ObserveConfig) {

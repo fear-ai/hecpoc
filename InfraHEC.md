@@ -181,7 +181,7 @@ HECpoc/
       config.rs
       error.rs
       event.rs
-      handler.rs
+      hec_request.rs
       health.rs
       line_splitter.rs
       outcome.rs
@@ -270,10 +270,12 @@ Avoid:
 | Config file | none | `HEC_CONFIG` | `--config`, `-c` | none | readable TOML |
 | Listen address | `hec.addr` | `HEC_ADDR` | `--addr` | `127.0.0.1:18088` | valid socket address |
 | Token | `hec.token` | `HEC_TOKEN` | `--token` | `dev-token` | non-empty; redacted |
+| Default index | `hec.default_index` | `HEC_DEFAULT_INDEX` | `--default-index` | none | Splunk-compatible index syntax; bounded by `limits.max_index_len` |
 | Capture path | `hec.capture` | `HEC_CAPTURE` | `--capture` | none | parent exists when required |
-| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_048_576` | positive bounded bytes |
-| Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `--max-decoded-bytes` | `4_194_304` | `>= max_bytes` when gzip enabled |
+| Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_000_000` | positive bounded bytes |
+| Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `--max-decoded-bytes` | `4_000_000` | `>= max_bytes` when gzip enabled |
 | Max events per request | `limits.max_events` | `HEC_MAX_EVENTS` | `--max-events` | `100_000` | positive bounded count |
+| Max index length | `limits.max_index_len` | `HEC_MAX_INDEX_LEN` | `--max-index-len` | `128` | positive byte count |
 | Body idle timeout | `limits.idle_timeout` | `HEC_IDLE_TIMEOUT` | `--idle-timeout` | `5s` | positive duration |
 | Body total timeout | `limits.total_timeout` | `HEC_TOTAL_TIMEOUT` | `--total-timeout` | `30s` | `>= idle_timeout` |
 | Gzip buffer bytes | `limits.gzip_buffer_bytes` | `HEC_GZIP_BUFFER_BYTES` | `--gzip-buffer-bytes` | `8_192` | bounded bytes |
@@ -285,7 +287,6 @@ Observation and reporting settings are first-class configuration, not hard-coded
 | Observe level/filter | `observe.level` | `HEC_OBSERVE_LEVEL` | `--observe-level` | `info` | valid `tracing-subscriber` filter syntax |
 | Observe format | `observe.format` | `HEC_OBSERVE_FORMAT` | `--observe-format` | `compact` | `compact` or `json` |
 | Redaction mode | `observe.redaction_mode` | `HEC_OBSERVE_REDACTION_MODE` | `--observe-redaction-mode` | `redact` | `redact` or `passthrough` |
-| Redaction text | `observe.redaction_text` | `HEC_OBSERVE_REDACTION_TEXT` | `--observe-redaction-text` | `<redacted>` | non-empty |
 | Tracing output | `observe.tracing` | `HEC_OBSERVE_TRACING` | `--observe-tracing <bool>` | `true` | boolean |
 | Console output | `observe.console` | `HEC_OBSERVE_CONSOLE` | `--observe-console <bool>` | `false` | boolean |
 | Stats output | `observe.stats` | `HEC_OBSERVE_STATS` | `--observe-stats <bool>` | `true` | boolean |
@@ -300,11 +301,15 @@ Protocol result settings remain configurable but centralized through outcome def
 | invalid token | `protocol.invalid_token` | `HEC_INVALID_TOKEN` | `--protocol-invalid-token` | `4` |
 | no data | `protocol.no_data` | `HEC_NO_DATA` | `--protocol-no-data` | `5` |
 | invalid data format | `protocol.invalid_data_format` | `HEC_INVALID_DATA_FORMAT` | `--protocol-invalid-data-format` | `6` |
+| incorrect index | `protocol.incorrect_index` | `HEC_INCORRECT_INDEX` | `--protocol-incorrect-index` | `7` |
 | server busy | `protocol.server_busy` | `HEC_SERVER_BUSY` | `--protocol-server-busy` | `9` |
 | event field required | `protocol.event_field_required` | `HEC_EVENT_FIELD_REQUIRED` | `--protocol-event-field-required` | `12` |
 | event field blank | `protocol.event_field_blank` | `HEC_EVENT_FIELD_BLANK` | `--protocol-event-field-blank` | `13` |
+| ACK disabled | `protocol.ack_disabled` | `HEC_ACK_DISABLED` | `--protocol-ack-disabled` | `14` |
 | handling indexed fields | `protocol.handling_indexed_fields` | `HEC_HANDLING_INDEXED_FIELDS` | `--protocol-handling-indexed-fields` | `15` |
-| health | `protocol.health` | `HEC_HEALTH` | `--protocol-health` | `17` |
+| health OK | `protocol.health_ok` | `HEC_HEALTH_OK` | `--protocol-health-ok` | `17` |
+| health unhealthy | `protocol.health_unhealthy` | `HEC_HEALTH_UNHEALTHY` | `--protocol-health-unhealthy` | `18` |
+| shutting down | `protocol.server_shutting_down` | `HEC_SERVER_SHUTTING_DOWN` | `--protocol-server-shutting-down` | `23` |
 
 ### 7.5 Growth Parameters
 
@@ -819,7 +824,7 @@ Common fields should be bounded and typed. Prefer specialized field constructors
 - `status`;
 - `hec_code`;
 - `reason`;
-- `wire_len`;
+- `http_body_len`;
 - `decoded_len`;
 - `event_count`;
 - `elapsed_us`;
@@ -838,7 +843,7 @@ Field primitive type, interpretation, serialization, and formatting are not deci
 Example field definitions:
 
 ```rust
-pub const WIRE_LEN: FieldSpec = FieldSpec::u64("wire_len").unit(Unit::Bytes);
+pub const HTTP_BODY_LEN: FieldSpec = FieldSpec::u64("http_body_len").unit(Unit::Bytes);
 pub const DECODED_LEN: FieldSpec = FieldSpec::u64("decoded_len").unit(Unit::Bytes);
 pub const EVENT_COUNT: FieldSpec = FieldSpec::u64("event_count").unit(Unit::Count);
 pub const ELAPSED_US: FieldSpec = FieldSpec::duration_us("elapsed_us");
@@ -849,7 +854,7 @@ pub const INPUT_CLASS: FieldSpec = FieldSpec::enum_("input_class", &["lf", "crlf
 Example field constructors:
 
 ```rust
-field::wire_len(wire.len())
+field::http_body_len(http_body.len())
 field::decoded_len(decoded.len())
 field::event_count(events.len())
 field::elapsed_us(started.elapsed())
@@ -975,7 +980,7 @@ Required counters:
 - `requests_total`;
 - `requests_accepted_total`;
 - `requests_rejected_total` by reason;
-- `bytes_wire_total`;
+- `http_body_bytes_total`;
 - `bytes_decoded_total`;
 - `events_accepted_total`;
 - `events_written_total`;
@@ -1178,7 +1183,7 @@ Initial security scope:
 Later hardening:
 
 - TLS/rustls;
-- token registry with IDs and allowed indexes;
+- token registry with IDs, enabled/disabled state, default index, ACK policy, query-token policy, and allowed indexes;
 - per-IP admission;
 - rate limits;
 - separate observability listener;

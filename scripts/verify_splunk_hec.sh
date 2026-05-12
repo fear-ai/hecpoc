@@ -123,6 +123,7 @@ write_payload raw_final_no_lf 'final-without-newline'
 write_payload json_array '[{"event":"a"},{"event":"b"}]'
 write_payload oversize_small 'abcdef'
 write_payload unsupported_encoding 'abc'
+write_payload ack_query '{"acks":[0,1]}'
 
 run_case event_ok POST /services/collector/event "$OUT_DIR/payloads/event_ok.body" 'baseline event with flat scalar fields'
 run_case stacked POST /services/collector/event "$OUT_DIR/payloads/stacked.body" 'documented stacked JSON objects batch'
@@ -140,6 +141,7 @@ run_case raw_final_no_lf POST /services/collector/raw "$OUT_DIR/payloads/raw_fin
 run_case unsupported_encoding POST /services/collector/raw "$OUT_DIR/payloads/unsupported_encoding.body" 'unsupported content-encoding br' -H 'Content-Encoding: br'
 run_case malformed_content_length POST /services/collector/raw "$OUT_DIR/payloads/raw_ok.body" 'malformed content-length header' -H 'Content-Length: nope'
 run_case oversize_advertised POST /services/collector/raw "$OUT_DIR/payloads/oversize_small.body" 'advertised content-length too large; curl may override body length, inspect result' -H 'Content-Length: 999999999'
+run_case ack_disabled POST /services/collector/ack "$OUT_DIR/payloads/ack_query.body" 'ACK status query when token ACK is disabled or unavailable; expect code 14 class if token has ACK disabled'
 run_get unknown_path /services/collector/not-a-real-endpoint 'incorrect HEC path'
 
 if [[ "$RUN_OPTIONAL" == "1" ]]; then

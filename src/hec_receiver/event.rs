@@ -19,6 +19,7 @@ pub struct Event {
 pub enum Endpoint {
     Event,
     Raw,
+    Ack,
 }
 
 impl Endpoint {
@@ -26,6 +27,7 @@ impl Endpoint {
         match self {
             Self::Event => "event",
             Self::Raw => "raw",
+            Self::Ack => "ack",
         }
     }
 }

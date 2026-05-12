@@ -17,7 +17,7 @@ pub enum Sink {
 }
 
 impl Sink {
-    pub fn drop_only() -> Self {
+    pub fn drop_events() -> Self {
         Self::Drop
     }
 
@@ -28,17 +28,17 @@ impl Sink {
         }
     }
 
-    pub async fn submit_batch(&self, events: &[Event]) -> std::io::Result<SinkReport> {
+    pub async fn submit_events(&self, events: &[Event]) -> std::io::Result<SinkOutcome> {
         match self {
-            Self::Drop => Ok(SinkReport {
+            Self::Drop => Ok(SinkOutcome {
                 accepted: events.len(),
                 dropped: events.len(),
                 written: 0,
             }),
             Self::CaptureFile { file, write_lock } => {
                 let _guard = write_lock.lock().await;
-                file.write_batch(events).await?;
-                Ok(SinkReport {
+                file.write_events(events).await?;
+                Ok(SinkOutcome {
                     accepted: events.len(),
                     dropped: 0,
                     written: events.len(),
@@ -49,7 +49,7 @@ impl Sink {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SinkReport {
+pub struct SinkOutcome {
     pub accepted: usize,
     pub dropped: usize,
     pub written: usize,
@@ -65,7 +65,7 @@ impl FileSink {
         Self { path: path.into() }
     }
 
-    pub async fn write_batch(&self, events: &[Event]) -> std::io::Result<()> {
+    pub async fn write_events(&self, events: &[Event]) -> std::io::Result<()> {
         if let Some(parent) = self.path.parent() {
             if !parent.as_os_str().is_empty() {
                 create_dir_all(parent).await?;
@@ -92,24 +92,24 @@ mod tests {
     use crate::hec_receiver::event::{Endpoint, Event};
 
     #[tokio::test]
-    async fn file_sink_can_write_jsonl_when_wired_later() {
+    async fn file_sink_can_write_jsonl_when_connected_later() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let sink = FileSink::new(&path);
         let events = vec![Event::from_raw_line("hello".to_string(), Endpoint::Raw)];
-        sink.write_batch(&events).await.unwrap();
+        sink.write_events(&events).await.unwrap();
         let written = tokio::fs::read_to_string(path).await.unwrap();
         assert!(written.contains("\"raw\":\"hello\""));
     }
 
     #[tokio::test]
     async fn drop_sink_reports_dropped_events() {
-        let sink = Sink::drop_only();
+        let sink = Sink::drop_events();
         let events = vec![Event::from_raw_line("hello".to_string(), Endpoint::Raw)];
-        let report = sink.submit_batch(&events).await.unwrap();
+        let report = sink.submit_events(&events).await.unwrap();
         assert_eq!(
             report,
-            SinkReport {
+            SinkOutcome {
                 accepted: 1,
                 dropped: 1,
                 written: 0

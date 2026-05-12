@@ -166,7 +166,7 @@ pub mod field {
     pub const AUTH_SCHEME: FieldId = FieldId::new("auth_scheme");
     pub const TOKEN_PRESENT: FieldId = FieldId::new("token_present");
     pub const AUTH_LEN: FieldId = FieldId::new("auth_len");
-    pub const WIRE_LEN: FieldId = FieldId::new("wire_len");
+    pub const HTTP_BODY_LEN: FieldId = FieldId::new("http_body_len");
     pub const DECODED_LEN: FieldId = FieldId::new("decoded_len");
     pub const EVENT_COUNT: FieldId = FieldId::new("event_count");
     pub const DROP_COUNT: FieldId = FieldId::new("drop_count");
@@ -210,8 +210,8 @@ pub mod field {
         usize_field(AUTH_LEN, value)
     }
 
-    pub fn wire_len(value: usize) -> Field {
-        usize_field(WIRE_LEN, value)
+    pub fn http_body_len(value: usize) -> Field {
+        usize_field(HTTP_BODY_LEN, value)
     }
 
     pub fn decoded_len(value: usize) -> Field {
@@ -568,7 +568,7 @@ pub mod facts {
     pub const GZIP_FAILED: FactId = FactId(21);
     pub const BODY_TOO_LARGE: FactId = FactId(22);
     pub const BODY_TIMEOUT: FactId = FactId(23);
-    pub const WIRE_BODY_READ: FactId = FactId(24);
+    pub const HTTP_BODY_READ: FactId = FactId(24);
     pub const BODY_DECODED: FactId = FactId(25);
     pub const BODY_READ_FAILED: FactId = FactId(26);
     pub const PARSE_FAILED: FactId = FactId(30);
@@ -606,9 +606,9 @@ const BODY_TOO_LARGE_COUNTERS: &[CounterBinding] =
 const BODY_READ_FAILED_COUNTERS: &[CounterBinding] =
     &[CounterBinding::Increment(Counter::BodyReadErrors)];
 const BODY_TIMEOUT_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::Timeouts)];
-const WIRE_BODY_READ_COUNTERS: &[CounterBinding] = &[CounterBinding::AddField {
-    counter: Counter::WireBytes,
-    field: field::WIRE_LEN,
+const HTTP_BODY_READ_COUNTERS: &[CounterBinding] = &[CounterBinding::AddField {
+    counter: Counter::HttpBodyBytes,
+    field: field::HTTP_BODY_LEN,
 }];
 const BODY_DECODED_COUNTERS: &[CounterBinding] = &[CounterBinding::AddField {
     counter: Counter::DecodedBytes,
@@ -623,7 +623,7 @@ const EVENTS_PARSED_COUNTERS: &[CounterBinding] = &[CounterBinding::AddField {
 const SINK_FAILED_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::SinkFailures)];
 const SINK_COMPLETED_COUNTERS: &[CounterBinding] = &[
     CounterBinding::AddField {
-        counter: Counter::EventsDropSink,
+        counter: Counter::EventsDropped,
         field: field::DROP_COUNT,
     },
     CounterBinding::AddField {
@@ -655,7 +655,7 @@ const BODY_FIELDS: &[FieldId] = &[
     field::OUTCOME,
     field::HEC_CODE,
     field::HTTP_STATUS,
-    field::WIRE_LEN,
+    field::HTTP_BODY_LEN,
     field::DECODED_LEN,
     field::INPUT_CLASS,
     field::INPUT_OFFSET,
@@ -793,14 +793,14 @@ static FACTS: &[FactSpec] = &[
         fields: BODY_FIELDS,
     },
     FactSpec {
-        id: facts::WIRE_BODY_READ,
-        name: "hec.body.wire_read",
+        id: facts::HTTP_BODY_READ,
+        name: "hec.body.http_body_read",
         phase: Phase::Ingress,
         component: Component::Body,
         step: Step::ReadBody,
         severity: Severity::Debug,
         outputs: OutputSet::STATS,
-        counters: WIRE_BODY_READ_COUNTERS,
+        counters: HTTP_BODY_READ_COUNTERS,
         fields: BODY_FIELDS,
     },
     FactSpec {
@@ -908,11 +908,11 @@ mod tests {
     fn submit_adds_length_fields_to_stats() {
         let reporter = Reporter::default();
         let ctx = ReportContext::request();
-        reporter.submit(&ctx, facts::WIRE_BODY_READ, vec![field::wire_len(11)]);
+        reporter.submit(&ctx, facts::HTTP_BODY_READ, vec![field::http_body_len(11)]);
         reporter.submit(&ctx, facts::BODY_DECODED, vec![field::decoded_len(7)]);
 
         let stats = reporter.stats_snapshot();
-        assert_eq!(stats.wire_bytes, 11);
+        assert_eq!(stats.http_body_bytes, 11);
         assert_eq!(stats.decoded_bytes, 7);
     }
 

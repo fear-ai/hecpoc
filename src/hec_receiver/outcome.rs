@@ -15,8 +15,10 @@ pub enum HecError {
     NoData,
     InvalidDataFormat,
     ServerBusy,
+    IncorrectIndex,
     EventFieldRequired,
     EventFieldBlank,
+    AckDisabled,
     HandlingIndexedFields,
     UnsupportedEncoding,
     BodyTooLarge,
@@ -53,6 +55,11 @@ impl HecError {
                 "Server is busy",
                 protocol.server_busy,
             ),
+            Self::IncorrectIndex => HecResponse::new(
+                StatusCode::BAD_REQUEST,
+                "Incorrect index",
+                protocol.incorrect_index,
+            ),
             Self::EventFieldRequired => HecResponse::new(
                 StatusCode::BAD_REQUEST,
                 "Event field is required",
@@ -62,6 +69,11 @@ impl HecError {
                 StatusCode::BAD_REQUEST,
                 "Event field cannot be blank",
                 protocol.event_field_blank,
+            ),
+            Self::AckDisabled => HecResponse::new(
+                StatusCode::BAD_REQUEST,
+                "ACK is disabled",
+                protocol.ack_disabled,
             ),
             Self::HandlingIndexedFields => HecResponse::new(
                 StatusCode::BAD_REQUEST,
