@@ -270,7 +270,8 @@ Avoid:
 | Config file | none | `HEC_CONFIG` | `--config`, `-c` | none | readable TOML |
 | Listen address | `hec.addr` | `HEC_ADDR` | `--addr` | `127.0.0.1:18088` | valid socket address |
 | Token | `hec.token` | `HEC_TOKEN` | `--token` | `dev-token` | non-empty; redacted |
-| Default index | `hec.default_index` | `HEC_DEFAULT_INDEX` | `--default-index` | none | Splunk-compatible index syntax; bounded by `limits.max_index_len` |
+| Default index | `hec.default_index` | `HEC_DEFAULT_INDEX` | `--default-index` | `main` | Splunk-compatible index syntax; bounded by `limits.max_index_len`; must be allowed when allow-list is configured |
+| Allowed indexes | `hec.allowed_indexes` | `HEC_ALLOWED_INDEXES` | `--allowed-indexes` | `["main"]` | comma-list or TOML list; each value uses index syntax/length policy |
 | Capture path | `hec.capture` | `HEC_CAPTURE` | `--capture` | none | parent exists when required |
 | Max HTTP body bytes | `limits.max_bytes` | `HEC_MAX_BYTES` | `--max-bytes` | `1_000_000` | positive bounded bytes |
 | Max decoded bytes | `limits.max_decoded_bytes` | `HEC_MAX_DECODED_BYTES` | `--max-decoded-bytes` | `4_000_000` | `>= max_bytes` when gzip enabled |
@@ -307,6 +308,7 @@ Protocol result settings remain configurable but centralized through outcome def
 | event field blank | `protocol.event_field_blank` | `HEC_EVENT_FIELD_BLANK` | `--protocol-event-field-blank` | `13` |
 | ACK disabled | `protocol.ack_disabled` | `HEC_ACK_DISABLED` | `--protocol-ack-disabled` | `14` |
 | handling indexed fields | `protocol.handling_indexed_fields` | `HEC_HANDLING_INDEXED_FIELDS` | `--protocol-handling-indexed-fields` | `15` |
+| query-string authorization disabled | `protocol.query_string_authorization_disabled` | `HEC_QUERY_STRING_AUTHORIZATION_DISABLED` | `--protocol-query-string-authorization-disabled` | `16` |
 | health OK | `protocol.health_ok` | `HEC_HEALTH_OK` | `--protocol-health-ok` | `17` |
 | health unhealthy | `protocol.health_unhealthy` | `HEC_HEALTH_UNHEALTHY` | `--protocol-health-unhealthy` | `18` |
 | shutting down | `protocol.server_shutting_down` | `HEC_SERVER_SHUTTING_DOWN` | `--protocol-server-shutting-down` | `23` |

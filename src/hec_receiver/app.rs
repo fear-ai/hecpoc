@@ -161,16 +161,25 @@ impl AppState {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
-        .route("/services/collector", post(hec_request::post_event))
-        .route("/services/collector/event", post(hec_request::post_event))
+        .route("/services/collector", hec_post(hec_request::post_event))
+        .route(
+            "/services/collector/event",
+            hec_post(hec_request::post_event),
+        )
         .route(
             "/services/collector/event/1.0",
-            post(hec_request::post_event),
+            hec_post(hec_request::post_event),
         )
-        .route("/services/collector/raw", post(hec_request::post_raw))
-        .route("/services/collector/raw/1.0", post(hec_request::post_raw))
-        .route("/services/collector/ack", post(hec_request::post_ack))
-        .route("/services/collector/ack/1.0", post(hec_request::post_ack))
+        .route("/services/collector/raw", hec_post(hec_request::post_raw))
+        .route(
+            "/services/collector/raw/1.0",
+            hec_post(hec_request::post_raw),
+        )
+        .route("/services/collector/ack", hec_post(hec_request::post_ack))
+        .route(
+            "/services/collector/ack/1.0",
+            hec_post(hec_request::post_ack),
+        )
         .route(
             "/services/collector/health",
             get(hec_request::health).post(hec_request::health),
@@ -182,6 +191,19 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/hec/stats", get(hec_request::stats))
         .fallback(hec_request::not_found)
         .with_state(state)
+}
+
+fn hec_post<S>(
+    handler: fn(axum::extract::State<Arc<AppState>>, axum::http::Request<axum::body::Body>) -> S,
+) -> axum::routing::MethodRouter<Arc<AppState>>
+where
+    S: std::future::Future<Output = axum::response::Response> + Send + 'static,
+{
+    post(handler)
+        .get(hec_request::method_not_allowed)
+        .put(hec_request::method_not_allowed)
+        .delete(hec_request::method_not_allowed)
+        .patch(hec_request::method_not_allowed)
 }
 
 #[cfg(test)]

@@ -76,6 +76,15 @@ pub async fn not_found() -> Response {
     .into_response()
 }
 
+pub async fn method_not_allowed() -> Response {
+    HecResponse::new(
+        StatusCode::METHOD_NOT_ALLOWED,
+        "The requested URL was not found on this server.",
+        404,
+    )
+    .into_response()
+}
+
 async fn process_ack_request(state: Arc<AppState>, request: Request<Body>) -> Response {
     let started = Instant::now();
     let ctx = ReportContext::request();
@@ -90,12 +99,16 @@ async fn process_ack_request(state: Arc<AppState>, request: Request<Body>) -> Re
     );
 
     let (parts, _) = request.into_parts();
-    let outcome = match state.tokens.authenticate(&parts.headers) {
-        Ok(_) => HecError::AckDisabled.outcome(&state.protocol),
-        Err(error) => {
-            let outcome = error.outcome(&state.protocol);
-            report_auth_error(&state, &ctx, error, &outcome);
-            outcome
+    let outcome = if query_has_token(parts.uri.query()) {
+        HecError::QueryStringAuthorizationDisabled.outcome(&state.protocol)
+    } else {
+        match state.tokens.authenticate(&parts.headers) {
+            Ok(_) => HecError::AckDisabled.outcome(&state.protocol),
+            Err(error) => {
+                let outcome = error.outcome(&state.protocol);
+                report_auth_error(&state, &ctx, error, &outcome);
+                outcome
+            }
         }
     };
     state.reporter.submit(
@@ -186,6 +199,17 @@ async fn process_hec_request_pipeline(
     }
 
     let (parts, body) = request.into_parts();
+    if query_has_token(parts.uri.query()) {
+        let outcome = HecError::QueryStringAuthorizationDisabled.outcome(&state.protocol);
+        report_auth_error(
+            state,
+            ctx,
+            HecError::QueryStringAuthorizationDisabled,
+            &outcome,
+        );
+        return Err(outcome);
+    }
+
     let auth = state.tokens.authenticate(&parts.headers).map_err(|error| {
         let outcome = error.outcome(&state.protocol);
         report_auth_error(state, ctx, error, &outcome);
@@ -252,6 +276,7 @@ async fn process_hec_request_pipeline(
             state.limits.max_events_per_request,
             state.limits.max_index_len,
             auth.default_index.as_deref(),
+            &auth.allowed_indexes,
             &state.protocol,
         )
         .map_err(|outcome| {
@@ -324,6 +349,7 @@ fn report_auth_error(
     let fact = match error {
         HecError::TokenRequired => facts::AUTH_TOKEN_REQUIRED,
         HecError::InvalidAuthorization => facts::AUTH_INVALID_AUTHORIZATION,
+        HecError::QueryStringAuthorizationDisabled => facts::AUTH_INVALID_AUTHORIZATION,
         HecError::InvalidToken => facts::AUTH_TOKEN_INVALID,
         _ => return,
     };
@@ -337,6 +363,14 @@ fn report_auth_error(
             field::http_status(outcome.status.as_u16()),
         ],
     );
+}
+
+fn query_has_token(query: Option<&str>) -> bool {
+    query
+        .unwrap_or_default()
+        .split('&')
+        .filter_map(|part| part.split_once('=').map(|(key, _)| key).or(Some(part)))
+        .any(|key| key == "token")
 }
 
 fn report_body_error(
@@ -596,11 +630,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn basic_auth_password_token_returns_success_code() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/raw")
+            .header(AUTHORIZATION, "Basic dXNlcjp0ZXN0LXRva2Vu")
+            .body(Body::from("x\n"))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"{"text":"Success","code":0}"#);
+    }
+
+    #[tokio::test]
+    async fn bearer_auth_returns_invalid_authorization() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/raw")
+            .header(AUTHORIZATION, "Bearer test-token")
+            .body(Body::from("x\n"))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"text":"Invalid authorization","code":3}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn query_string_token_returns_code_16() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/raw?token=test-token")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .body(Body::from("x\n"))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"text":"Query string authorization is not enabled","code":16}"#
+        );
+    }
+
+    #[tokio::test]
     async fn default_index_is_applied_to_event_input() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let state = Arc::new(AppState::capture_file_with_registry(
-            TokenRegistry::single("test-token".to_string(), Some("main".to_string())),
+            TokenRegistry::single(
+                "test-token".to_string(),
+                Some("main".to_string()),
+                vec!["main".to_string()],
+            ),
             Limits::default(),
             &path,
             Default::default(),
@@ -625,7 +729,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("events.jsonl");
         let state = Arc::new(AppState::capture_file_with_registry(
-            TokenRegistry::single("test-token".to_string(), Some("main".to_string())),
+            TokenRegistry::single(
+                "test-token".to_string(),
+                Some("main".to_string()),
+                vec!["main".to_string()],
+            ),
             Limits::default(),
             &path,
             Default::default(),
@@ -748,6 +856,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn whitespace_only_raw_body_returns_code_5() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/raw")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .body(Body::from(" \t \n"))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Raw).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::BAD_REQUEST);
+        assert_eq!(body.as_ref(), br#"{"text":"No data","code":5}"#);
+    }
+
+    #[tokio::test]
     async fn malformed_json_returns_code_6() {
         let state = Arc::new(AppState::drop_events(
             vec!["test-token".to_string()],
@@ -812,8 +940,28 @@ mod tests {
         assert_eq!(parts.status, StatusCode::BAD_REQUEST);
         assert_eq!(
             body.as_ref(),
-            br#"{"text":"Incorrect index","code":7,"invalid-event-number":0}"#
+            br#"{"text":"Incorrect index","code":7,"invalid-event-number":1}"#
         );
+    }
+
+    #[tokio::test]
+    async fn json_array_batch_returns_success_code() {
+        let state = Arc::new(AppState::drop_events(
+            vec!["test-token".to_string()],
+            Limits::default(),
+        ));
+        let request = Request::builder()
+            .uri("/services/collector/event")
+            .header(AUTHORIZATION, "Splunk test-token")
+            .body(Body::from(r#"[{"event":"one"},{"event":"two"}]"#))
+            .unwrap();
+
+        let response = process_hec_request(state, request, Endpoint::Event).await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::OK);
+        assert_eq!(body.as_ref(), br#"{"text":"Success","code":0}"#);
     }
 
     #[tokio::test]
@@ -912,6 +1060,19 @@ mod tests {
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::NOT_FOUND);
+        assert_eq!(
+            body.as_ref(),
+            br#"{"text":"The requested URL was not found on this server.","code":404}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_method_returns_splunk_style_json_405() {
+        let response = method_not_allowed().await;
+        let (parts, body) = response.into_parts();
+        let body = to_bytes(body, usize::MAX).await.unwrap();
+
+        assert_eq!(parts.status, StatusCode::METHOD_NOT_ALLOWED);
         assert_eq!(
             body.as_ref(),
             br#"{"text":"The requested URL was not found on this server.","code":404}"#

@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = loaded.config;
     let addr = config.addr;
     let report_outputs = config.observe.report_outputs();
-    let tokens = TokenRegistry::single(config.token, config.default_index);
+    let tokens = TokenRegistry::single(config.token, config.default_index, config.allowed_indexes);
     let state = Arc::new(
         match config.capture_path {
             Some(path) => {

@@ -10,6 +10,7 @@ const DEFAULT_EVENT_FIELD_REQUIRED: u16 = 12;
 const DEFAULT_EVENT_FIELD_BLANK: u16 = 13;
 const DEFAULT_ACK_DISABLED: u16 = 14;
 const DEFAULT_HANDLING_INDEXED_FIELDS: u16 = 15;
+const DEFAULT_QUERY_STRING_AUTHORIZATION_DISABLED: u16 = 16;
 const DEFAULT_HEALTH_OK: u16 = 17;
 const DEFAULT_HEALTH_UNHEALTHY: u16 = 18;
 const DEFAULT_SERVER_SHUTTING_DOWN: u16 = 23;
@@ -28,6 +29,7 @@ pub struct Protocol {
     pub event_field_blank: u16,
     pub ack_disabled: u16,
     pub handling_indexed_fields: u16,
+    pub query_string_authorization_disabled: u16,
     pub health_ok: u16,
     pub health_unhealthy: u16,
     pub server_shutting_down: u16,
@@ -48,6 +50,7 @@ impl Default for Protocol {
             event_field_blank: DEFAULT_EVENT_FIELD_BLANK,
             ack_disabled: DEFAULT_ACK_DISABLED,
             handling_indexed_fields: DEFAULT_HANDLING_INDEXED_FIELDS,
+            query_string_authorization_disabled: DEFAULT_QUERY_STRING_AUTHORIZATION_DISABLED,
             health_ok: DEFAULT_HEALTH_OK,
             health_unhealthy: DEFAULT_HEALTH_UNHEALTHY,
             server_shutting_down: DEFAULT_SERVER_SHUTTING_DOWN,

@@ -11,6 +11,7 @@ use super::{app::Limits, index::is_valid_index_name, protocol::Protocol, report:
 
 const DEFAULT_ADDR: &str = "127.0.0.1:18088";
 const DEFAULT_TOKEN: &str = "dev-token";
+const DEFAULT_INDEX: &str = "main";
 const DEFAULT_MAX_BYTES: usize = 1_000_000;
 const DEFAULT_MAX_DECODED_BYTES: usize = 4 * DEFAULT_MAX_BYTES;
 const DEFAULT_MAX_EVENTS: usize = 100_000;
@@ -26,6 +27,7 @@ const ENV_ADDR: &str = "HEC_ADDR";
 const ENV_TOKEN: &str = "HEC_TOKEN";
 const ENV_SPANK_TOKEN: &str = "SPANK_HEC_TOKEN";
 const ENV_DEFAULT_INDEX: &str = "HEC_DEFAULT_INDEX";
+const ENV_ALLOWED_INDEXES: &str = "HEC_ALLOWED_INDEXES";
 const ENV_CAPTURE: &str = "HEC_CAPTURE";
 const ENV_MAX_BYTES: &str = "HEC_MAX_BYTES";
 const ENV_MAX_DECODED_BYTES: &str = "HEC_MAX_DECODED_BYTES";
@@ -52,6 +54,7 @@ pub struct RuntimeConfig {
     pub addr: SocketAddr,
     pub token: String,
     pub default_index: Option<String>,
+    pub allowed_indexes: Vec<String>,
     pub capture_path: Option<String>,
     pub limits: Limits,
     pub protocol: Protocol,
@@ -158,6 +161,9 @@ pub struct Cli {
     #[arg(long)]
     pub default_index: Option<String>,
 
+    #[arg(long, value_delimiter = ',')]
+    pub allowed_indexes: Option<Vec<String>>,
+
     #[arg(long)]
     pub capture: Option<String>,
 
@@ -217,6 +223,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub protocol_handling_indexed_fields: Option<u16>,
+
+    #[arg(long)]
+    pub protocol_query_string_authorization_disabled: Option<u16>,
 
     #[arg(long)]
     pub protocol_health_ok: Option<u16>,
@@ -304,6 +313,7 @@ impl Cli {
                 addr: self.addr.clone(),
                 token: self.token.clone(),
                 default_index: self.default_index.clone(),
+                allowed_indexes: self.allowed_indexes.clone(),
                 capture: self.capture.clone(),
             })
             .filter(has_hec_values),
@@ -330,6 +340,8 @@ impl Cli {
                 event_field_blank: self.protocol_event_field_blank,
                 ack_disabled: self.protocol_ack_disabled,
                 handling_indexed_fields: self.protocol_handling_indexed_fields,
+                query_string_authorization_disabled: self
+                    .protocol_query_string_authorization_disabled,
                 health_ok: self.protocol_health_ok,
                 health_unhealthy: self.protocol_health_unhealthy,
                 server_shutting_down: self.protocol_server_shutting_down,
@@ -368,7 +380,8 @@ impl ConfigDoc {
             hec: Some(HecDoc {
                 addr: Some(DEFAULT_ADDR.to_string()),
                 token: Some(DEFAULT_TOKEN.to_string()),
-                default_index: None,
+                default_index: Some(DEFAULT_INDEX.to_string()),
+                allowed_indexes: Some(vec![DEFAULT_INDEX.to_string()]),
                 capture: None,
             }),
             limits: Some(LimitsDoc {
@@ -399,6 +412,7 @@ impl ConfigDoc {
                 addr: env_string(ENV_ADDR),
                 token: env_string(ENV_TOKEN).or_else(|| env_string(ENV_SPANK_TOKEN)),
                 default_index: env_string(ENV_DEFAULT_INDEX),
+                allowed_indexes: env_list(ENV_ALLOWED_INDEXES),
                 capture: env_string(ENV_CAPTURE),
             })
             .filter(has_hec_values),
@@ -440,6 +454,10 @@ impl ConfigDoc {
                     "HEC_HANDLING_INDEXED_FIELDS",
                     "protocol.handling_indexed_fields",
                 )?,
+                query_string_authorization_disabled: env_parse(
+                    "HEC_QUERY_STRING_AUTHORIZATION_DISABLED",
+                    "protocol.query_string_authorization_disabled",
+                )?,
                 health_ok: env_parse("HEC_HEALTH_OK", "protocol.health_ok")?,
                 health_unhealthy: env_parse("HEC_HEALTH_UNHEALTHY", "protocol.health_unhealthy")?,
                 server_shutting_down: env_parse(
@@ -471,6 +489,7 @@ impl ConfigDoc {
                     config.token.clone()
                 }),
                 default_index: config.default_index.clone(),
+                allowed_indexes: Some(config.allowed_indexes.clone()),
                 capture: config.capture_path.clone(),
             }),
             limits: Some(LimitsDoc {
@@ -554,6 +573,30 @@ impl ConfigDoc {
                 );
             }
         }
+        let allowed_indexes = hec.allowed_indexes.unwrap_or_default();
+        for allowed_index in &allowed_indexes {
+            if allowed_index.is_empty() {
+                return invalid("hec.allowed_indexes", "index names cannot be empty");
+            }
+            if !is_valid_index_name(allowed_index, max_index_len) {
+                return invalid(
+                    "hec.allowed_indexes",
+                    "each index must use lowercase ASCII letters, digits, underscore, or dash; cannot start with '_' or '-'; cannot contain 'kvstore'; cannot exceed limits.max_index_len",
+                );
+            }
+        }
+        if let Some(default_index) = hec.default_index.as_deref() {
+            if !allowed_indexes.is_empty()
+                && !allowed_indexes
+                    .iter()
+                    .any(|allowed| allowed == default_index)
+            {
+                return invalid(
+                    "hec.default_index",
+                    "default index must be listed in hec.allowed_indexes when an allow-list is configured",
+                );
+            }
+        }
         if idle_timeout.is_zero() {
             return invalid("limits.idle_timeout", "must be greater than zero");
         }
@@ -575,6 +618,7 @@ impl ConfigDoc {
             addr,
             token,
             default_index: hec.default_index,
+            allowed_indexes,
             capture_path: hec.capture,
             limits: Limits {
                 max_content_length: max_bytes,
@@ -601,6 +645,8 @@ struct HecDoc {
     token: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_indexes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capture: Option<String>,
 }
@@ -651,6 +697,8 @@ struct ProtocolDoc {
     ack_disabled: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     handling_indexed_fields: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    query_string_authorization_disabled: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     health_ok: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -746,6 +794,7 @@ impl ProtocolDoc {
             event_field_blank: Some(protocol.event_field_blank),
             ack_disabled: Some(protocol.ack_disabled),
             handling_indexed_fields: Some(protocol.handling_indexed_fields),
+            query_string_authorization_disabled: Some(protocol.query_string_authorization_disabled),
             health_ok: Some(protocol.health_ok),
             health_unhealthy: Some(protocol.health_unhealthy),
             server_shutting_down: Some(protocol.server_shutting_down),
@@ -780,6 +829,9 @@ impl ProtocolDoc {
             handling_indexed_fields: self
                 .handling_indexed_fields
                 .expect("default protocol handling_indexed_fields"),
+            query_string_authorization_disabled: self
+                .query_string_authorization_disabled
+                .expect("default protocol query_string_authorization_disabled"),
             health_ok: self.health_ok.expect("default protocol health_ok"),
             health_unhealthy: self
                 .health_unhealthy
@@ -795,6 +847,7 @@ fn has_hec_values(value: &HecDoc) -> bool {
     value.addr.is_some()
         || value.token.is_some()
         || value.default_index.is_some()
+        || value.allowed_indexes.is_some()
         || value.capture.is_some()
 }
 
@@ -821,6 +874,7 @@ fn has_protocol_values(value: &ProtocolDoc) -> bool {
         || value.event_field_blank.is_some()
         || value.ack_disabled.is_some()
         || value.handling_indexed_fields.is_some()
+        || value.query_string_authorization_disabled.is_some()
         || value.health_ok.is_some()
         || value.health_unhealthy.is_some()
         || value.server_shutting_down.is_some()
@@ -886,6 +940,17 @@ fn env_string(name: &str) -> Option<String> {
     }
 }
 
+fn env_list(name: &str) -> Option<Vec<String>> {
+    env_string(name).map(|value| {
+        value
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    })
+}
+
 fn env_parse<T>(name: &str, field: &'static str) -> Result<Option<T>, ConfigError>
 where
     T: std::str::FromStr,
@@ -915,6 +980,7 @@ mod tests {
         "HEC_TOKEN",
         "SPANK_HEC_TOKEN",
         "HEC_DEFAULT_INDEX",
+        "HEC_ALLOWED_INDEXES",
         "HEC_CAPTURE",
         "HEC_MAX_BYTES",
         "HEC_MAX_DECODED_BYTES",
@@ -942,6 +1008,7 @@ mod tests {
         "HEC_EVENT_FIELD_BLANK",
         "HEC_ACK_DISABLED",
         "HEC_HANDLING_INDEXED_FIELDS",
+        "HEC_QUERY_STRING_AUTHORIZATION_DISABLED",
         "HEC_HEALTH_OK",
         "HEC_HEALTH_UNHEALTHY",
         "HEC_SERVER_SHUTTING_DOWN",
@@ -956,6 +1023,7 @@ mod tests {
 addr = "127.0.0.1:18111"
 token = "file-token"
 default_index = "app_logs"
+allowed_indexes = ["app_logs", "audit_logs"]
 capture = "/tmp/hec-events.jsonl"
 
 [limits]
@@ -991,6 +1059,7 @@ stats = true
         assert_eq!(config.addr.to_string(), "127.0.0.1:18111");
         assert_eq!(config.token, "file-token");
         assert_eq!(config.default_index.as_deref(), Some("app_logs"));
+        assert_eq!(config.allowed_indexes, vec!["app_logs", "audit_logs"]);
         assert_eq!(
             config.capture_path.as_deref(),
             Some("/tmp/hec-events.jsonl")
@@ -1029,6 +1098,7 @@ max_events = 10
         );
         env::set_var("HEC_TOKEN", "env-token");
         env::set_var("HEC_DEFAULT_INDEX", "env_index");
+        env::set_var("HEC_ALLOWED_INDEXES", "env_index,other_index");
         env::set_var("HEC_MAX_EVENTS", "30");
         env::set_var("HEC_OBSERVE_CONSOLE", "true");
 
@@ -1044,6 +1114,10 @@ max_events = 10
         assert_eq!(loaded.config.addr.to_string(), "127.0.0.1:18112");
         assert_eq!(loaded.config.token, "env-token");
         assert_eq!(loaded.config.default_index.as_deref(), Some("env_index"));
+        assert_eq!(
+            loaded.config.allowed_indexes,
+            vec!["env_index", "other_index"]
+        );
         assert_eq!(loaded.config.limits.max_content_length, 1000);
         assert_eq!(loaded.config.limits.max_events_per_request, 30);
         assert!(loaded.config.observe.console);
@@ -1176,6 +1250,28 @@ token = "env-file-token"
         let _guard = env_guard();
         let error = RuntimeConfig::load_with_cli(Cli {
             default_index: Some("Bad.Index".to_string()),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("hec.default_index"));
+    }
+
+    #[test]
+    fn defaults_to_main_index_and_allowed_index() {
+        let _guard = env_guard();
+        let loaded = RuntimeConfig::load_with_cli(Cli::default()).expect("load config");
+
+        assert_eq!(loaded.config.default_index.as_deref(), Some("main"));
+        assert_eq!(loaded.config.allowed_indexes, vec!["main"]);
+    }
+
+    #[test]
+    fn validation_rejects_default_index_outside_allowed_indexes() {
+        let _guard = env_guard();
+        let error = RuntimeConfig::load_with_cli(Cli {
+            default_index: Some("other".to_string()),
+            allowed_indexes: Some(vec!["main".to_string()]),
             ..Cli::default()
         })
         .expect_err("invalid config");

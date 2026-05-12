@@ -20,7 +20,7 @@ pub fn parse_raw_body(
             return Err(HecError::ServerBusy);
         }
         let line = strip_trailing_cr(line);
-        if line.is_empty() {
+        if is_blank_raw_line(line) {
             continue;
         }
         let raw_bytes_len = line.len();
@@ -39,6 +39,10 @@ pub fn parse_raw_body(
 
 fn strip_trailing_cr(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+fn is_blank_raw_line(line: &[u8]) -> bool {
+    line.is_empty() || line.iter().all(|byte| byte.is_ascii_whitespace())
 }
 
 #[cfg(test)]
@@ -72,7 +76,7 @@ mod tests {
 
     #[test]
     fn rejects_only_blank_lines_as_no_data() {
-        let body = Bytes::from_static(b"\n\r\n");
+        let body = Bytes::from_static(b"\n\r\n \t \n");
         assert_eq!(
             parse_raw_body(&body, 10, None).unwrap_err(),
             HecError::NoData

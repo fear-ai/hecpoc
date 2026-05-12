@@ -145,7 +145,7 @@ run_case ack_disabled POST /services/collector/ack "$OUT_DIR/payloads/ack_query.
 run_get unknown_path /services/collector/not-a-real-endpoint 'incorrect HEC path'
 
 if [[ "$RUN_OPTIONAL" == "1" ]]; then
-  run_case json_array POST /services/collector/event "$OUT_DIR/payloads/json_array.body" 'OPTIONAL: JSON array batch; docs suggest not supported, verify only'
+  run_case json_array POST /services/collector/event "$OUT_DIR/payloads/json_array.body" 'OPTIONAL: JSON array batch compatibility probe'
   run_get health /services/collector/health 'OPTIONAL: only verifies reachable healthy endpoint unless Splunk can be forced unhealthy'
   run_get health_v1 /services/collector/health/1.0 'OPTIONAL: health v1 alias'
 fi

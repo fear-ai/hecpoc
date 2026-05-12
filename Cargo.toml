@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
+base64 = "0.22"
 bytes = "1"
 clap = { version = "4", features = ["derive", "env"] }
 figment = { version = "0.10", features = ["toml"] }

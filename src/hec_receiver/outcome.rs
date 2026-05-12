@@ -20,6 +20,7 @@ pub enum HecError {
     EventFieldBlank,
     AckDisabled,
     HandlingIndexedFields,
+    QueryStringAuthorizationDisabled,
     UnsupportedEncoding,
     BodyTooLarge,
     Timeout,
@@ -79,6 +80,11 @@ impl HecError {
                 StatusCode::BAD_REQUEST,
                 "Error in handling indexed fields",
                 protocol.handling_indexed_fields,
+            ),
+            Self::QueryStringAuthorizationDisabled => HecResponse::new(
+                StatusCode::BAD_REQUEST,
+                "Query string authorization is not enabled",
+                protocol.query_string_authorization_disabled,
             ),
             Self::UnsupportedEncoding => HecResponse::html(
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,

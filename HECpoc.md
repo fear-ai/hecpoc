@@ -118,7 +118,7 @@ Appendix B records naming rationale and external terminology comparisons. It is 
 
 Minimum surface:
 
-- `/services/collector/event`: accept one or more stacked JSON `HecEnvelope` objects.
+- `/services/collector/event`: accept one or more stacked JSON `HecEnvelope` objects and JSON array batches observed from Splunk verification.
 - `/services/collector/raw`: accept LF-framed raw events with documented CRLF behavior.
 - `/services/collector/health`: report availability and lifecycle phase.
 - `/services/collector/ack`: return a deliberate disabled/unsupported response until ACK commit semantics exist.
@@ -134,8 +134,8 @@ Initial field rules:
 - `_raw`: preserve event text for comparison; raw byte preservation becomes a sink/store property before replay claims.
 - `_time`: store parsed event time with explicit precision; choose microseconds or nanoseconds after Splunk comparison and sink format review.
 - `host`, `source`, `sourcetype`: store payload values and make defaults visible.
-- `index`: logical namespace first; physical partitioning later.
-- `fields`: start with flat scalar values; nested behavior must be accepted, ignored, stringified, or rejected deliberately.
+- `index`: logical namespace first; default to `main`; validate against token-associated allowed indexes before physical partitioning exists.
+- `fields`: accept an object with scalar, null, and direct array values; reject nested object values and non-object top-level `fields`.
 
 Metadata extracted before store/write decisions includes endpoint, token/channel class, request id, event ordinal, HTTP body length, decoded length, content encoding, source query params, and validation outcome. Store/output grouping may split or coalesce events later, but it must retain request provenance.
 
@@ -201,7 +201,7 @@ The main invariant is commit-state truthfulness: response, ACK, report, and benc
 |------|----------|--------|-----------------|
 | Runtime | Use Tokio and Axum initially | gets a real HEC server running while keeping protocol checks explicit | connection-level stats, header limits, culling, or accept-loop policy require Hyper/hyper-util direct control |
 | Protocol checks | Implement auth/body/gzip/HEC response mapping in HEC-owned code | protocol-critical behavior must be testable and Splunk-comparable | a library feature proves identical behavior and better maintainability |
-| JSON HEC batching | Support stacked JSON objects for `/event`; do not assume JSON array batches | Splunk documents stacked objects distinctly from arrays | local Splunk or a target shipper proves arrays are required |
+| JSON HEC batching | Support stacked JSON objects and JSON array batches for `/event` | local Splunk accepted both; clients may generate either shape | later Splunk version or shipper evidence contradicts current oracle |
 | Output grouping | Use `WriteBlock` for store/output aggregation, not HEC request grouping | store/write granularity should match storage and benchmark needs | generalized Store interface chooses a better term |
 | Queue policy | Correctness mode rejects newest or returns busy when full | HEC senders can retry; silent drop lies | telemetry profile explicitly chooses drop/spill behavior |
 | Store partitioning | Preserve host/source/sourcetype/index metadata; do not make per-host/per-log DBs during ingest | avoids writer/schema/compaction explosion | measured workload proves partition-local writes or searches dominate |
@@ -239,7 +239,7 @@ Immediate verification targets:
 2. Missing/malformed/invalid auth response bodies and status codes.
 3. Body too large before read, body too large while reading, and gzip expansion too large.
 4. Stacked JSON object success and malformed-late-object failure.
-5. JSON array rejection unless a real shipper requires arrays.
+5. JSON array success plus malformed-array edge cases.
 6. Raw endpoint CRLF, blank line, trailing newline, NUL, and invalid UTF-8 behavior.
 7. Health during stopping (`503/code23`) and later queue-full health degradation.
 
@@ -409,8 +409,8 @@ Splunk's current troubleshooting table assigns particular meaning to HEC respons
 | HTTP status | Splunk HEC meaning | Current receiver behavior | Gap or action |
 |-------------|--------------------|---------------------------|---------------|
 | `200 OK` | code `0` success; code `17` healthy; codes `24`/`25` approaching queue/ACK capacity | success uses `200`/code `0`; health uses `200`/code `17` when serving | success path exists; health is minimal; queue/ACK warning statuses not implemented |
-| `400 Bad Request` | codes `5`, `6`, `7`, `10`, `11`, `12`, `13`, `14`, `15`, `16`, `21`, `22` | no data, invalid JSON/data, missing/blank event, indexed-field handling use `400`; unknown index/channel/ACK/query-auth states absent | add compatibility tests for implemented cases; decide whether unsupported features return Splunk-specific codes or remain absent |
-| `401 Unauthorized` | code `2` token required; code `3` invalid authorization | implemented for absent/blank auth and malformed auth | covered partly by handler tests; add response-body tests for invalid authorization |
+| `400 Bad Request` | codes `5`, `6`, `7`, `10`, `11`, `12`, `13`, `14`, `15`, `16`, `21`, `22` | no data, invalid JSON/data, incorrect index, missing/blank event, ACK disabled, indexed-field handling, and query-token-disabled use `400` | implemented HEC cases have unit coverage; channel and token-management codes remain future work |
+| `401 Unauthorized` | code `2` token required; code `3` invalid authorization | implemented for absent/blank auth, malformed auth, unsupported auth schemes, and Splunk-incompatible `Bearer` | covered by auth and handler tests |
 | `403 Forbidden` | code `1` token disabled; code `4` invalid token | invalid token implemented; disabled token absent | token store has no disabled-token state; add if token metadata appears |
 | `500 Internal Error` | code `8` internal server error | no explicit HEC internal-error outcome | add only when real sink/runtime failures need conversion to HEC JSON rather than process failure |
 | `503 Service Unavailable` | code `9` server busy; codes `18`/`19`/`20` unhealthy; code `23` shutting down | server busy is used for health admission failure, event-count limit, and sink failure; health unhealthy returns `503` with code `18` | split busy, queue-full, shutting-down, and ACK-unavailable when those states exist |
@@ -418,33 +418,33 @@ Splunk's current troubleshooting table assigns particular meaning to HEC respons
 | `408 Request Timeout` | not listed in Splunk HEC table | body idle/total timeout maps to `408`/code `9` | defensible HTTP, but Splunk-incompatible unless local Splunk proves similar behavior; add slow-client tests and decide |
 | `413 Payload Too Large` | Splunk local oracle returns generic HTML, not HEC JSON | advertised or actual over-limit body maps to `413` with Splunk-style generic HTML | HEC code remains internal/reporting only, not serialized |
 | `415 Unsupported Media Type` | Splunk local oracle returns generic HTML, not HEC JSON | unsupported `Content-Encoding` maps to `415` with Splunk-style generic HTML | HEC code remains internal/reporting only, not serialized |
-| `404 Not Found` | incorrect path | Axum will return default `404` for unregistered paths, not a deliberate HEC JSON outcome | add explicit 404 route if compatibility requires JSON body or metrics for incorrect URL |
+| `404 Not Found` | incorrect path | fallback returns measured Splunk-style JSON body with code `404` | add metric/counter if incorrect-URL reporting becomes necessary |
 
-Important conclusion: the current receiver is HEC-shaped and now follows the measured Splunk body-shape split for key controlled cases: HEC protocol failures return HEC JSON, while unsupported encoding and body-size failures return generic HTML. Remaining gray areas include timeout, unhealthy health status, malformed wire headers, and ACK/channel behavior.
+Important conclusion: the current receiver follows the measured Splunk body-shape split for key controlled cases: HEC protocol failures return HEC JSON, while unsupported encoding and body-size failures return generic HTML. Remaining gray areas include timeout, malformed HTTP headers rejected by Hyper before the handler, unhealthy health subcauses, and ACK/channel behavior.
 
 ### A.2 HEC Return Code Coverage
 
-The current Splunk table lists HEC codes `0` through `27`, with some gaps in feature coverage rather than just missing tests. Current receiver protocol defaults expose only codes `0`, `2`, `3`, `4`, `5`, `6`, `9`, `12`, `13`, `14`, `15`, `17`, `18`, and `23`.
+The current Splunk table lists HEC codes `0` through `27`, with some gaps in feature coverage rather than just missing tests. Current receiver protocol defaults expose codes `0`, `2`, `3`, `4`, `5`, `6`, `7`, `9`, `12`, `13`, `14`, `15`, `16`, `17`, `18`, and `23`.
 
 | HEC code | Splunk status/message | Current implementation | Current test/validation coverage | Gap or action |
 |----------|-----------------------|------------------------|----------------------------------|---------------|
-| `0` | `200 Success` | `HecResponse::success` | handler unit test asserts raw success JSON; validation run observed successful requests | add event endpoint success body test |
+| `0` | `200 Success` | `HecResponse::success` | handler unit tests assert raw success, Basic auth success, and JSON array success; validation run observed successful requests | covered for current success paths |
 | `1` | `403 Token disabled` | absent | none | add only with token metadata/disabled state |
 | `2` | `401 Token is required` | `HecError::TokenRequired` | handler unit test asserts `401` body with code `2`; validation covers missing auth | covered; add blank-header handler test if desired |
-| `3` | `401 Invalid authorization` | `HecError::InvalidAuthorization` | auth unit tests cover parser error; handler test asserts malformed auth response body | covered for wrong scheme; add non-text header handler test if needed |
+| `3` | `401 Invalid authorization` | `HecError::InvalidAuthorization` | auth unit tests cover parser errors; handler tests cover malformed auth and `Bearer` rejection | covered for current auth parser paths |
 | `4` | `403 Invalid token` | `HecError::InvalidToken` | auth unit test covers token-store error; handler test asserts invalid-token response body | covered |
-| `5` | `400 No data` | `HecError::NoData` | raw unit covers blank-only body; handler test asserts blank raw body response | add event empty-body handler test |
+| `5` | `400 No data` | `HecError::NoData` | raw unit covers blank-only and whitespace-only body; handler tests assert blank and whitespace raw body responses | add event empty-body handler test |
 | `6` | `400 Invalid data format` | malformed JSON/body stream/gzip decode; top-level `fields` non-object maps here; unsupported encoding/body-too-large keep internal code `6` for reporting but serialize generic HTML like Splunk | parser unit covers trailing garbage and fields-array rejection; handler tests assert malformed JSON, top-level fields-array, unsupported encoding HTML, and body-too-large HTML responses | add raw socket tests for malformed HTTP headers that never reach HEC code |
-| `7` | `400 Incorrect index` | `index` syntax/length validation implemented; allow-list validation absent | parser and handler tests cover invalid syntax and configured length | add token allowed-index policy later |
+| `7` | `400 Incorrect index` | `index` syntax/length validation and token-associated allowed-index validation implemented; compile default is `main` | parser and handler tests cover invalid syntax, configured length, allowed index, and disallowed index | query-string `index` remains postponed |
 | `8` | `500 Internal server error` | absent | none | define when sink/runtime failures should become code `8` instead of `9` |
 | `9` | `503 Server is busy` | max-event limit, health not admitting work, sink failure, timeout uses code `9` | parser unit and handler test cover event-count limit; timeout not covered; handler sink/health busy not covered | add slow-body tests; add health busy and sink-failure response tests; reconsider mapping of max-events and timeout |
 | `10` | `400 Data channel is missing` | absent | none | needed when ACK/channel semantics implemented |
 | `11` | `400 Invalid data channel` | absent | none | needed when ACK/channel semantics implemented |
-| `12` | `400 Event field is required` | missing or `null` `event` | parser unit and handler unit cover missing event; parser unit covers null event | covered for JSON endpoint; add array-batch variant after array support decision |
+| `12` | `400 Event field is required` | missing or `null` `event` | parser unit and handler unit cover missing event; parser unit covers null event | covered for JSON endpoint |
 | `13` | `400 Event field cannot be blank` | empty string event | parser unit and handler test cover blank event | covered |
 | `14` | `400 ACK is disabled` | `/services/collector/ack` and `/services/collector/ack/1.0` authenticate first, then return ACK-disabled response | handler tests cover authenticated ACK-disabled response and unauthenticated token-required precedence | verify exact Splunk behavior for method, body shape, and ACK-disabled token state |
 | `15` | `400 Error in handling indexed fields` | `fields` absent ok; `fields` must be object; nested object values rejected; array values accepted to match Splunk oracle | parser and handler tests cover nested object; parser and handler tests cover array value acceptance and top-level array as code `6` | decide later whether arrays containing objects need a separate compatibility test |
-| `16` | `400 Query string authorization is not enabled` | absent | none | current auth ignores `?token=` entirely; add explicit behavior if query auth is considered |
+| `16` | `400 Query string authorization is not enabled` | query parameter named `token` is detected before auth/body work and rejected | handler test and local verifier cover `?token=` with and without authorization header | optional query-token acceptance is postponed; default remains disabled for Splunk compatibility |
 | `17` | `200 HEC is healthy` | health endpoint uses configured healthy code | handler tests cover healthy response | covered for serving phase |
 | `18` | `503 HEC unhealthy, queues full` | health endpoint uses configured unhealthy code for starting/non-ready phase | handler tests cover starting/unhealthy response | refine into queue-full once bounded queue state exists |
 | `19` | `503 HEC unhealthy, ACK unavailable` | absent | none | add only with ACK service |
@@ -459,11 +459,11 @@ The current Splunk table lists HEC codes `0` through `27`, with some gaps in fea
 
 Actionable distinction:
 
-- Implemented and handler-tested now: `0`, `2`, `3`, `4`, `5`, `6`, `7`, `9`, `12`, `13`, `14`, `15`, and Splunk-style unknown-route `404`.
+- Implemented and handler-tested now: `0`, `2`, `3`, `4`, `5`, `6`, `7`, `9`, `12`, `13`, `14`, `15`, `16`, and Splunk-style unknown-route/wrong-method JSON bodies.
 - Implemented and unit/validation-covered but not fully handler-body-covered for every subcase: body stream errors, gzip decode failure, and raw malformed-header cases.
 - Implemented and handler-tested: health codes `17`, `18`, and shutdown code `23`.
 - Present as code paths but weakly invokable or untested at handler level: timeout, health unhealthy, sink failure, and malformed wire-header behavior.
-- Not addressed by design yet: disabled tokens, index allow-list, ACK registry/channel status, query-string auth, queue capacity states, internal-error state, incorrect-path metrics.
+- Not addressed by design yet: disabled-token state, ACK registry/channel status, optional query-token acceptance, queue capacity states, internal-error state, incorrect-path metrics.
 
 ### A.3 Size, Transfer, And Buffer Bounds
 
@@ -473,7 +473,8 @@ Current configured values and constraints:
 |-------|---------|------------|---------------------|
 | `hec.addr` | `127.0.0.1:18088` | valid socket address; port must be greater than zero | listener bind at startup |
 | `hec.token` | `dev-token` | non-empty; no ASCII control characters | exact token membership in `TokenRegistry` |
-| `hec.default_index` | none | if present, same syntax and length policy as event `index` | applied to event/raw input when the HEC input omits `index` |
+| `hec.default_index` | `main` | if present, same syntax and length policy as event `index`; must be listed in `hec.allowed_indexes` when allow-list exists | applied to event/raw input when the HEC input omits `index` |
+| `hec.allowed_indexes` | `["main"]` | each value follows index syntax/length policy | token-associated allow-list for event `index` values; empty list currently means no allow-list and should become an explicit policy choice before production use |
 | `hec.capture` | none | if present, cannot be empty | file sink path when capture sink is wired |
 | `limits.max_bytes` | `1_000_000` | must be greater than zero | maximum advertised `Content-Length` and maximum received HTTP body bytes |
 | `limits.max_decoded_bytes` | `4_000_000` | must be at least `max_bytes` | maximum identity body after receipt and maximum gzip-expanded body |
@@ -513,16 +514,16 @@ Current accepted request and payload syntax:
 
 | Area | Current behavior | Splunk comparison | Gap or action |
 |------|------------------|-------------------|---------------|
-| Authorization header | accepts `Splunk <token>` and `Bearer <token>`, case-insensitive scheme; rejects absent, non-text, unknown scheme, missing token | Splunk documents `Authorization: Splunk <hec_token>` plus basic auth and query-string auth | decide whether `Bearer` is intentional extension; basic and query auth absent |
-| Basic auth | absent | Splunk accepts token as password in basic auth form | add only if compatibility tests require common clients using `-u x:token` |
-| Query-string auth | absent and postponed | Splunk supports `?token=` only when enabled; Vector source does not implement query-token auth | keep disabled by default; later detect `?token=` and return code `16` unless explicitly enabled |
+| Authorization header | accepts `Splunk <token>` and rejects unsupported schemes, including `Bearer`, with code `3` | Splunk documents `Authorization: Splunk <hec_token>` plus basic auth and query-string auth | current behavior follows local Splunk oracle for `Bearer` rejection |
+| Basic auth | accepts token as Basic password | Splunk accepts token as password in basic auth form | covered by handler test and local verifier |
+| Query-string auth | detects query parameter `token` and rejects with code `16` | Splunk returned `400/code16` when query-string auth is disabled, even with a valid Authorization header | optional query-token support is postponed and disabled by default |
 | Channel header/query | ignored | required for raw requests when ACK is enabled | safe while ACK is absent; must become explicit once ACK appears |
 | Content-Encoding | accepts absent, empty, `identity`, `gzip`; rejects other values | Splunk behavior must be tested for unsupported encodings | add local Splunk comparison for `br`, mixed encodings, and malformed header bytes |
 | Content-Length | malformed value returns invalid-data; over-limit advertised length returns body-too-large before body read | Splunk status mapping uncertain from docs | add local Splunk comparison |
-| JSON event endpoint | accepts concatenated JSON objects deserialized as `HecEnvelope`; missing/null `event` rejected; empty string `event` rejected | Splunk documents the batch protocol as event objects stacked one after another, not a JSON array | current concatenated-object support matches the documented batch shape; JSON array batches should be rejected unless a specific client proves they are needed |
+| JSON event endpoint | accepts concatenated JSON objects and JSON arrays of objects; missing/null `event` rejected; empty string `event` rejected | local Splunk oracle accepted both stacked objects and JSON array batches | keep both forms unless later Splunk version or client evidence contradicts |
 | Event value type | string stored directly; non-string JSON converted with `to_string()` | Splunk says event data can be string, number, object, and so on | acceptable for initial capture; downstream store may need original JSON type preservation |
 | `fields` value | must be object; nested object values rejected; direct array values accepted; scalar and null values accepted | Splunk oracle accepted array field values, rejected nested objects with code `15`, and rejected top-level `fields` array with code `6` | add a later test for arrays containing objects if a shipper produces them |
-| Raw endpoint splitting | splits on LF, strips one trailing CR, skips blank lines | Splunk applies line-breaking rules and can use sourcetype/props; raw events must not span requests | current behavior is simpler than Splunk and not source-type aware |
+| Raw endpoint splitting | splits on LF, strips one trailing CR, skips blank and ASCII-whitespace-only lines | Splunk returned no-data for blank/space-only raw input and accepts final line without LF | current behavior is simpler than Splunk and not source-type aware |
 | Incorrect HEC paths | fallback returns Splunk-style JSON `404` with text `The requested URL was not found on this server.` | local Splunk oracle returned that body for `/services/collector/not-a-real-endpoint` | add incorrect-path metric if compatibility/observability requires it |
 
 Punctuation and separators currently have narrow meaning:
@@ -566,7 +567,7 @@ Current incomplete-input behavior:
 | Raw record split across two HTTP requests | treated as two independent requests/events; no cross-request assembly |
 | Event JSON with unterminated string/object/array | invalid data, code `6`, with zero-based `invalid-event-number` |
 | Event JSON with one good object then trailing garbage | invalid data, code `6`, `invalid-event-number` points at the failed next item |
-| Event JSON array batch | currently not accepted, matching Splunk's documented stacked-object batch shape | add explicit rejection test and only change if local Splunk or a target shipper requires arrays |
+| Event JSON array batch | accepted when the array contains valid HEC envelope objects | add malformed-array and mixed-array tests |
 | Malformed gzip or truncated gzip | invalid data, code `6` |
 | Slow or stalled body | timeout maps to HTTP `408`, HEC code `9` |
 | Partial HTTP headers | handled before HEC handler by Axum/Hyper/OS behavior; no HEC-configured timeout yet |
@@ -589,13 +590,13 @@ Splunk comparison:
 
 - Splunk documents optional metadata keys and says omitted values fall back to token/platform defaults.
 - Splunk documents `fields` as flat indexed fields only for the event endpoint.
-- Splunk documents concatenated JSON object batches and explicitly distinguishes them from JSON arrays.
+- Splunk documents concatenated JSON object batches; local Splunk also accepted a JSON array of event objects.
 - Splunk raw parsing can use timestamp and sourcetype rules rather than simple LF splitting.
 
 Implementation implications:
 
-1. Keep concatenated-object batch tests as the primary event-endpoint compatibility proof.
-2. Add a negative JSON-array test unless local Splunk accepts arrays in this endpoint/version.
+1. Keep concatenated-object and JSON-array batch tests as event-endpoint compatibility proof.
+2. Add malformed-array, mixed-array, empty-array, and later-invalid-array cases.
 3. Decide whether raw query parameters (`host`, `source`, `sourcetype`, `index`, `channel`) become request metadata.
 4. Preserve original endpoint and original field names while storing canonical internal names.
 5. Keep queue/store alignment decisions out of HEC parsing until the internal event batch representation is designed.
@@ -643,13 +644,13 @@ Current and planned outcomes should be described by server state first, then map
 |--------------------|-----------------|---------------------------|----------------------------|-------------------------------|
 | accepted request reaches current sink boundary | after parse and `Sink::submit_events` returns | `200/code0 Success` | `REQUEST_SUCCEEDED`, `SINK_COMPLETED`, event/drop/write counts | make commit-state explicit before durable or ACK claims |
 | missing authorization | header/auth validation before body read | `401/code2 Token is required` | `AUTH_TOKEN_REQUIRED`, `REQUEST_FAILED` | covered; add blank-header handler test if desired |
-| malformed authorization | header/auth validation before body read | `401/code3 Invalid authorization` | `AUTH_INVALID_AUTHORIZATION`, `REQUEST_FAILED` | add handler-body assertion |
-| unknown token | token lookup before body read | `403/code4 Invalid token` | `AUTH_TOKEN_INVALID`, `REQUEST_FAILED` | add handler-body assertion |
+| malformed authorization | header/auth validation before body read | `401/code3 Invalid authorization` | `AUTH_INVALID_AUTHORIZATION`, `REQUEST_FAILED` | handler tests cover malformed scheme and `Bearer` rejection |
+| unknown token | token lookup before body read | `403/code4 Invalid token` | `AUTH_TOKEN_INVALID`, `REQUEST_FAILED` | handler test covers response body |
 | disabled token | future token lookup with token state | not implemented | future `AUTH_TOKEN_DISABLED`, disabled-token counter | add enabled/disabled token metadata before response mapping |
-| no data | empty event body or raw body with no nonblank lines | `400/code5 No data` | `PARSE_FAILED` for raw blank/no-data path only where currently wired; `REQUEST_FAILED` | add handler-body tests and event-empty test |
+| no data | empty event body or raw body with no nonblank/whitespace-only lines | `400/code5 No data` | `PARSE_FAILED` for raw blank/no-data path only where currently wired; `REQUEST_FAILED` | raw handler tests cover blank and whitespace-only; add event-empty test |
 | malformed JSON or bad HEC event body | event decode/validation | `400/code6 Invalid data format` with invalid event number where applicable | `PARSE_FAILED`, `REQUEST_FAILED` | covered by parser tests; add handler matrix |
 | malformed or unsupported body/header encoding | content/header/body/decode stage | malformed content length may be rejected by HTTP stack before HEC code; unsupported encoding returns `415` generic HTML; too large returns `413` generic HTML | `BODY_READ_FAILED`, `BODY_TOO_LARGE`, `GZIP_FAILED` where matched; unsupported encoding lacks a dedicated fact | add `BODY_UNSUPPORTED_ENCODING`; add raw socket tests for malformed header cases |
-| incorrect index | HEC event metadata validation and startup config validation | `400/code7 Incorrect index` for invalid event syntax, reserved `kvstore`, leading `_`/`-`, empty, or over configured length; configured `hec.default_index` is rejected at startup if invalid; allow-list absent | `REQUEST_FAILED`; currently parse failure fact does not distinguish index reason | add `EVENT_INDEX_INVALID` and token allow-list policy |
+| incorrect index | HEC event metadata validation and startup config validation | `400/code7 Incorrect index` for invalid event syntax, reserved `kvstore`, leading `_`/`-`, empty, over configured length, or outside token-associated allow-list; configured `hec.default_index` is rejected at startup if invalid or outside configured allow-list | `REQUEST_FAILED`; currently parse failure fact does not distinguish index reason | add `EVENT_INDEX_INVALID` and query-string index policy later |
 | internal server error | future invariant/config/runtime fault class | not implemented | future sanitized internal-error fact and counter | reserve code `8` for non-policy, non-capacity failures |
 | transient server capacity/dependency pressure | phase not accepting, sink transient failure, future bounded wait/resource pressure | current `503/code9 Server is busy`; timeout currently `408/code9`; max-events currently also `503/code9` | `REQUEST_FAILED`; `SINK_FAILED` for sink path; timeout fact where body timeout occurs | keep code `9` for transient retryable server pressure; move max-events to a policy error after verification |
 | too many events in one request | event/raw parser reaches configured `max_events_per_request` | current `503/code9` | parser-level test only; generic request failure at handler | split from true busy: candidate `400/code6`, `413/code6`, or future `429/code26` policy |
@@ -660,7 +661,7 @@ Current and planned outcomes should be described by server state first, then map
 | shutdown | health/ingest while phase `Stopping` | `503/code23 Server is shutting down` | `REQUEST_FAILED` for ingest; no health report | add real graceful-shutdown system test |
 | queue approaching/full | future queue occupancy thresholds | not implemented; planned `200/code24` or `429/code26` depending condition | future queue occupancy metrics, capacity events | requires bounded queue and policy |
 | ACK channel approaching/full | future ACK registry thresholds | not implemented; planned `200/code25` or `429/code27` | future ACK registry metrics/events | requires ACK registry |
-| unknown HEC-looking path | current Axum route miss | current default `404`, no HEC JSON or metric | none | add HEC-scoped fallback and incorrect-url counter after Splunk verification |
+| unknown HEC-looking path or wrong method | current route fallback or explicit method fallback | Splunk-style JSON body with `404` code; wrong method uses HTTP `405` | none | add incorrect-url/method counters if compatibility/observability requires them |
 | unknown non-HEC path | current Axum route miss | default `404` | none | keep separate from HEC incorrect-url accounting |
 
 ### A.9 Test Upgrade Plan From This Appendix
@@ -670,8 +671,8 @@ Focused tests to add next:
 | Test group | Cases |
 |------------|-------|
 | Handler response matrix | event success; event empty body; unsupported encoding HTML; body too large HTML; timeout; health busy; sink failure; incorrect path |
-| Splunk compatibility probes | local Splunk response for oversized body, unsupported encoding, timeout/slow body, JSON array rejection, raw blank lines, basic auth, query auth disabled, missing channel with ACK disabled/enabled |
-| JSON parser edges | concatenated-object batch, top-level array rejection, scalar top-level, fields top-level non-object, fields null/scalar/object/array values, invalid UTF-8 JSON, huge strings, nesting depth |
+| Splunk compatibility probes | local Splunk response for oversized body, unsupported encoding, timeout/slow body, JSON array edge cases, raw blank lines, basic auth, query auth disabled, missing channel with ACK disabled/enabled |
+| JSON parser edges | concatenated-object batch, JSON-array batch, scalar top-level, fields top-level non-object, fields null/scalar/object/array values, invalid UTF-8 JSON, huge strings, nesting depth |
 | Raw parser edges | final line no LF, CR-only separators, interior CR, NUL, other C0 controls, invalid UTF-8, very long line, blank-line policy |
 | Limit enforcement | advertised length over cap, actual body over cap without content length, gzip expansion over cap, gzip buffer min/max config, event-count cap raw/event |
 | Config/protocol safety | invalid protocol code/status pairing if validation added; token length/control; source filter syntax; redaction passthrough |
@@ -715,15 +716,17 @@ Immediate Splunk verification cases:
 | Raw blank behavior | empty/blank raw body | determines whether Splunk indexes zero events or returns `No data` |
 | Oversize/encoding | advertised oversize, unsupported `Content-Encoding`, malformed content length | verifies generic HTML for `413`/`415` and distinguishes handler-owned errors from HTTP parser rejection |
 | Incorrect HEC path | wrong HEC-looking `/services/collector/...` URL | determines plain Axum-style `404` versus HEC JSON or metric behavior |
+| Auth variants | missing auth, wrong token, `Bearer`, Basic, query-string token | verifies status/code split for compatibility-sensitive auth behavior |
+| Index variants | `main`, unknown valid index, invalid syntax, reserved/private-looking index | verifies token/index policy and error numbering |
 
 Postponed Splunk verification cases:
 
 | Case | Reason for postponement |
 |------|-------------------------|
-| JSON array batch | Splunk docs describe stacked event objects and distinguish them from JSON arrays; current work should test rejection locally and only enable Splunk probe with `SPLUNK_HEC_RUN_OPTIONAL=1`. |
+| JSON array edge cases | Basic array batches are now accepted; malformed arrays, mixed arrays, empty arrays, and arrays containing invalid later events still need more compatibility checks. |
 | Health unhealthy | A healthy local Splunk endpoint is easy to test, but forcing queue-full/ACK-unavailable/shutdown states requires Splunk admin setup and may not be stable across versions. |
 | ACK channel states | ACK is explicitly not implemented; missing/invalid channel behavior matters when ACK design starts. |
-| Basic/query-string auth | Relevant for compatibility, but not blocking current `Authorization: Splunk <token>` path. |
+| Query-string auth enabled mode | Disabled mode is implemented as code `16`; accepting query tokens is postponed until a concrete client requires it and security policy is defined. |
 
 #### `fields` Test Selection
 
@@ -733,8 +736,8 @@ Immediate local tests:
 |-------|---------------------------|--------|
 | `fields` flat object with string/number/bool/null values | accept | minimum useful indexed-field compatibility |
 | nested object value | reject code `15` | Splunk documents flat indexed fields; nested values create ambiguous indexing semantics |
-| array value | reject code `15` | arrays are non-scalar and ambiguous for indexed fields |
-| top-level `fields` array/string/null | reject code `15` | `fields` itself must be an object if present |
+| array value | accept | local Splunk oracle accepted direct array values |
+| top-level `fields` array/string/null | reject code `6` | local Splunk oracle rejected non-object `fields` as invalid data |
 
 Postponed `fields` tests:
 
@@ -749,7 +752,7 @@ Postponed `fields` tests:
 
 | Code | Condition to detect | Blocking subsystem | First test once available |
 |------|---------------------|--------------------|---------------------------|
-| `7` incorrect index | event names an index outside a future token allow-list | allowed-index registry and token-to-index policy | send allowed and disallowed `index` values and verify response/counter |
+| `7` incorrect index | event names an invalid index or an index outside token allow-list | implemented for event-body index; query-string index postponed | add reporting reason and query-string index policy |
 | `23` shutting down | request arrives after shutdown begins and intake is closed | graceful shutdown orchestration around existing `Phase::Stopping` behavior | begin shutdown, send request during drain, expect `503/code23` or documented alternate |
 | `26` queue at capacity | bounded ingest queue cannot accept more work | bounded queue, queue policy, and source/request capacity counters | fill queue with blocked write path, send one more request, expect `429/code26` or chosen busy mapping |
 | `27` ACK channel at capacity | ACK-enabled request/HEC batch needs a channel but channel capacity is exhausted | ACK channel registry and capacity policy | create max channels, send new channel, expect `429/code27` or Splunk-matched response |
@@ -778,7 +781,7 @@ These prove bounded request processing, not end-to-end queue backpressure. The f
 | Raw policy | open | replay-grade ingest and binary safety claims | decide strict UTF-8, lossy text, or byte-preserving raw event representation |
 | Observability | partially implemented | complete failure reason accounting and benchmark ledger | add bounded reason fields for every `REQUEST_FAILED` path |
 | Lifecycle | handler-level `Phase::Stopping` implemented | graceful drain semantics, shutdown request behavior, accepted-work completion | add graceful-shutdown system test harness |
-| Index policy | syntax/length implemented; token default index applied; allow-list not implemented | per-token allowed index validation, logical namespace enforcement | add enabled state and allowed-index lookup to token metadata |
+| Index policy | syntax/length implemented; token default index applied; token-associated allow-list implemented with compile default `main` | disabled token state, query-string index policy, richer token lifecycle | add enabled state and token lifecycle metadata |
 | ACK | ACK-disabled endpoint implemented; full ACK postponed and request/HEC batch scoped | codes `10`, `11`, `19`, `20`, `25`, `27`, `ackId` registry and commit-boundary semantics | implement only after `ack.boundary` and registry design are encoded in config/tests |
 | Queue/backpressure | not implemented | code `26`, health queue-full state, source capacity policy | add bounded queue and blocked-write-path test |
 | Axum accept visibility | deferred | connection counts, peer culling, header timeout tuning, socket backlog/buffers | add task for owned accept loop using `TcpSocket` + Hyper/hyper-util after current HEC matrix stabilizes |
@@ -1215,11 +1218,13 @@ Method problems to fix:
 
 Local Splunk Enterprise HEC was verified by `/Users/walter/Work/Spank/HECpoc/scripts/verify_splunk_hec.sh` with results under `/Users/walter/Work/Spank/HECpoc/results/splunk-verify-20260512T082128Z`.
 After code updates, the same script was run against HECpoc with results under `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T084259Z`.
+Additional oracle and local comparison runs captured auth, method, JSON-array, health, and index behavior under `/Users/walter/Work/Spank/HECpoc/results/splunk-verify-20260512T084632Z`, `/Users/walter/Work/Spank/HECpoc/results/splunk-extra-20260512T084834Z`, `/Users/walter/Work/Spank/HECpoc/results/splunk-index-20260512T085059Z`, `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T092550Z`, and `/Users/walter/Work/Spank/HECpoc/results/spank-extra-20260512T092625Z`.
 
 | Case | Splunk result | Implementation status |
 |------|---------------|-----------------------|
 | event baseline | `200`, `{"text":"Success","code":0}` | matched |
 | stacked JSON objects | `200/code0` | matched |
+| JSON array batch | `200/code0` | fixed to match |
 | missing `event` | `400/code12`, invalid event `0` | matched |
 | blank `event` | `400/code13`, invalid event `0` | matched |
 | malformed JSON object/string | `400/code6`, invalid event `0` | matched |
@@ -1230,10 +1235,17 @@ After code updates, the same script was run against HECpoc with results under `/
 | raw lines | `200/code0` | matched |
 | blank raw body | `400/code5` | matched |
 | raw final line without LF | `200/code0` | matched |
+| raw whitespace-only body | `400/code5` | fixed to match |
 | ACK query when ACK disabled | `400/code14` | matched |
 | unknown HEC path | `404`, `{"text":"The requested URL was not found on this server.","code":404}` | fixed to match body/status |
+| wrong method on known route | `405` with same JSON body/code `404` | fixed to match body/status |
+| `Bearer` auth scheme | `401/code3` | fixed to reject |
+| Basic auth password token | `200/code0` | fixed to accept |
+| query-string token disabled | `400/code16` | fixed to reject before auth/body work |
+| event index `main` | `200/code0` | fixed by compile defaults and allow-list |
+| unknown or invalid event index | `400/code7`, invalid event `1` | fixed for event-body index cases |
 | unsupported content encoding | `415` HTML body | fixed to match generic HTML body |
-| huge/conflicting `Content-Length` | `413` HTML body; script case is not a true malformed-header test | advertised oversize fixed to generic HTML; malformed/conflicting header remains a script limitation requiring raw socket tests |
+| huge/conflicting `Content-Length` | `413` HTML body; script case is not a true malformed-header test | advertised oversize fixed to generic HTML; malformed `Content-Length` is still rejected by Hyper before HEC handler with empty `400` |
 
 | Area | Current Interpretation | Required Action |
 |------|------------------------|-----------------|
@@ -1242,7 +1254,7 @@ After code updates, the same script was run against HECpoc with results under `/
 | unsupported encoding response | Splunk returns generic HTML `415`; HECpoc now does too for handler-owned unsupported encoding | add reason-specific reporting fact if needed |
 | body-too-large response | Splunk returns generic HTML `413`; HECpoc now does too for handler-owned body-too-large | add raw socket tests for malformed header cases |
 | raw invalid UTF-8 | lossy acceptance is useful but not replay-grade | document raw text policy and add byte-preserving mode before replay claims |
-| blank raw lines | current no-data behavior needs Splunk comparison | compare Splunk raw HEC behavior and decide skip, preserve, or reject semantics |
+| blank raw lines | Splunk returned no-data for blank and whitespace-only raw bodies | current behavior matches for tested cases |
 | direct file success | written, flushed, and durable are different claims | define direct-file commit state and make response/reporting use that state |
 | per-component filters | `EnvFilter` handles tracing but not every output | implement TOML-to-EnvFilter first; add Reporter filters only when another output needs them |
 
@@ -1260,7 +1272,7 @@ Near-term implementation tasks:
 
 Validation tasks:
 
-1. Compare the same response matrix against local Splunk Enterprise HEC.
+1. Extend raw-socket verification for malformed `Content-Length`, partial headers, partial body, and slow headers that never reach Axum handlers.
 2. Send with Vector as HEC client into this receiver and inspect request shapes.
 3. Run full-size syslog and auth.log with raised limits and record bytes/sec/events/sec.
 4. Add gzip expansion tests using both valid high-ratio gzip and malformed gzip.

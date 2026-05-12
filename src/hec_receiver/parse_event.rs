@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use serde::Deserialize;
+use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::Value;
 
 use super::{
@@ -25,58 +25,42 @@ pub fn parse_event_body(
     max_events: usize,
     max_index_len: usize,
     default_index: Option<&str>,
+    allowed_indexes: &[String],
     protocol: &Protocol,
 ) -> Result<Vec<Event>, HecResponse> {
     if body.is_empty() {
         return Err(HecError::NoData.outcome(protocol));
     }
 
-    let stream = serde_json::Deserializer::from_slice(body).into_iter::<HecEnvelope>();
+    let stream = serde_json::Deserializer::from_slice(body).into_iter::<Value>();
     let mut events = Vec::new();
-    for (index, envelope) in stream.enumerate() {
-        if index >= max_events {
-            return Err(HecError::ServerBusy.outcome(protocol));
-        }
-        let envelope =
-            envelope.map_err(|_| event_error(HecError::InvalidDataFormat, index, protocol))?;
-        let event_value = envelope
-            .event
-            .ok_or_else(|| event_error(HecError::EventFieldRequired, index, protocol))?;
-        if event_value.is_null() {
-            return Err(event_error(HecError::EventFieldRequired, index, protocol));
-        }
-
-        let raw = match event_value {
-            Value::String(text) => {
-                if text.is_empty() {
-                    return Err(event_error(HecError::EventFieldBlank, index, protocol));
+    for value in stream {
+        let value =
+            value.map_err(|_| event_error(HecError::InvalidDataFormat, events.len(), protocol))?;
+        match value {
+            Value::Array(values) => {
+                for value in values {
+                    push_envelope(
+                        value,
+                        &mut events,
+                        max_events,
+                        max_index_len,
+                        default_index,
+                        allowed_indexes,
+                        protocol,
+                    )?;
                 }
-                text
             }
-            other => other.to_string(),
-        };
-
-        let event_index = envelope
-            .index
-            .or_else(|| default_index.map(ToOwned::to_owned));
-        validate_index(event_index.as_deref(), max_index_len)
-            .map_err(|_| event_error(HecError::IncorrectIndex, index, protocol))?;
-
-        let fields = validate_fields(envelope.fields)
-            .map_err(|error| event_error(error, index, protocol))?;
-
-        let raw_bytes_len = raw.len();
-        events.push(Event {
-            raw,
-            raw_bytes_len,
-            time: parse_time(envelope.time),
-            host: envelope.host,
-            source: envelope.source,
-            sourcetype: envelope.sourcetype,
-            index: event_index,
-            fields,
-            endpoint: Endpoint::Event,
-        });
+            value => push_envelope(
+                value,
+                &mut events,
+                max_events,
+                max_index_len,
+                default_index,
+                allowed_indexes,
+                protocol,
+            )?,
+        }
     }
 
     if events.is_empty() {
@@ -86,11 +70,78 @@ pub fn parse_event_body(
     }
 }
 
-fn validate_index(index: Option<&str>, max_index_len: usize) -> Result<(), ()> {
+fn push_envelope(
+    value: Value,
+    events: &mut Vec<Event>,
+    max_events: usize,
+    max_index_len: usize,
+    default_index: Option<&str>,
+    allowed_indexes: &[String],
+    protocol: &Protocol,
+) -> Result<(), HecResponse> {
+    let index = events.len();
+    if index >= max_events {
+        return Err(HecError::ServerBusy.outcome(protocol));
+    }
+    let envelope: HecEnvelope =
+        from_value(value).map_err(|_| event_error(HecError::InvalidDataFormat, index, protocol))?;
+    let event_value = envelope
+        .event
+        .ok_or_else(|| event_error(HecError::EventFieldRequired, index, protocol))?;
+    if event_value.is_null() {
+        return Err(event_error(HecError::EventFieldRequired, index, protocol));
+    }
+
+    let raw = match event_value {
+        Value::String(text) => {
+            if text.is_empty() {
+                return Err(event_error(HecError::EventFieldBlank, index, protocol));
+            }
+            text
+        }
+        other => other.to_string(),
+    };
+
+    let event_index = envelope
+        .index
+        .or_else(|| default_index.map(ToOwned::to_owned));
+    validate_index(event_index.as_deref(), max_index_len, allowed_indexes)
+        .map_err(|_| index_error(index, protocol))?;
+
+    let fields =
+        validate_fields(envelope.fields).map_err(|error| event_error(error, index, protocol))?;
+
+    let raw_bytes_len = raw.len();
+    events.push(Event {
+        raw,
+        raw_bytes_len,
+        time: parse_time(envelope.time),
+        host: envelope.host,
+        source: envelope.source,
+        sourcetype: envelope.sourcetype,
+        index: event_index,
+        fields,
+        endpoint: Endpoint::Event,
+    });
+    Ok(())
+}
+
+fn from_value<T: DeserializeOwned>(value: Value) -> Result<T, serde_json::Error> {
+    serde_json::from_value(value)
+}
+
+fn validate_index(
+    index: Option<&str>,
+    max_index_len: usize,
+    allowed_indexes: &[String],
+) -> Result<(), ()> {
     let Some(index) = index else {
         return Ok(());
     };
     if !is_valid_index_name(index, max_index_len) {
+        return Err(());
+    }
+    if !allowed_indexes.is_empty() && !allowed_indexes.iter().any(|allowed| allowed == index) {
         return Err(());
     }
     Ok(())
@@ -113,6 +164,18 @@ fn event_error(error: HecError, index: usize, protocol: &Protocol) -> HecRespons
     error.outcome(protocol).with_invalid_event_number(index)
 }
 
+fn index_error(index: usize, protocol: &Protocol) -> HecResponse {
+    error_with_splunk_index_number(HecError::IncorrectIndex, index, protocol)
+}
+
+fn error_with_splunk_index_number(
+    error: HecError,
+    index: usize,
+    protocol: &Protocol,
+) -> HecResponse {
+    error.outcome(protocol).with_invalid_event_number(index + 1)
+}
+
 fn parse_time(value: Option<Value>) -> Option<f64> {
     match value? {
         Value::Number(number) => number.as_f64(),
@@ -133,6 +196,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -151,6 +215,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -166,6 +231,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -180,6 +246,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -194,6 +261,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -208,6 +276,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -222,6 +291,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -236,6 +306,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -250,6 +321,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -265,6 +337,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -280,6 +353,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -288,18 +362,20 @@ mod tests {
     }
 
     #[test]
-    fn rejects_json_array_batch() {
+    fn accepts_json_array_batch() {
         let body = Bytes::from_static(br#"[{"event":"one"},{"event":"two"}]"#);
-        let outcome = parse_event_body(
+        let events = parse_event_body(
             &body,
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
-        .unwrap_err();
-        assert_eq!(outcome.code, 6);
-        assert_eq!(outcome.invalid_event_number, Some(0));
+        .unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].raw, "one");
+        assert_eq!(events[1].raw, "two");
     }
 
     #[test]
@@ -310,6 +386,7 @@ mod tests {
             1,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -324,6 +401,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -338,6 +416,7 @@ mod tests {
             10,
             128,
             Some("app_logs"),
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -352,6 +431,7 @@ mod tests {
             10,
             128,
             Some("default_logs"),
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap();
@@ -366,6 +446,7 @@ mod tests {
             10,
             3,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -380,6 +461,7 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
@@ -394,9 +476,44 @@ mod tests {
             10,
             128,
             None,
+            &[],
             &super::super::protocol::Protocol::default(),
         )
         .unwrap_err();
         assert_eq!(outcome.code, 7);
+        assert_eq!(outcome.invalid_event_number, Some(1));
+    }
+
+    #[test]
+    fn accepts_index_in_allowed_registry() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"main"}"#);
+        let allowed = vec!["main".to_string()];
+        let events = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &allowed,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap();
+        assert_eq!(events[0].index.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn rejects_index_missing_from_allowed_registry() {
+        let body = Bytes::from_static(br#"{"event":"x","index":"other"}"#);
+        let allowed = vec!["main".to_string()];
+        let outcome = parse_event_body(
+            &body,
+            10,
+            128,
+            None,
+            &allowed,
+            &super::super::protocol::Protocol::default(),
+        )
+        .unwrap_err();
+        assert_eq!(outcome.code, 7);
+        assert_eq!(outcome.invalid_event_number, Some(1));
     }
 }
