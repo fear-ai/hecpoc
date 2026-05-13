@@ -4,12 +4,15 @@ use figment::{
     Figment,
 };
 use serde::{Deserialize, Serialize};
-use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
+use std::{
+    collections::BTreeMap, env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration,
+};
 use thiserror::Error;
 
 use super::{app::Limits, index::is_valid_index_name, protocol::Protocol, report::ReportOutputs};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:18088";
+const DEFAULT_TOKEN_ID: &str = "default";
 const DEFAULT_TOKEN: &str = "dev-token";
 const DEFAULT_INDEX: &str = "main";
 const DEFAULT_MAX_BYTES: usize = 1_000_000;
@@ -24,8 +27,11 @@ const MAX_GZIP_BUFFER_BYTES: usize = 1_048_576;
 
 const ENV_CONFIG: &str = "HEC_CONFIG";
 const ENV_ADDR: &str = "HEC_ADDR";
+const ENV_TOKEN_ID: &str = "HEC_TOKEN_ID";
 const ENV_TOKEN: &str = "HEC_TOKEN";
 const ENV_SPANK_TOKEN: &str = "SPANK_HEC_TOKEN";
+const ENV_TOKEN_ENABLED: &str = "HEC_TOKEN_ENABLED";
+const ENV_TOKEN_ACK_ENABLED: &str = "HEC_TOKEN_ACK_ENABLED";
 const ENV_DEFAULT_INDEX: &str = "HEC_DEFAULT_INDEX";
 const ENV_ALLOWED_INDEXES: &str = "HEC_ALLOWED_INDEXES";
 const ENV_CAPTURE: &str = "HEC_CAPTURE";
@@ -37,14 +43,14 @@ const ENV_IDLE_TIMEOUT: &str = "HEC_IDLE_TIMEOUT";
 const ENV_TOTAL_TIMEOUT: &str = "HEC_TOTAL_TIMEOUT";
 const ENV_GZIP_BUFFER_BYTES: &str = "HEC_GZIP_BUFFER_BYTES";
 const ENV_OBSERVE_LEVEL: &str = "HEC_OBSERVE_LEVEL";
+const ENV_OBSERVE_SOURCES: &str = "HEC_OBSERVE_SOURCES";
 const ENV_OBSERVE_FORMAT: &str = "HEC_OBSERVE_FORMAT";
 const ENV_OBSERVE_REDACTION_MODE: &str = "HEC_OBSERVE_REDACTION_MODE";
 const ENV_OBSERVE_REDACTION_TEXT: &str = "HEC_OBSERVE_REDACTION_TEXT";
 const ENV_OBSERVE_TRACING: &str = "HEC_OBSERVE_TRACING";
 const ENV_OBSERVE_CONSOLE: &str = "HEC_OBSERVE_CONSOLE";
 const ENV_OBSERVE_STATS: &str = "HEC_OBSERVE_STATS";
-const DEFAULT_OBSERVE_LEVEL: &str =
-    "info,hec.receiver=info,hec.auth=warn,hec.body=warn,hec.parser=warn,hec.sink=warn";
+const DEFAULT_OBSERVE_LEVEL: &str = "info";
 const DEFAULT_OBSERVE_FORMAT: &str = "compact";
 const DEFAULT_REDACTION_MODE: &str = "redact";
 const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
@@ -52,7 +58,10 @@ const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub addr: SocketAddr,
+    pub token_id: String,
     pub token: String,
+    pub token_enabled: bool,
+    pub token_ack_enabled: bool,
     pub default_index: Option<String>,
     pub allowed_indexes: Vec<String>,
     pub capture_path: Option<String>,
@@ -64,6 +73,7 @@ pub struct RuntimeConfig {
 #[derive(Debug, Clone)]
 pub struct ObserveConfig {
     pub level: String,
+    pub sources: BTreeMap<String, String>,
     pub format: ObserveFormat,
     pub redaction_mode: RedactionMode,
     pub redaction_text: String,
@@ -79,6 +89,16 @@ impl ObserveConfig {
             console: self.console,
             stats: self.stats,
         }
+    }
+
+    pub fn filter_directives(&self) -> String {
+        let mut parts = vec![self.level.clone()];
+        parts.extend(
+            self.sources
+                .iter()
+                .map(|(source, level)| format!("{source}={level}")),
+        );
+        parts.join(",")
     }
 }
 
@@ -119,6 +139,12 @@ pub enum ConfigAction {
     CheckConfig,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObserveSourceOverride {
+    source: String,
+    level: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct LoadedConfig {
     pub config: RuntimeConfig,
@@ -156,7 +182,16 @@ pub struct Cli {
     pub addr: Option<String>,
 
     #[arg(long)]
+    pub token_id: Option<String>,
+
+    #[arg(long)]
     pub token: Option<String>,
+
+    #[arg(long)]
+    pub token_enabled: Option<bool>,
+
+    #[arg(long)]
+    pub token_ack_enabled: Option<bool>,
 
     #[arg(long)]
     pub default_index: Option<String>,
@@ -190,6 +225,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub protocol_success: Option<u16>,
+
+    #[arg(long)]
+    pub protocol_token_disabled: Option<u16>,
 
     #[arg(long)]
     pub protocol_token_required: Option<u16>,
@@ -238,6 +276,9 @@ pub struct Cli {
 
     #[arg(long)]
     pub observe_level: Option<String>,
+
+    #[arg(long = "observe-source", value_parser = parse_observe_source_cli)]
+    pub observe_sources: Option<Vec<ObserveSourceOverride>>,
 
     #[arg(long)]
     pub observe_format: Option<String>,
@@ -311,7 +352,10 @@ impl Cli {
         ConfigDoc {
             hec: Some(HecDoc {
                 addr: self.addr.clone(),
+                token_id: self.token_id.clone(),
                 token: self.token.clone(),
+                token_enabled: self.token_enabled,
+                token_ack_enabled: self.token_ack_enabled,
                 default_index: self.default_index.clone(),
                 allowed_indexes: self.allowed_indexes.clone(),
                 capture: self.capture.clone(),
@@ -329,6 +373,7 @@ impl Cli {
             .filter(has_limit_values),
             protocol: Some(ProtocolDoc {
                 success: self.protocol_success,
+                token_disabled: self.protocol_token_disabled,
                 token_required: self.protocol_token_required,
                 invalid_authorization: self.protocol_invalid_authorization,
                 invalid_token: self.protocol_invalid_token,
@@ -349,6 +394,12 @@ impl Cli {
             .filter(has_protocol_values),
             observe: Some(ObserveDoc {
                 level: self.observe_level.clone(),
+                sources: self.observe_sources.as_ref().map(|sources| {
+                    sources
+                        .iter()
+                        .map(|source| (source.source.clone(), source.level.clone()))
+                        .collect()
+                }),
                 format: self.observe_format.clone(),
                 redaction_mode: self.observe_redaction_mode.clone(),
                 redaction_text: self.observe_redaction_text.clone(),
@@ -379,7 +430,10 @@ impl ConfigDoc {
         Self {
             hec: Some(HecDoc {
                 addr: Some(DEFAULT_ADDR.to_string()),
+                token_id: Some(DEFAULT_TOKEN_ID.to_string()),
                 token: Some(DEFAULT_TOKEN.to_string()),
+                token_enabled: Some(true),
+                token_ack_enabled: Some(false),
                 default_index: Some(DEFAULT_INDEX.to_string()),
                 allowed_indexes: Some(vec![DEFAULT_INDEX.to_string()]),
                 capture: None,
@@ -396,6 +450,13 @@ impl ConfigDoc {
             protocol: Some(ProtocolDoc::defaults()),
             observe: Some(ObserveDoc {
                 level: Some(DEFAULT_OBSERVE_LEVEL.to_string()),
+                sources: Some(BTreeMap::from([
+                    ("hec.receiver".to_string(), "info".to_string()),
+                    ("hec.auth".to_string(), "warn".to_string()),
+                    ("hec.body".to_string(), "warn".to_string()),
+                    ("hec.parser".to_string(), "warn".to_string()),
+                    ("hec.sink".to_string(), "warn".to_string()),
+                ])),
                 format: Some(DEFAULT_OBSERVE_FORMAT.to_string()),
                 redaction_mode: Some(DEFAULT_REDACTION_MODE.to_string()),
                 redaction_text: Some(DEFAULT_REDACTION_TEXT.to_string()),
@@ -410,7 +471,10 @@ impl ConfigDoc {
         Ok(Self {
             hec: Some(HecDoc {
                 addr: env_string(ENV_ADDR),
+                token_id: env_string(ENV_TOKEN_ID),
                 token: env_string(ENV_TOKEN).or_else(|| env_string(ENV_SPANK_TOKEN)),
+                token_enabled: env_parse(ENV_TOKEN_ENABLED, "hec.token_enabled")?,
+                token_ack_enabled: env_parse(ENV_TOKEN_ACK_ENABLED, "hec.token_ack_enabled")?,
                 default_index: env_string(ENV_DEFAULT_INDEX),
                 allowed_indexes: env_list(ENV_ALLOWED_INDEXES),
                 capture: env_string(ENV_CAPTURE),
@@ -428,6 +492,7 @@ impl ConfigDoc {
             .filter(has_limit_values),
             protocol: Some(ProtocolDoc {
                 success: env_parse("HEC_SUCCESS", "protocol.success")?,
+                token_disabled: env_parse("HEC_TOKEN_DISABLED", "protocol.token_disabled")?,
                 token_required: env_parse("HEC_TOKEN_REQUIRED", "protocol.token_required")?,
                 invalid_authorization: env_parse(
                     "HEC_INVALID_AUTHORIZATION",
@@ -468,6 +533,7 @@ impl ConfigDoc {
             .filter(has_protocol_values),
             observe: Some(ObserveDoc {
                 level: env_string(ENV_OBSERVE_LEVEL),
+                sources: env_sources(ENV_OBSERVE_SOURCES)?,
                 format: env_string(ENV_OBSERVE_FORMAT),
                 redaction_mode: env_string(ENV_OBSERVE_REDACTION_MODE),
                 redaction_text: env_string(ENV_OBSERVE_REDACTION_TEXT),
@@ -483,11 +549,14 @@ impl ConfigDoc {
         Self {
             hec: Some(HecDoc {
                 addr: Some(config.addr.to_string()),
+                token_id: Some(config.token_id.clone()),
                 token: Some(if redact {
                     config.observe.redaction_text.clone()
                 } else {
                     config.token.clone()
                 }),
+                token_enabled: Some(config.token_enabled),
+                token_ack_enabled: Some(config.token_ack_enabled),
                 default_index: config.default_index.clone(),
                 allowed_indexes: Some(config.allowed_indexes.clone()),
                 capture: config.capture_path.clone(),
@@ -528,6 +597,12 @@ impl ConfigDoc {
         }
 
         let token = required(hec.token, "hec.token")?;
+        let token_id = required(hec.token_id, "hec.token_id")?;
+        if token_id.trim().is_empty() {
+            return invalid("hec.token_id", "token id cannot be empty");
+        }
+        let token_enabled = required(hec.token_enabled, "hec.token_enabled")?;
+        let token_ack_enabled = required(hec.token_ack_enabled, "hec.token_ack_enabled")?;
         validate_token(&token)?;
         if matches!(hec.default_index.as_deref(), Some("")) {
             return invalid("hec.default_index", "default index cannot be empty");
@@ -616,7 +691,10 @@ impl ConfigDoc {
 
         Ok(RuntimeConfig {
             addr,
+            token_id,
             token,
+            token_enabled,
+            token_ack_enabled,
             default_index: hec.default_index,
             allowed_indexes,
             capture_path: hec.capture,
@@ -642,7 +720,13 @@ struct HecDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     addr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    token_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_ack_enabled: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     default_index: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -675,6 +759,8 @@ struct LimitsDoc {
 struct ProtocolDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     success: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_disabled: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     token_required: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -713,6 +799,8 @@ struct ObserveDoc {
     #[serde(skip_serializing_if = "Option::is_none")]
     level: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    sources: Option<BTreeMap<String, String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     redaction_mode: Option<String>,
@@ -730,6 +818,7 @@ impl ObserveDoc {
     fn from_observe(observe: &ObserveConfig) -> Self {
         Self {
             level: Some(observe.level.clone()),
+            sources: Some(observe.sources.clone()),
             format: Some(observe.format.as_str().to_string()),
             redaction_mode: Some(observe.redaction_mode.as_str().to_string()),
             redaction_text: Some(observe.redaction_text.clone()),
@@ -741,7 +830,8 @@ impl ObserveDoc {
 
     fn to_observe(self) -> Result<ObserveConfig, ConfigError> {
         let level = required(self.level, "observe.level")?;
-        validate_observe_level(&level)?;
+        let sources = self.sources.unwrap_or_default();
+        validate_observe_level(&level, &sources)?;
         let format = match required(self.format, "observe.format")?.as_str() {
             "compact" => ObserveFormat::Compact,
             "json" => ObserveFormat::Json,
@@ -765,6 +855,7 @@ impl ObserveDoc {
 
         Ok(ObserveConfig {
             level,
+            sources,
             format,
             redaction_mode,
             redaction_text,
@@ -783,6 +874,7 @@ impl ProtocolDoc {
     fn from_protocol(protocol: &Protocol) -> Self {
         Self {
             success: Some(protocol.success),
+            token_disabled: Some(protocol.token_disabled),
             token_required: Some(protocol.token_required),
             invalid_authorization: Some(protocol.invalid_authorization),
             invalid_token: Some(protocol.invalid_token),
@@ -804,6 +896,9 @@ impl ProtocolDoc {
     fn to_protocol(self) -> Protocol {
         Protocol {
             success: self.success.expect("default protocol success"),
+            token_disabled: self
+                .token_disabled
+                .expect("default protocol token_disabled"),
             token_required: self
                 .token_required
                 .expect("default protocol token_required"),
@@ -845,7 +940,10 @@ impl ProtocolDoc {
 
 fn has_hec_values(value: &HecDoc) -> bool {
     value.addr.is_some()
+        || value.token_id.is_some()
         || value.token.is_some()
+        || value.token_enabled.is_some()
+        || value.token_ack_enabled.is_some()
         || value.default_index.is_some()
         || value.allowed_indexes.is_some()
         || value.capture.is_some()
@@ -863,6 +961,7 @@ fn has_limit_values(value: &LimitsDoc) -> bool {
 
 fn has_protocol_values(value: &ProtocolDoc) -> bool {
     value.success.is_some()
+        || value.token_disabled.is_some()
         || value.token_required.is_some()
         || value.invalid_authorization.is_some()
         || value.invalid_token.is_some()
@@ -882,6 +981,7 @@ fn has_protocol_values(value: &ProtocolDoc) -> bool {
 
 fn has_observe_values(value: &ObserveDoc) -> bool {
     value.level.is_some()
+        || value.sources.is_some()
         || value.format.is_some()
         || value.redaction_mode.is_some()
         || value.redaction_text.is_some()
@@ -921,11 +1021,28 @@ fn validate_token(token: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn validate_observe_level(level: &str) -> Result<(), ConfigError> {
+fn validate_observe_level(
+    level: &str,
+    sources: &BTreeMap<String, String>,
+) -> Result<(), ConfigError> {
     if level.trim().is_empty() {
         return invalid("observe.level", "cannot be empty");
     }
-    tracing_subscriber::filter::Targets::from_str(level)
+    for (source, source_level) in sources {
+        if source.trim().is_empty() {
+            return invalid("observe.sources", "source name cannot be empty");
+        }
+        if source_level.trim().is_empty() {
+            return invalid("observe.sources", "source level cannot be empty");
+        }
+    }
+    let mut directives = vec![level.to_string()];
+    directives.extend(
+        sources
+            .iter()
+            .map(|(source, source_level)| format!("{source}={source_level}")),
+    );
+    tracing_subscriber::filter::Targets::from_str(&directives.join(","))
         .map(|_| ())
         .map_err(|error| ConfigError::Invalid {
             field: "observe.level",
@@ -949,6 +1066,36 @@ fn env_list(name: &str) -> Option<Vec<String>> {
             .map(ToOwned::to_owned)
             .collect()
     })
+}
+
+fn env_sources(name: &str) -> Result<Option<BTreeMap<String, String>>, ConfigError> {
+    env_list(name)
+        .map(|values| {
+            values
+                .iter()
+                .map(|value| parse_source_override(value))
+                .collect::<Result<BTreeMap<_, _>, _>>()
+        })
+        .transpose()
+}
+
+fn parse_observe_source_cli(value: &str) -> Result<ObserveSourceOverride, String> {
+    parse_source_override(value)
+        .map(|(source, level)| ObserveSourceOverride { source, level })
+        .map_err(|error| error.to_string())
+}
+
+fn parse_source_override(value: &str) -> Result<(String, String), ConfigError> {
+    let (source, level) = value.split_once('=').ok_or_else(|| ConfigError::Invalid {
+        field: "observe.sources",
+        message: "source overrides must use source=level".to_string(),
+    })?;
+    let source = source.trim();
+    let level = level.trim();
+    if source.is_empty() || level.is_empty() {
+        return invalid("observe.sources", "source and level cannot be empty");
+    }
+    Ok((source.to_string(), level.to_string()))
 }
 
 fn env_parse<T>(name: &str, field: &'static str) -> Result<Option<T>, ConfigError>
@@ -977,8 +1124,11 @@ mod tests {
     const ENV_NAMES: &[&str] = &[
         "HEC_CONFIG",
         "HEC_ADDR",
+        "HEC_TOKEN_ID",
         "HEC_TOKEN",
         "SPANK_HEC_TOKEN",
+        "HEC_TOKEN_ENABLED",
+        "HEC_TOKEN_ACK_ENABLED",
         "HEC_DEFAULT_INDEX",
         "HEC_ALLOWED_INDEXES",
         "HEC_CAPTURE",
@@ -990,6 +1140,7 @@ mod tests {
         "HEC_TOTAL_TIMEOUT",
         "HEC_GZIP_BUFFER_BYTES",
         "HEC_OBSERVE_LEVEL",
+        "HEC_OBSERVE_SOURCES",
         "HEC_OBSERVE_FORMAT",
         "HEC_OBSERVE_REDACTION_MODE",
         "HEC_OBSERVE_REDACTION_TEXT",
@@ -997,6 +1148,7 @@ mod tests {
         "HEC_OBSERVE_CONSOLE",
         "HEC_OBSERVE_STATS",
         "HEC_SUCCESS",
+        "HEC_TOKEN_DISABLED",
         "HEC_TOKEN_REQUIRED",
         "HEC_INVALID_AUTHORIZATION",
         "HEC_INVALID_TOKEN",
@@ -1021,7 +1173,10 @@ mod tests {
             r#"
 [hec]
 addr = "127.0.0.1:18111"
+token_id = "file-token-id"
 token = "file-token"
+token_enabled = true
+token_ack_enabled = false
 default_index = "app_logs"
 allowed_indexes = ["app_logs", "audit_logs"]
 capture = "/tmp/hec-events.jsonl"
@@ -1039,7 +1194,8 @@ token_required = 202
 invalid_token = 204
 
 [observe]
-level = "hec_receiver=debug"
+level = "debug"
+sources = { "hec.auth" = "debug", "hec.body" = "info" }
 format = "json"
 redaction_mode = "redact"
 redaction_text = "[hidden]"
@@ -1057,7 +1213,10 @@ stats = true
         let config = loaded.config;
 
         assert_eq!(config.addr.to_string(), "127.0.0.1:18111");
+        assert_eq!(config.token_id, "file-token-id");
         assert_eq!(config.token, "file-token");
+        assert!(config.token_enabled);
+        assert!(!config.token_ack_enabled);
         assert_eq!(config.default_index.as_deref(), Some("app_logs"));
         assert_eq!(config.allowed_indexes, vec!["app_logs", "audit_logs"]);
         assert_eq!(
@@ -1073,7 +1232,15 @@ stats = true
         assert_eq!(config.limits.gzip_buffer_bytes, 4096);
         assert_eq!(config.protocol.token_required, 202);
         assert_eq!(config.protocol.invalid_token, 204);
-        assert_eq!(config.observe.level, "hec_receiver=debug");
+        assert_eq!(config.observe.level, "debug");
+        assert_eq!(
+            config.observe.sources.get("hec.auth").map(String::as_str),
+            Some("debug")
+        );
+        assert_eq!(
+            config.observe.filter_directives(),
+            "debug,hec.auth=debug,hec.body=info,hec.parser=warn,hec.receiver=info,hec.sink=warn"
+        );
         assert_eq!(config.observe.format, super::ObserveFormat::Json);
         assert_eq!(config.observe.redaction_text, "[hidden]");
         assert!(config.observe.tracing);
@@ -1097,6 +1264,9 @@ max_events = 10
 "#,
         );
         env::set_var("HEC_TOKEN", "env-token");
+        env::set_var("HEC_TOKEN_ID", "env-token-id");
+        env::set_var("HEC_TOKEN_ENABLED", "false");
+        env::set_var("HEC_TOKEN_ACK_ENABLED", "true");
         env::set_var("HEC_DEFAULT_INDEX", "env_index");
         env::set_var("HEC_ALLOWED_INDEXES", "env_index,other_index");
         env::set_var("HEC_MAX_EVENTS", "30");
@@ -1112,7 +1282,10 @@ max_events = 10
         .expect("load config");
 
         assert_eq!(loaded.config.addr.to_string(), "127.0.0.1:18112");
+        assert_eq!(loaded.config.token_id, "env-token-id");
         assert_eq!(loaded.config.token, "env-token");
+        assert!(!loaded.config.token_enabled);
+        assert!(loaded.config.token_ack_enabled);
         assert_eq!(loaded.config.default_index.as_deref(), Some("env_index"));
         assert_eq!(
             loaded.config.allowed_indexes,
@@ -1264,6 +1437,23 @@ token = "env-file-token"
 
         assert_eq!(loaded.config.default_index.as_deref(), Some("main"));
         assert_eq!(loaded.config.allowed_indexes, vec!["main"]);
+        assert_eq!(loaded.config.token_id, "default");
+        assert!(loaded.config.token_enabled);
+        assert!(!loaded.config.token_ack_enabled);
+    }
+
+    #[test]
+    fn env_observe_sources_compose_with_global_level() {
+        let _guard = env_guard();
+        env::set_var("HEC_OBSERVE_LEVEL", "info");
+        env::set_var("HEC_OBSERVE_SOURCES", "hec.auth=debug,hec.body=trace");
+
+        let loaded = RuntimeConfig::load_with_cli(Cli::default()).expect("load config");
+
+        assert_eq!(
+            loaded.config.observe.filter_directives(),
+            "info,hec.auth=debug,hec.body=trace,hec.parser=warn,hec.receiver=info,hec.sink=warn"
+        );
     }
 
     #[test]

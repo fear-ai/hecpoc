@@ -26,7 +26,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = loaded.config;
     let addr = config.addr;
     let report_outputs = config.observe.report_outputs();
-    let tokens = TokenRegistry::single(config.token, config.default_index, config.allowed_indexes);
+    let tokens = TokenRegistry::single(
+        config.token_id,
+        config.token,
+        config.token_enabled,
+        config.default_index,
+        config.allowed_indexes,
+        config.token_ack_enabled,
+    );
     let state = Arc::new(
         match config.capture_path {
             Some(path) => {
@@ -60,8 +67,8 @@ fn init_tracing(observe: &ObserveConfig) {
         return;
     }
 
-    let filter =
-        EnvFilter::try_new(&observe.level).unwrap_or_else(|_| EnvFilter::new("hec.receiver=info"));
+    let filter = EnvFilter::try_new(observe.filter_directives())
+        .unwrap_or_else(|_| EnvFilter::new("info,hec.receiver=info"));
     let result = match observe.format {
         ObserveFormat::Compact => tracing_subscriber::fmt()
             .with_env_filter(filter)

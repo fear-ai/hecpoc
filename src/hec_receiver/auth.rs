@@ -6,9 +6,11 @@ use super::outcome::HecError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthContext {
+    pub token_id: String,
     pub scheme: AuthScheme,
     pub default_index: Option<String>,
     pub allowed_indexes: Vec<String>,
+    pub ack_enabled: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,26 +26,43 @@ pub struct TokenRegistry {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HecToken {
+    id: String,
     secret: String,
+    enabled: bool,
     default_index: Option<String>,
     allowed_indexes: Vec<String>,
+    ack_enabled: bool,
 }
 
 impl HecToken {
     pub fn new(
+        id: String,
         secret: String,
+        enabled: bool,
         default_index: Option<String>,
         allowed_indexes: Vec<String>,
+        ack_enabled: bool,
     ) -> Self {
         Self {
+            id,
             secret,
+            enabled,
             default_index,
             allowed_indexes,
+            ack_enabled,
         }
+    }
+
+    fn id(&self) -> &str {
+        &self.id
     }
 
     fn secret(&self) -> &str {
         &self.secret
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
     }
 
     fn default_index(&self) -> Option<&str> {
@@ -53,22 +72,43 @@ impl HecToken {
     fn allowed_indexes(&self) -> &[String] {
         &self.allowed_indexes
     }
+
+    fn ack_enabled(&self) -> bool {
+        self.ack_enabled
+    }
 }
 
 impl TokenRegistry {
     pub fn new(tokens: Vec<String>) -> Self {
-        let tokens = tokens
-            .into_iter()
-            .map(|token| HecToken::new(token, None, Vec::new()));
+        let tokens = tokens.into_iter().enumerate().map(|(index, token)| {
+            HecToken::new(
+                format!("token-{index}"),
+                token,
+                true,
+                None,
+                Vec::new(),
+                false,
+            )
+        });
         Self::from_tokens(tokens)
     }
 
     pub fn single(
+        token_id: String,
         token: String,
+        enabled: bool,
         default_index: Option<String>,
         allowed_indexes: Vec<String>,
+        ack_enabled: bool,
     ) -> Self {
-        Self::from_tokens([HecToken::new(token, default_index, allowed_indexes)])
+        Self::from_tokens([HecToken::new(
+            token_id,
+            token,
+            enabled,
+            default_index,
+            allowed_indexes,
+            ack_enabled,
+        )])
     }
 
     pub fn from_tokens(tokens: impl IntoIterator<Item = HecToken>) -> Self {
@@ -83,10 +123,15 @@ impl TokenRegistry {
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, HecError> {
         let parsed = parse_authorization(headers)?;
         if let Some(token) = self.tokens.get(parsed.token.as_ref()) {
+            if !token.enabled() {
+                return Err(HecError::TokenDisabled);
+            }
             Ok(AuthContext {
+                token_id: token.id().to_string(),
                 scheme: parsed.scheme,
                 default_index: token.default_index().map(ToOwned::to_owned),
                 allowed_indexes: token.allowed_indexes().to_vec(),
+                ack_enabled: token.ack_enabled(),
             })
         } else {
             Err(HecError::InvalidToken)
@@ -186,15 +231,36 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, HeaderValue::from_static("Splunk abc"));
         let store = TokenRegistry::single(
+            "default".to_string(),
             "abc".to_string(),
+            true,
             Some("main".to_string()),
             vec!["main".to_string()],
+            false,
         );
 
         let context = store.authenticate(&headers).unwrap();
 
+        assert_eq!(context.token_id, "default");
         assert_eq!(context.default_index.as_deref(), Some("main"));
         assert_eq!(context.allowed_indexes, vec!["main"]);
+        assert!(!context.ack_enabled);
+    }
+
+    #[test]
+    fn rejects_disabled_token_with_distinct_internal_error() {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, HeaderValue::from_static("Splunk abc"));
+        let store = TokenRegistry::single(
+            "disabled-id".to_string(),
+            "abc".to_string(),
+            false,
+            Some("main".to_string()),
+            vec!["main".to_string()],
+            false,
+        );
+
+        assert_eq!(store.authenticate(&headers), Err(HecError::TokenDisabled));
     }
 
     #[test]

@@ -12,6 +12,7 @@ flowchart LR
   end
 
   subgraph R2["HTTP request B"]
+    B0["JSON array HecBatch B"]:::request
     B1["HecEnvelope B.1"]:::request
     B2["HecEnvelope B.2"]:::request
   end
@@ -21,8 +22,8 @@ flowchart LR
     C1["RawEvents C.1..C.n"]:::request
   end
 
-  HB1["HecBatch A<br/>stacked JSON input only"]:::hec
-  HB2["HecBatch B<br/>stacked JSON input only"]:::hec
+  HB1["HecBatch A<br/>stacked JSON objects"]:::hec
+  HB2["HecBatch B<br/>JSON array input"]:::hec
   HE1["HecEvents A<br/>valid events + provenance"]:::hec
   HE2["HecEvents B<br/>valid events + provenance"]:::hec
   HE3["HecEvents C<br/>raw events + provenance"]:::hec
@@ -46,6 +47,8 @@ flowchart LR
   A1 --> HB1
   A2 --> HB1
   A3 --> HB1
+  B0 --> B1
+  B0 --> B2
   B1 --> HB2
   B2 --> HB2
   C0 --> C1

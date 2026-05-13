@@ -12,6 +12,7 @@ pub enum HecError {
     TokenRequired,
     InvalidAuthorization,
     InvalidToken,
+    TokenDisabled,
     NoData,
     InvalidDataFormat,
     ServerBusy,
@@ -44,6 +45,11 @@ impl HecError {
                 StatusCode::FORBIDDEN,
                 "Invalid token",
                 protocol.invalid_token,
+            ),
+            Self::TokenDisabled => HecResponse::new(
+                StatusCode::FORBIDDEN,
+                "Token is disabled",
+                protocol.token_disabled,
             ),
             Self::NoData => HecResponse::new(StatusCode::BAD_REQUEST, "No data", protocol.no_data),
             Self::InvalidDataFormat => HecResponse::new(

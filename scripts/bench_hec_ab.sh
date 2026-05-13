@@ -17,7 +17,8 @@ C1_REQUESTS=${C1_REQUESTS:-500}
 CN_REQUESTS=${CN_REQUESTS:-2000}
 CONCURRENCY=${CONCURRENCY:-16}
 MONITOR_INTERVAL=${MONITOR_INTERVAL:-2}
-OBSERVE_LEVEL=${OBSERVE_LEVEL:-warn,hec.receiver=warn,hec.body=warn,hec.parser=warn,hec.sink=warn}
+OBSERVE_LEVEL=${OBSERVE_LEVEL:-warn}
+OBSERVE_SOURCES=${OBSERVE_SOURCES:-hec.receiver=warn,hec.body=warn,hec.parser=warn,hec.sink=warn}
 
 mkdir -p "$RUN"
 cp "$PAYLOAD" "$RUN/payload.input"
@@ -36,7 +37,7 @@ wc -l "$PAYLOAD" > "$RUN/payload.lines"
 
 cargo build --release
 
-target/release/hec-receiver \
+HEC_OBSERVE_SOURCES="$OBSERVE_SOURCES" target/release/hec-receiver \
   --addr "$ADDR" \
   --token "$TOKEN" \
   --max-bytes "$MAX_BYTES" \

@@ -165,6 +165,7 @@ pub mod field {
     pub const HTTP_STATUS: FieldId = FieldId::new("http_status");
     pub const AUTH_SCHEME: FieldId = FieldId::new("auth_scheme");
     pub const TOKEN_PRESENT: FieldId = FieldId::new("token_present");
+    pub const TOKEN_ID: FieldId = FieldId::new("token_id");
     pub const AUTH_LEN: FieldId = FieldId::new("auth_len");
     pub const HTTP_BODY_LEN: FieldId = FieldId::new("http_body_len");
     pub const DECODED_LEN: FieldId = FieldId::new("decoded_len");
@@ -202,6 +203,14 @@ pub mod field {
         Field {
             id: TOKEN_PRESENT,
             value: FieldValue::Bool(value),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn token_id(value: String) -> Field {
+        Field {
+            id: TOKEN_ID,
+            value: FieldValue::String(value),
         }
     }
 
@@ -564,6 +573,7 @@ pub mod facts {
     pub const AUTH_TOKEN_REQUIRED: FactId = FactId(10);
     pub const AUTH_INVALID_AUTHORIZATION: FactId = FactId(11);
     pub const AUTH_TOKEN_INVALID: FactId = FactId(12);
+    pub const AUTH_TOKEN_DISABLED: FactId = FactId(13);
     pub const GZIP_REQUEST: FactId = FactId(20);
     pub const GZIP_FAILED: FactId = FactId(21);
     pub const BODY_TOO_LARGE: FactId = FactId(22);
@@ -571,8 +581,10 @@ pub mod facts {
     pub const HTTP_BODY_READ: FactId = FactId(24);
     pub const BODY_DECODED: FactId = FactId(25);
     pub const BODY_READ_FAILED: FactId = FactId(26);
+    pub const BODY_UNSUPPORTED_ENCODING: FactId = FactId(27);
     pub const PARSE_FAILED: FactId = FactId(30);
     pub const EVENTS_PARSED: FactId = FactId(31);
+    pub const EVENT_INDEX_INVALID: FactId = FactId(32);
     pub const SINK_FAILED: FactId = FactId(40);
     pub const SINK_COMPLETED: FactId = FactId(41);
 }
@@ -603,6 +615,8 @@ const GZIP_REQUEST_COUNTERS: &[CounterBinding] =
 const GZIP_FAILED_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::GzipFailures)];
 const BODY_TOO_LARGE_COUNTERS: &[CounterBinding] =
     &[CounterBinding::Increment(Counter::BodyTooLarge)];
+const BODY_UNSUPPORTED_ENCODING_COUNTERS: &[CounterBinding] =
+    &[CounterBinding::Increment(Counter::UnsupportedEncoding)];
 const BODY_READ_FAILED_COUNTERS: &[CounterBinding] =
     &[CounterBinding::Increment(Counter::BodyReadErrors)];
 const BODY_TIMEOUT_COUNTERS: &[CounterBinding] = &[CounterBinding::Increment(Counter::Timeouts)];
@@ -646,6 +660,7 @@ const AUTH_FIELDS: &[FieldId] = &[
     field::OUTCOME,
     field::AUTH_SCHEME,
     field::TOKEN_PRESENT,
+    field::TOKEN_ID,
     field::AUTH_LEN,
     field::HEC_CODE,
     field::HTTP_STATUS,
@@ -738,6 +753,17 @@ static FACTS: &[FactSpec] = &[
         fields: AUTH_FIELDS,
     },
     FactSpec {
+        id: facts::AUTH_TOKEN_DISABLED,
+        name: "hec.auth.token_disabled",
+        phase: Phase::Ingress,
+        component: Component::Auth,
+        step: Step::Authorize,
+        severity: Severity::Warn,
+        outputs: LOG_CONSOLE_STATS,
+        counters: AUTH_FAILURE_COUNTERS,
+        fields: AUTH_FIELDS,
+    },
+    FactSpec {
         id: facts::GZIP_REQUEST,
         name: "hec.body.gzip_request",
         phase: Phase::Decode,
@@ -793,6 +819,17 @@ static FACTS: &[FactSpec] = &[
         fields: BODY_FIELDS,
     },
     FactSpec {
+        id: facts::BODY_UNSUPPORTED_ENCODING,
+        name: "hec.body.unsupported_encoding",
+        phase: Phase::Decode,
+        component: Component::Body,
+        step: Step::DecodeBody,
+        severity: Severity::Warn,
+        outputs: LOG_STATS,
+        counters: BODY_UNSUPPORTED_ENCODING_COUNTERS,
+        fields: BODY_FIELDS,
+    },
+    FactSpec {
         id: facts::HTTP_BODY_READ,
         name: "hec.body.http_body_read",
         phase: Phase::Ingress,
@@ -835,6 +872,17 @@ static FACTS: &[FactSpec] = &[
         outputs: OutputSet::STATS,
         counters: EVENTS_PARSED_COUNTERS,
         fields: EVENT_FIELDS,
+    },
+    FactSpec {
+        id: facts::EVENT_INDEX_INVALID,
+        name: "hec.parser.index_invalid",
+        phase: Phase::Parse,
+        component: Component::Parser,
+        step: Step::ParseEvent,
+        severity: Severity::Warn,
+        outputs: LOG_STATS,
+        counters: PARSE_FAILED_COUNTERS,
+        fields: COMMON_REQUEST_FIELDS,
     },
     FactSpec {
         id: facts::SINK_FAILED,

@@ -24,10 +24,11 @@ flowchart TD
   P["drop HecEvents<br/>explicit benchmark mode"]:::store
   Q["forward HecEvents<br/>future external destination"]:::store
   R["WriteBlock construction<br/>store/output aggregation"]:::store
-  S["Commit state<br/>accepted, queued, written, flushed, durable"]:::store
+  S["Disposition/commit state<br/>accepted, queued, written, flushed, durable"]:::store
   T["Inspection/readback<br/>capture evidence and run assertions"]:::store
   U["Format interpretation<br/>parse log-record structure"]:::optional
   V["Search preparation<br/>normalize, tokenize, index"]:::optional
+  X["response/reporting outcome<br/>no accepted HecEvents"]:::error
 
   A --> B --> C --> D
   D -- no --> M
@@ -44,4 +45,4 @@ flowchart TD
   L -- "forward later" --> Q --> S
   R --> S --> T
   S --> U --> V
-  M --> S
+  M --> X

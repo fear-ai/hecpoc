@@ -1,4 +1,5 @@
 const DEFAULT_SUCCESS: u16 = 0;
+const DEFAULT_TOKEN_DISABLED: u16 = 1;
 const DEFAULT_TOKEN_REQUIRED: u16 = 2;
 const DEFAULT_INVALID_AUTHORIZATION: u16 = 3;
 const DEFAULT_INVALID_TOKEN: u16 = 4;
@@ -18,6 +19,7 @@ const DEFAULT_SERVER_SHUTTING_DOWN: u16 = 23;
 #[derive(Debug, Clone)]
 pub struct Protocol {
     pub success: u16,
+    pub token_disabled: u16,
     pub token_required: u16,
     pub invalid_authorization: u16,
     pub invalid_token: u16,
@@ -39,6 +41,7 @@ impl Default for Protocol {
     fn default() -> Self {
         Self {
             success: DEFAULT_SUCCESS,
+            token_disabled: DEFAULT_TOKEN_DISABLED,
             token_required: DEFAULT_TOKEN_REQUIRED,
             invalid_authorization: DEFAULT_INVALID_AUTHORIZATION,
             invalid_token: DEFAULT_INVALID_TOKEN,

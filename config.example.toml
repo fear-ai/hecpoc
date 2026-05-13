@@ -1,0 +1,50 @@
+# HECpoc example configuration.
+# Compile defaults are used when keys are omitted. Uncomment only the values you want to override.
+
+[hec]
+# addr = "127.0.0.1:18088"
+# token_id = "default"
+# token = "dev-token"
+# token_enabled = true
+# token_ack_enabled = false
+# default_index = "main"
+# allowed_indexes = ["main"]
+# capture = "/tmp/hec-events.jsonl"
+
+[limits]
+# max_bytes = 1000000
+# max_decoded_bytes = 4000000
+# max_events = 100000
+# max_index_len = 128
+# idle_timeout = "5s"
+# total_timeout = "30s"
+# gzip_buffer_bytes = 8192
+
+[protocol]
+# success = 0
+# token_disabled = 1
+# token_required = 2
+# invalid_authorization = 3
+# invalid_token = 4
+# no_data = 5
+# invalid_data_format = 6
+# incorrect_index = 7
+# server_busy = 9
+# event_field_required = 12
+# event_field_blank = 13
+# ack_disabled = 14
+# handling_indexed_fields = 15
+# query_string_authorization_disabled = 16
+# health_ok = 17
+# health_unhealthy = 18
+# server_shutting_down = 23
+
+[observe]
+# level = "info"
+# sources = { "hec.receiver" = "info", "hec.auth" = "warn", "hec.body" = "warn", "hec.parser" = "warn", "hec.sink" = "warn" }
+# format = "compact"
+# redaction_mode = "redact"
+# redaction_text = "<redacted>"
+# tracing = true
+# console = false
+# stats = true
