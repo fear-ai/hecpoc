@@ -58,6 +58,7 @@ const DEFAULT_REDACTION_TEXT: &str = "<redacted>";
 #[derive(Debug, Clone)]
 pub struct RuntimeConfig {
     pub addr: SocketAddr,
+    pub tokens: Vec<RuntimeToken>,
     pub token_id: String,
     pub token: String,
     pub token_enabled: bool,
@@ -68,6 +69,16 @@ pub struct RuntimeConfig {
     pub limits: Limits,
     pub protocol: Protocol,
     pub observe: ObserveConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeToken {
+    pub id: String,
+    pub secret: String,
+    pub enabled: bool,
+    pub ack_enabled: bool,
+    pub default_index: Option<String>,
+    pub allowed_indexes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -359,6 +370,7 @@ impl Cli {
                 default_index: self.default_index.clone(),
                 allowed_indexes: self.allowed_indexes.clone(),
                 capture: self.capture.clone(),
+                tokens: None,
             })
             .filter(has_hec_values),
             limits: Some(LimitsDoc {
@@ -437,6 +449,7 @@ impl ConfigDoc {
                 default_index: Some(DEFAULT_INDEX.to_string()),
                 allowed_indexes: Some(vec![DEFAULT_INDEX.to_string()]),
                 capture: None,
+                tokens: None,
             }),
             limits: Some(LimitsDoc {
                 max_bytes: Some(DEFAULT_MAX_BYTES),
@@ -478,6 +491,7 @@ impl ConfigDoc {
                 default_index: env_string(ENV_DEFAULT_INDEX),
                 allowed_indexes: env_list(ENV_ALLOWED_INDEXES),
                 capture: env_string(ENV_CAPTURE),
+                tokens: None,
             })
             .filter(has_hec_values),
             limits: Some(LimitsDoc {
@@ -560,6 +574,28 @@ impl ConfigDoc {
                 default_index: config.default_index.clone(),
                 allowed_indexes: Some(config.allowed_indexes.clone()),
                 capture: config.capture_path.clone(),
+                tokens: if config.tokens.len() > 1 {
+                    Some(
+                        config
+                            .tokens
+                            .iter()
+                            .map(|token| HecTokenDoc {
+                                id: Some(token.id.clone()),
+                                secret: Some(if redact {
+                                    config.observe.redaction_text.clone()
+                                } else {
+                                    token.secret.clone()
+                                }),
+                                enabled: Some(token.enabled),
+                                ack_enabled: Some(token.ack_enabled),
+                                default_index: token.default_index.clone(),
+                                allowed_indexes: Some(token.allowed_indexes.clone()),
+                            })
+                            .collect(),
+                    )
+                } else {
+                    None
+                },
             }),
             limits: Some(LimitsDoc {
                 max_bytes: Some(config.limits.max_http_body_bytes),
@@ -585,7 +621,7 @@ impl ConfigDoc {
         let protocol = self.protocol.unwrap_or_default();
         let observe = self.observe.unwrap_or_default();
 
-        let addr_text = required(hec.addr, "hec.addr")?;
+        let addr_text = required(hec.addr.clone(), "hec.addr")?;
         let addr = addr_text
             .parse::<SocketAddr>()
             .map_err(|error| ConfigError::Invalid {
@@ -596,8 +632,8 @@ impl ConfigDoc {
             return invalid("hec.addr", "port must be greater than zero");
         }
 
-        let token = required(hec.token, "hec.token")?;
-        let token_id = required(hec.token_id, "hec.token_id")?;
+        let token = required(hec.token.clone(), "hec.token")?;
+        let token_id = required(hec.token_id.clone(), "hec.token_id")?;
         if token_id.trim().is_empty() {
             return invalid("hec.token_id", "token id cannot be empty");
         }
@@ -648,7 +684,7 @@ impl ConfigDoc {
                 );
             }
         }
-        let allowed_indexes = hec.allowed_indexes.unwrap_or_default();
+        let allowed_indexes = hec.allowed_indexes.clone().unwrap_or_default();
         for allowed_index in &allowed_indexes {
             if allowed_index.is_empty() {
                 return invalid("hec.allowed_indexes", "index names cannot be empty");
@@ -688,16 +724,18 @@ impl ConfigDoc {
             );
         }
         let observe = observe.to_observe()?;
+        let tokens = build_runtime_tokens(&hec, max_index_len)?;
 
         Ok(RuntimeConfig {
             addr,
+            tokens,
             token_id,
             token,
             token_enabled,
             token_ack_enabled,
-            default_index: hec.default_index,
+            default_index: hec.default_index.clone(),
             allowed_indexes,
-            capture_path: hec.capture,
+            capture_path: hec.capture.clone(),
             limits: Limits {
                 max_content_length: max_bytes,
                 max_http_body_bytes: max_bytes,
@@ -733,6 +771,25 @@ struct HecDoc {
     allowed_indexes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<Vec<HecTokenDoc>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HecTokenDoc {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ack_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    default_index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    allowed_indexes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -947,6 +1004,7 @@ fn has_hec_values(value: &HecDoc) -> bool {
         || value.default_index.is_some()
         || value.allowed_indexes.is_some()
         || value.capture.is_some()
+        || value.tokens.is_some()
 }
 
 fn has_limit_values(value: &LimitsDoc) -> bool {
@@ -990,6 +1048,153 @@ fn has_observe_values(value: &ObserveDoc) -> bool {
         || value.stats.is_some()
 }
 
+fn build_runtime_tokens(
+    hec: &HecDoc,
+    max_index_len: usize,
+) -> Result<Vec<RuntimeToken>, ConfigError> {
+    let tokens = match hec.tokens.as_ref() {
+        Some(tokens) if !tokens.is_empty() => tokens
+            .iter()
+            .enumerate()
+            .map(|(index, token)| {
+                let field = "hec.tokens";
+                let id = required(token.id.clone(), "hec.tokens.id")?;
+                if id.trim().is_empty() {
+                    return invalid("hec.tokens.id", "token id cannot be empty");
+                }
+                let secret = required(token.secret.clone(), "hec.tokens.secret")?;
+                validate_token_field(&secret, "hec.tokens.secret")?;
+                let enabled = token.enabled.unwrap_or(true);
+                let ack_enabled = token.ack_enabled.unwrap_or(false);
+                validate_optional_index(
+                    token.default_index.as_deref(),
+                    max_index_len,
+                    "hec.tokens.default_index",
+                )?;
+                let allowed_indexes = token.allowed_indexes.clone().unwrap_or_default();
+                validate_allowed_indexes(
+                    &allowed_indexes,
+                    max_index_len,
+                    "hec.tokens.allowed_indexes",
+                )?;
+                validate_default_in_allowed(
+                    token.default_index.as_deref(),
+                    &allowed_indexes,
+                    "hec.tokens.default_index",
+                )?;
+                Ok(RuntimeToken {
+                    id,
+                    secret,
+                    enabled,
+                    ack_enabled,
+                    default_index: token.default_index.clone(),
+                    allowed_indexes,
+                })
+                .map_err(|error: ConfigError| match error {
+                    ConfigError::Invalid { field: _, message } => ConfigError::Invalid {
+                        field,
+                        message: format!("entry {index}: {message}"),
+                    },
+                    other => other,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => vec![RuntimeToken {
+            id: required(hec.token_id.clone(), "hec.token_id")?,
+            secret: required(hec.token.clone(), "hec.token")?,
+            enabled: required(hec.token_enabled, "hec.token_enabled")?,
+            ack_enabled: required(hec.token_ack_enabled, "hec.token_ack_enabled")?,
+            default_index: hec.default_index.clone(),
+            allowed_indexes: hec.allowed_indexes.clone().unwrap_or_default(),
+        }],
+    };
+
+    if tokens.is_empty() {
+        return invalid("hec.tokens", "at least one token is required");
+    }
+
+    for (index, token) in tokens.iter().enumerate() {
+        if token.id.trim().is_empty() {
+            return invalid(
+                "hec.tokens",
+                format!("entry {index}: token id cannot be empty"),
+            );
+        }
+        validate_token_field(&token.secret, "hec.tokens")?;
+    }
+
+    for left in 0..tokens.len() {
+        for right in (left + 1)..tokens.len() {
+            if tokens[left].id == tokens[right].id {
+                return invalid("hec.tokens", "token ids must be unique");
+            }
+            if tokens[left].secret == tokens[right].secret {
+                return invalid("hec.tokens", "token secrets must be unique");
+            }
+        }
+    }
+
+    Ok(tokens)
+}
+
+fn validate_optional_index(
+    index: Option<&str>,
+    max_index_len: usize,
+    field: &'static str,
+) -> Result<(), ConfigError> {
+    if matches!(index, Some("")) {
+        return invalid(field, "default index cannot be empty");
+    }
+    if let Some(index) = index {
+        if !is_valid_index_name(index, max_index_len) {
+            return invalid(
+                field,
+                "must use lowercase ASCII letters, digits, underscore, or dash; cannot start with '_' or '-'; cannot contain 'kvstore'; cannot exceed limits.max_index_len",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_allowed_indexes(
+    allowed_indexes: &[String],
+    max_index_len: usize,
+    field: &'static str,
+) -> Result<(), ConfigError> {
+    for allowed_index in allowed_indexes {
+        if allowed_index.is_empty() {
+            return invalid(field, "index names cannot be empty");
+        }
+        if !is_valid_index_name(allowed_index, max_index_len) {
+            return invalid(
+                field,
+                "each index must use lowercase ASCII letters, digits, underscore, or dash; cannot start with '_' or '-'; cannot contain 'kvstore'; cannot exceed limits.max_index_len",
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_default_in_allowed(
+    default_index: Option<&str>,
+    allowed_indexes: &[String],
+    field: &'static str,
+) -> Result<(), ConfigError> {
+    if let Some(default_index) = default_index {
+        if !allowed_indexes.is_empty()
+            && !allowed_indexes
+                .iter()
+                .any(|allowed| allowed == default_index)
+        {
+            return invalid(
+                field,
+                "default index must be listed in allowed indexes when an allow-list is configured",
+            );
+        }
+    }
+    Ok(())
+}
+
 fn required<T>(value: Option<T>, field: &'static str) -> Result<T, ConfigError> {
     value.ok_or_else(|| ConfigError::Invalid {
         field,
@@ -1012,11 +1217,15 @@ fn parse_duration(value: String, field: &'static str) -> Result<Duration, Config
 }
 
 fn validate_token(token: &str) -> Result<(), ConfigError> {
+    validate_token_field(token, "hec.token")
+}
+
+fn validate_token_field(token: &str, field: &'static str) -> Result<(), ConfigError> {
     if token.is_empty() {
-        return invalid("hec.token", "token cannot be empty");
+        return invalid(field, "token cannot be empty");
     }
     if token.chars().any(|character| character.is_ascii_control()) {
-        return invalid("hec.token", "token cannot contain ASCII control characters");
+        return invalid(field, "token cannot contain ASCII control characters");
     }
     Ok(())
 }
@@ -1440,6 +1649,142 @@ token = "env-file-token"
         assert_eq!(loaded.config.token_id, "default");
         assert!(loaded.config.token_enabled);
         assert!(!loaded.config.token_ack_enabled);
+        assert_eq!(loaded.config.tokens.len(), 1);
+        assert_eq!(loaded.config.tokens[0].id, "default");
+    }
+
+    #[test]
+    fn loads_multiple_token_records_from_toml() {
+        let _guard = env_guard();
+        let config_path = write_config(
+            r#"
+[hec]
+addr = "127.0.0.1:18111"
+token = "legacy-token"
+default_index = "main"
+allowed_indexes = ["main"]
+
+[[hec.tokens]]
+id = "main-token"
+secret = "main-secret"
+enabled = true
+ack_enabled = false
+default_index = "main"
+allowed_indexes = ["main"]
+
+[[hec.tokens]]
+id = "audit-token"
+secret = "audit-secret"
+enabled = false
+ack_enabled = true
+default_index = "audit"
+allowed_indexes = ["audit", "main"]
+"#,
+        );
+
+        let loaded = RuntimeConfig::load_with_cli(Cli {
+            config: Some(config_path),
+            ..Cli::default()
+        })
+        .expect("load config");
+
+        assert_eq!(loaded.config.tokens.len(), 2);
+        assert_eq!(loaded.config.tokens[0].id, "main-token");
+        assert_eq!(loaded.config.tokens[0].secret, "main-secret");
+        assert_eq!(
+            loaded.config.tokens[0].default_index.as_deref(),
+            Some("main")
+        );
+        assert_eq!(loaded.config.tokens[1].id, "audit-token");
+        assert_eq!(loaded.config.tokens[1].secret, "audit-secret");
+        assert!(!loaded.config.tokens[1].enabled);
+        assert!(loaded.config.tokens[1].ack_enabled);
+        assert_eq!(
+            loaded.config.tokens[1].allowed_indexes,
+            vec!["audit", "main"]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_token_ids() {
+        let _guard = env_guard();
+        let config_path = write_config(
+            r#"
+[hec]
+addr = "127.0.0.1:18111"
+token = "legacy-token"
+
+[[hec.tokens]]
+id = "dup"
+secret = "one"
+
+[[hec.tokens]]
+id = "dup"
+secret = "two"
+"#,
+        );
+
+        let error = RuntimeConfig::load_with_cli(Cli {
+            config: Some(config_path),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("token ids must be unique"));
+    }
+
+    #[test]
+    fn rejects_duplicate_token_secrets() {
+        let _guard = env_guard();
+        let config_path = write_config(
+            r#"
+[hec]
+addr = "127.0.0.1:18111"
+token = "legacy-token"
+
+[[hec.tokens]]
+id = "one"
+secret = "same"
+
+[[hec.tokens]]
+id = "two"
+secret = "same"
+"#,
+        );
+
+        let error = RuntimeConfig::load_with_cli(Cli {
+            config: Some(config_path),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("token secrets must be unique"));
+    }
+
+    #[test]
+    fn rejects_token_default_index_outside_token_allowed_indexes() {
+        let _guard = env_guard();
+        let config_path = write_config(
+            r#"
+[hec]
+addr = "127.0.0.1:18111"
+token = "legacy-token"
+
+[[hec.tokens]]
+id = "bad-index"
+secret = "secret"
+default_index = "audit"
+allowed_indexes = ["main"]
+"#,
+        );
+
+        let error = RuntimeConfig::load_with_cli(Cli {
+            config: Some(config_path),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("default index must be listed"));
     }
 
     #[test]

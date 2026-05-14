@@ -5,7 +5,6 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use serde_json::json;
 use std::{sync::Arc, time::Instant};
 
 use super::{
@@ -53,14 +52,7 @@ pub async fn health(State(state): State<Arc<AppState>>) -> Response {
             state.protocol.health_unhealthy,
         ),
     };
-    (
-        status,
-        Json(json!({
-            "text": text,
-            "code": code
-        })),
-    )
-        .into_response()
+    HecResponse::new(status, text, code).into_response()
 }
 
 pub async fn stats(State(state): State<Arc<AppState>>) -> Response {
@@ -427,7 +419,9 @@ fn report_decode_error(
     outcome: &HecResponse,
 ) {
     let fact = match (encoding, error) {
-        (Encoding::Gzip, HecError::InvalidDataFormat) => facts::GZIP_FAILED,
+        (Encoding::Gzip, HecError::InvalidDataFormat | HecError::MalformedGzip) => {
+            facts::GZIP_FAILED
+        }
         (_, HecError::BodyTooLarge) => facts::BODY_TOO_LARGE,
         _ => return,
     };
@@ -476,7 +470,7 @@ mod tests {
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::OK);
-        assert_eq!(body.as_ref(), br#"{"code":17,"text":"HEC is healthy"}"#);
+        assert_eq!(body.as_ref(), br#"{"text":"HEC is healthy","code":17}"#);
     }
 
     #[tokio::test]
@@ -492,7 +486,7 @@ mod tests {
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(body.as_ref(), br#"{"code":18,"text":"HEC is unhealthy"}"#);
+        assert_eq!(body.as_ref(), br#"{"text":"HEC is unhealthy","code":18}"#);
     }
 
     #[tokio::test]
@@ -510,7 +504,7 @@ mod tests {
         assert_eq!(parts.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             body.as_ref(),
-            br#"{"code":23,"text":"Server is shutting down"}"#
+            br#"{"text":"Server is shutting down","code":23}"#
         );
     }
 
@@ -691,7 +685,10 @@ mod tests {
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::BAD_REQUEST);
-        assert_eq!(body.as_ref(), br#"{"text":"Invalid data format","code":6}"#);
+        assert_eq!(
+            body.as_ref(),
+            b"<!doctype html><html><head><meta http-equiv=\"content-type\" content=\"text/html; charset=UTF-8\"><title>400 Unparsable gzip header in request data</title></head><body><h1>Unparsable gzip header in request data</h1><p>HTTP Request was malformed.</p></body></html>\r\n"
+        );
         assert_eq!(state.reporter.stats_snapshot().gzip_failures, 1);
     }
 

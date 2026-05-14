@@ -93,6 +93,7 @@ impl TokenRegistry {
         Self::from_tokens(tokens)
     }
 
+    #[allow(dead_code)]
     pub fn single(
         token_id: String,
         token: String,

@@ -11,6 +11,25 @@
 # allowed_indexes = ["main"]
 # capture = "/tmp/hec-events.jsonl"
 
+# For more than one token, keep the shorthand fields above as compatibility
+# defaults or replace them with explicit token records.
+#
+# [[hec.tokens]]
+# id = "default"
+# secret = "dev-token"
+# enabled = true
+# ack_enabled = false
+# default_index = "main"
+# allowed_indexes = ["main"]
+#
+# [[hec.tokens]]
+# id = "disabled-example"
+# secret = "disabled-token"
+# enabled = false
+# ack_enabled = false
+# default_index = "main"
+# allowed_indexes = ["main"]
+
 [limits]
 # max_bytes = 1000000
 # max_decoded_bytes = 4000000

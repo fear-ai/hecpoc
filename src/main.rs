@@ -1,7 +1,8 @@
 mod hec_receiver;
 
 use hec_receiver::{
-    AppState, ConfigAction, ObserveConfig, ObserveFormat, Phase, RuntimeConfig, TokenRegistry,
+    AppState, ConfigAction, HecToken, ObserveConfig, ObserveFormat, Phase, RuntimeConfig,
+    TokenRegistry,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -26,14 +27,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = loaded.config;
     let addr = config.addr;
     let report_outputs = config.observe.report_outputs();
-    let tokens = TokenRegistry::single(
-        config.token_id,
-        config.token,
-        config.token_enabled,
-        config.default_index,
-        config.allowed_indexes,
-        config.token_ack_enabled,
-    );
+    let tokens = TokenRegistry::from_tokens(config.tokens.into_iter().map(|token| {
+        HecToken::new(
+            token.id,
+            token.secret,
+            token.enabled,
+            token.default_index,
+            token.allowed_indexes,
+            token.ack_enabled,
+        )
+    }));
     let state = Arc::new(
         match config.capture_path {
             Some(path) => {

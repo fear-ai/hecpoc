@@ -105,7 +105,7 @@ fn decode_gzip_limited(
     loop {
         let read = decoder
             .read(&mut buf)
-            .map_err(|_| HecError::InvalidDataFormat)?;
+            .map_err(|_| HecError::MalformedGzip)?;
         if read == 0 {
             break;
         }

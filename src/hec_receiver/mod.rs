@@ -15,6 +15,6 @@ mod sink;
 mod stats;
 
 pub use app::{router, AppState};
-pub use auth::TokenRegistry;
+pub use auth::{HecToken, TokenRegistry};
 pub use config::{ConfigAction, ObserveConfig, ObserveFormat, RuntimeConfig};
 pub use health::Phase;

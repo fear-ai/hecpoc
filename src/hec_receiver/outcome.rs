@@ -15,6 +15,7 @@ pub enum HecError {
     TokenDisabled,
     NoData,
     InvalidDataFormat,
+    MalformedGzip,
     ServerBusy,
     IncorrectIndex,
     EventFieldRequired,
@@ -56,6 +57,14 @@ impl HecError {
                 StatusCode::BAD_REQUEST,
                 "Invalid data format",
                 protocol.invalid_data_format,
+            ),
+            Self::MalformedGzip => HecResponse::html(
+                StatusCode::BAD_REQUEST,
+                "Invalid data format",
+                protocol.invalid_data_format,
+                "400 Unparsable gzip header in request data",
+                "Unparsable gzip header in request data",
+                "HTTP Request was malformed.",
             ),
             Self::ServerBusy => HecResponse::new(
                 StatusCode::SERVICE_UNAVAILABLE,
