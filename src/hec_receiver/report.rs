@@ -81,6 +81,61 @@ pub enum Outcome {
     Informational,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    TokenRequired,
+    InvalidAuthorization,
+    InvalidToken,
+    TokenDisabled,
+    NoData,
+    InvalidDataFormat,
+    MalformedGzip,
+    ServerBusy,
+    IncorrectIndex,
+    EventFieldRequired,
+    EventFieldBlank,
+    AckDisabled,
+    IndexedFields,
+    QueryStringAuthorizationDisabled,
+    UnsupportedEncoding,
+    BodyTooLarge,
+    Timeout,
+    ServerShuttingDown,
+    SinkFailed,
+}
+
+impl Reason {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenRequired => "token_required",
+            Self::InvalidAuthorization => "invalid_authorization",
+            Self::InvalidToken => "invalid_token",
+            Self::TokenDisabled => "token_disabled",
+            Self::NoData => "no_data",
+            Self::InvalidDataFormat => "invalid_data_format",
+            Self::MalformedGzip => "malformed_gzip",
+            Self::ServerBusy => "server_busy",
+            Self::IncorrectIndex => "incorrect_index",
+            Self::EventFieldRequired => "event_field_required",
+            Self::EventFieldBlank => "event_field_blank",
+            Self::AckDisabled => "ack_disabled",
+            Self::IndexedFields => "indexed_fields",
+            Self::QueryStringAuthorizationDisabled => "query_string_authorization_disabled",
+            Self::UnsupportedEncoding => "unsupported_encoding",
+            Self::BodyTooLarge => "body_too_large",
+            Self::Timeout => "timeout",
+            Self::ServerShuttingDown => "server_shutting_down",
+            Self::SinkFailed => "sink_failed",
+        }
+    }
+}
+
+impl fmt::Display for Reason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 impl fmt::Display for Outcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -140,6 +195,7 @@ pub enum FieldValue {
     Str(&'static str),
     String(String),
     Outcome(Outcome),
+    Reason(Reason),
     Endpoint(Endpoint),
 }
 
@@ -151,13 +207,14 @@ impl FieldValue {
             Self::Str(value) => Value::String((*value).to_string()),
             Self::String(value) => Value::String(value.clone()),
             Self::Outcome(value) => Value::String(value.to_string()),
+            Self::Reason(value) => Value::String(value.to_string()),
             Self::Endpoint(value) => Value::String(value.as_str().to_string()),
         }
     }
 }
 
 pub mod field {
-    use super::{Endpoint, Field, FieldId, FieldValue, Outcome};
+    use super::{Endpoint, Field, FieldId, FieldValue, Outcome, Reason};
     use std::time::Duration;
 
     pub const OUTCOME: FieldId = FieldId::new("outcome");
@@ -175,6 +232,7 @@ pub mod field {
     pub const ELAPSED_US: FieldId = FieldId::new("elapsed_us");
     pub const ENDPOINT_KIND: FieldId = FieldId::new("endpoint_kind");
     pub const ROUTE_ALIAS: FieldId = FieldId::new("route_alias");
+    pub const REASON: FieldId = FieldId::new("reason");
     pub const FAILURE_REASON: FieldId = FieldId::new("failure_reason");
     pub const INPUT_CLASS: FieldId = FieldId::new("input_class");
     pub const INPUT_OFFSET: FieldId = FieldId::new("input_offset");
@@ -257,6 +315,13 @@ pub mod field {
         Field {
             id: ROUTE_ALIAS,
             value: FieldValue::String(value),
+        }
+    }
+
+    pub fn reason(value: Reason) -> Field {
+        Field {
+            id: REASON,
+            value: FieldValue::Reason(value),
         }
     }
 
@@ -433,6 +498,9 @@ impl Reporter {
                     }
                 }
             }
+        }
+        if let Some(reason) = get_reason(fields) {
+            self.stats.increment_reason(spec.name, reason.as_str());
         }
     }
 
@@ -652,6 +720,8 @@ const COMMON_REQUEST_FIELDS: &[FieldId] = &[
     field::HTTP_STATUS,
     field::ENDPOINT_KIND,
     field::ROUTE_ALIAS,
+    field::TOKEN_ID,
+    field::REASON,
     field::ELAPSED_US,
     field::FAILURE_REASON,
 ];
@@ -664,6 +734,8 @@ const AUTH_FIELDS: &[FieldId] = &[
     field::AUTH_LEN,
     field::HEC_CODE,
     field::HTTP_STATUS,
+    field::REASON,
+    field::FAILURE_REASON,
 ];
 
 const BODY_FIELDS: &[FieldId] = &[
@@ -674,15 +746,26 @@ const BODY_FIELDS: &[FieldId] = &[
     field::DECODED_LEN,
     field::INPUT_CLASS,
     field::INPUT_OFFSET,
+    field::REASON,
     field::FAILURE_REASON,
 ];
 
-const EVENT_FIELDS: &[FieldId] = &[field::EVENT_COUNT, field::OUTCOME];
+const EVENT_FIELDS: &[FieldId] = &[
+    field::EVENT_COUNT,
+    field::OUTCOME,
+    field::ENDPOINT_KIND,
+    field::HEC_CODE,
+    field::HTTP_STATUS,
+    field::REASON,
+    field::FAILURE_REASON,
+];
 const SINK_FIELDS: &[FieldId] = &[
     field::OUTCOME,
     field::EVENT_COUNT,
     field::DROP_COUNT,
     field::WRITTEN_COUNT,
+    field::REASON,
+    field::FAILURE_REASON,
 ];
 
 static FACTS: &[FactSpec] = &[
@@ -926,6 +1009,17 @@ fn get_u64(fields: &[Field], field: FieldId) -> Option<u64> {
     })
 }
 
+fn get_reason(fields: &[Field]) -> Option<Reason> {
+    fields.iter().find_map(|candidate| {
+        if candidate.id == field::REASON {
+            if let FieldValue::Reason(value) = candidate.value {
+                return Some(value);
+            }
+        }
+        None
+    })
+}
+
 fn fields_json(fields: &[Field]) -> Value {
     let mut out = Map::new();
     for field in fields {
@@ -936,7 +1030,7 @@ fn fields_json(fields: &[Field]) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use super::{facts, field, Outcome, ReportContext, ReportOutputs, Reporter};
+    use super::{facts, field, Outcome, Reason, ReportContext, ReportOutputs, Reporter};
 
     #[test]
     fn submit_updates_stats_from_fact_mapping() {
@@ -962,6 +1056,26 @@ mod tests {
         let stats = reporter.stats_snapshot();
         assert_eq!(stats.http_body_bytes, 11);
         assert_eq!(stats.decoded_bytes, 7);
+    }
+
+    #[test]
+    fn submit_records_reason_counts_by_fact() {
+        let reporter = Reporter::default();
+        let ctx = ReportContext::request();
+        reporter.submit(
+            &ctx,
+            facts::REQUEST_FAILED,
+            vec![
+                field::outcome(Outcome::Rejected),
+                field::reason(Reason::InvalidToken),
+                field::hec_code(4),
+                field::http_status(403),
+            ],
+        );
+
+        let stats = reporter.stats_snapshot();
+        assert_eq!(stats.requests_failed, 1);
+        assert_eq!(stats.reasons["hec.request.failed"]["invalid_token"], 1);
     }
 
     #[test]

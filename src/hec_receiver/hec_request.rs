@@ -18,7 +18,8 @@ use super::{
     outcome::{HecError, HecResponse},
     parse_event::parse_event_body,
     parse_raw::parse_raw_body,
-    report::{facts, field, Outcome, ReportContext},
+    protocol::Protocol,
+    report::{facts, field, Outcome, Reason, ReportContext},
 };
 
 pub async fn post_event(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
@@ -31,6 +32,17 @@ pub async fn post_raw(State(state): State<Arc<AppState>>, request: Request<Body>
 
 pub async fn post_ack(State(state): State<Arc<AppState>>, request: Request<Body>) -> Response {
     process_ack_request(state, request).await
+}
+
+struct PipelineOk {
+    response: HecResponse,
+    token_id: String,
+}
+
+struct PipelineErr {
+    response: HecResponse,
+    token_id: Option<String>,
+    reason: Reason,
 }
 
 pub async fn health(State(state): State<Arc<AppState>>) -> Response {
@@ -91,32 +103,49 @@ async fn process_ack_request(state: Arc<AppState>, request: Request<Body>) -> Re
     );
 
     let (parts, _) = request.into_parts();
-    let outcome = if query_has_token(parts.uri.query()) {
-        HecError::QueryStringAuthorizationDisabled.outcome(&state.protocol)
+    let (outcome, reason, token_id) = if query_has_token(parts.uri.query()) {
+        let error = HecError::QueryStringAuthorizationDisabled;
+        (error.outcome(&state.protocol), error.reason(), None)
     } else {
-        match state.tokens.authenticate(&parts.headers) {
-            Ok(auth) if auth.ack_enabled => HecError::AckDisabled.outcome(&state.protocol),
-            Ok(_) => HecError::AckDisabled.outcome(&state.protocol),
-            Err(error) => {
-                let outcome = error.outcome(&state.protocol);
-                report_auth_error(&state, &ctx, error, &outcome);
-                outcome
+        match state.tokens.authenticate_detailed(&parts.headers) {
+            Ok(auth) if auth.ack_enabled => (
+                HecError::AckDisabled.outcome(&state.protocol),
+                HecError::AckDisabled.reason(),
+                Some(auth.token_id),
+            ),
+            Ok(auth) => (
+                HecError::AckDisabled.outcome(&state.protocol),
+                HecError::AckDisabled.reason(),
+                Some(auth.token_id),
+            ),
+            Err(failure) => {
+                let outcome = failure.error.outcome(&state.protocol);
+                let reason = failure.error.reason();
+                report_auth_error(
+                    &state,
+                    &ctx,
+                    failure.error,
+                    failure.token_id.as_deref(),
+                    &outcome,
+                );
+                (outcome, reason, failure.token_id)
             }
         }
     };
-    state.reporter.submit(
-        &ctx,
-        facts::REQUEST_FAILED,
-        vec![
-            field::outcome(outcome_from_response(&outcome)),
-            field::endpoint_kind(Endpoint::Ack),
-            field::route_alias(route_alias),
-            field::hec_code(outcome.code),
-            field::http_status(outcome.status.as_u16()),
-            field::failure_reason(outcome.text),
-            field::elapsed_us(started.elapsed()),
-        ],
-    );
+    let mut fields = vec![
+        field::outcome(outcome_from_response(&outcome)),
+        field::endpoint_kind(Endpoint::Ack),
+        field::route_alias(route_alias),
+        field::reason(reason),
+        field::hec_code(outcome.code),
+        field::http_status(outcome.status.as_u16()),
+        field::failure_reason(outcome.text),
+        field::elapsed_us(started.elapsed()),
+    ];
+    if let Some(token_id) = token_id {
+        fields.push(field::token_id(token_id));
+    }
+    state.reporter.submit(&ctx, facts::REQUEST_FAILED, fields);
 
     outcome.into_response()
 }
@@ -140,7 +169,7 @@ async fn process_hec_request(
 
     let result = process_hec_request_pipeline(&state, &ctx, request, endpoint).await;
     let response = match result {
-        Ok(outcome) => {
+        Ok(success) => {
             state.reporter.submit(
                 &ctx,
                 facts::REQUEST_SUCCEEDED,
@@ -148,28 +177,30 @@ async fn process_hec_request(
                     field::outcome(Outcome::Accepted),
                     field::endpoint_kind(endpoint),
                     field::route_alias(route_alias),
-                    field::hec_code(outcome.code),
-                    field::http_status(outcome.status.as_u16()),
+                    field::token_id(success.token_id),
+                    field::hec_code(success.response.code),
+                    field::http_status(success.response.status.as_u16()),
                     field::elapsed_us(started.elapsed()),
                 ],
             );
-            outcome.into_response()
+            success.response.into_response()
         }
-        Err(outcome) => {
-            state.reporter.submit(
-                &ctx,
-                facts::REQUEST_FAILED,
-                vec![
-                    field::outcome(outcome_from_response(&outcome)),
-                    field::endpoint_kind(endpoint),
-                    field::route_alias(route_alias),
-                    field::hec_code(outcome.code),
-                    field::http_status(outcome.status.as_u16()),
-                    field::failure_reason(outcome.text),
-                    field::elapsed_us(started.elapsed()),
-                ],
-            );
-            outcome.into_response()
+        Err(failure) => {
+            let mut fields = vec![
+                field::outcome(outcome_from_response(&failure.response)),
+                field::endpoint_kind(endpoint),
+                field::route_alias(route_alias),
+                field::reason(failure.reason),
+                field::hec_code(failure.response.code),
+                field::http_status(failure.response.status.as_u16()),
+                field::failure_reason(failure.response.text),
+                field::elapsed_us(started.elapsed()),
+            ];
+            if let Some(token_id) = failure.token_id {
+                fields.push(field::token_id(token_id));
+            }
+            state.reporter.submit(&ctx, facts::REQUEST_FAILED, fields);
+            failure.response.into_response()
         }
     };
 
@@ -181,33 +212,47 @@ async fn process_hec_request_pipeline(
     ctx: &ReportContext,
     request: Request<Body>,
     endpoint: Endpoint,
-) -> Result<HecResponse, HecResponse> {
+) -> Result<PipelineOk, PipelineErr> {
     let phase = state.health.current();
     if !phase.admits_work() {
         let error = match phase {
             Phase::Stopping => HecError::ServerShuttingDown,
             _ => HecError::ServerBusy,
         };
-        return Err(error.outcome(&state.protocol));
+        return Err(pipeline_error(error, None, &state.protocol));
     }
 
     let (parts, body) = request.into_parts();
     if query_has_token(parts.uri.query()) {
-        let outcome = HecError::QueryStringAuthorizationDisabled.outcome(&state.protocol);
-        report_auth_error(
-            state,
-            ctx,
-            HecError::QueryStringAuthorizationDisabled,
-            &outcome,
-        );
-        return Err(outcome);
+        let error = HecError::QueryStringAuthorizationDisabled;
+        let outcome = error.outcome(&state.protocol);
+        report_auth_error(state, ctx, error, None, &outcome);
+        return Err(PipelineErr {
+            response: outcome,
+            token_id: None,
+            reason: error.reason(),
+        });
     }
 
-    let auth = state.tokens.authenticate(&parts.headers).map_err(|error| {
-        let outcome = error.outcome(&state.protocol);
-        report_auth_error(state, ctx, error, &outcome);
-        outcome
-    })?;
+    let auth = state
+        .tokens
+        .authenticate_detailed(&parts.headers)
+        .map_err(|failure| {
+            let outcome = failure.error.outcome(&state.protocol);
+            report_auth_error(
+                state,
+                ctx,
+                failure.error,
+                failure.token_id.as_deref(),
+                &outcome,
+            );
+            PipelineErr {
+                response: outcome,
+                token_id: failure.token_id,
+                reason: failure.error.reason(),
+            }
+        })?;
+    let token_id = auth.token_id.clone();
 
     let encoding = parse_content_encoding(&parts.headers).map_err(|error| {
         let outcome = error.outcome(&state.protocol);
@@ -217,13 +262,18 @@ async fn process_hec_request_pipeline(
                 facts::BODY_UNSUPPORTED_ENCODING,
                 vec![
                     field::outcome(Outcome::Rejected),
+                    field::reason(error.reason()),
                     field::hec_code(outcome.code),
                     field::http_status(outcome.status.as_u16()),
                     field::failure_reason(outcome.text),
                 ],
             );
         }
-        outcome
+        PipelineErr {
+            response: outcome,
+            token_id: Some(token_id.clone()),
+            reason: error.reason(),
+        }
     })?;
     if encoding == Encoding::Gzip {
         state.reporter.submit(
@@ -237,7 +287,11 @@ async fn process_hec_request_pipeline(
         |error| {
             let outcome = error.outcome(&state.protocol);
             report_body_error(state, ctx, error, &outcome);
-            outcome
+            PipelineErr {
+                response: outcome,
+                token_id: Some(token_id.clone()),
+                reason: error.reason(),
+            }
         },
     )?;
 
@@ -251,7 +305,11 @@ async fn process_hec_request_pipeline(
     .map_err(|error| {
         let outcome = error.outcome(&state.protocol);
         report_body_error(state, ctx, error, &outcome);
-        outcome
+        PipelineErr {
+            response: outcome,
+            token_id: Some(token_id.clone()),
+            reason: error.reason(),
+        }
     })?;
     state.reporter.submit(
         ctx,
@@ -269,7 +327,11 @@ async fn process_hec_request_pipeline(
     .map_err(|error| {
         let outcome = error.outcome(&state.protocol);
         report_decode_error(state, ctx, error, encoding, http_body_len, &outcome);
-        outcome
+        PipelineErr {
+            response: outcome,
+            token_id: Some(token_id.clone()),
+            reason: error.reason(),
+        }
     })?;
     state.reporter.submit(
         ctx,
@@ -287,6 +349,7 @@ async fn process_hec_request_pipeline(
             &state.protocol,
         )
         .map_err(|outcome| {
+            let reason = reason_from_response(&outcome, &state.protocol);
             let fact = if outcome.code == state.protocol.incorrect_index {
                 facts::EVENT_INDEX_INVALID
             } else {
@@ -297,12 +360,18 @@ async fn process_hec_request_pipeline(
                 fact,
                 vec![
                     field::outcome(outcome_from_response(&outcome)),
+                    field::reason(reason),
                     field::hec_code(outcome.code),
                     field::http_status(outcome.status.as_u16()),
                     field::endpoint_kind(endpoint),
+                    field::failure_reason(outcome.text),
                 ],
             );
-            outcome
+            PipelineErr {
+                response: outcome,
+                token_id: Some(token_id.clone()),
+                reason,
+            }
         })?,
         Endpoint::Raw => parse_raw_body(
             &decoded,
@@ -311,18 +380,33 @@ async fn process_hec_request_pipeline(
         )
         .map_err(|error| {
             if matches!(error, HecError::InvalidDataFormat | HecError::NoData) {
+                let outcome = error.outcome(&state.protocol);
                 state.reporter.submit(
                     ctx,
                     facts::PARSE_FAILED,
                     vec![
                         field::outcome(Outcome::Rejected),
                         field::endpoint_kind(endpoint),
+                        field::reason(error.reason()),
+                        field::hec_code(outcome.code),
+                        field::http_status(outcome.status.as_u16()),
+                        field::failure_reason(outcome.text),
                     ],
                 );
             }
-            error.outcome(&state.protocol)
+            PipelineErr {
+                response: error.outcome(&state.protocol),
+                token_id: Some(token_id.clone()),
+                reason: error.reason(),
+            }
         })?,
-        Endpoint::Ack => return Err(HecError::AckDisabled.outcome(&state.protocol)),
+        Endpoint::Ack => {
+            return Err(pipeline_error(
+                HecError::AckDisabled,
+                Some(token_id),
+                &state.protocol,
+            ));
+        }
     };
 
     state.reporter.submit(
@@ -335,9 +419,17 @@ async fn process_hec_request_pipeline(
         state.reporter.submit(
             ctx,
             facts::SINK_FAILED,
-            vec![field::outcome(Outcome::Failed)],
+            vec![
+                field::outcome(Outcome::Failed),
+                field::reason(Reason::SinkFailed),
+                field::failure_reason("Sink failed"),
+            ],
         );
-        HecError::ServerBusy.outcome(&state.protocol)
+        PipelineErr {
+            response: HecError::ServerBusy.outcome(&state.protocol),
+            token_id: Some(token_id.clone()),
+            reason: Reason::SinkFailed,
+        }
     })?;
     state.reporter.submit(
         ctx,
@@ -349,13 +441,17 @@ async fn process_hec_request_pipeline(
         ],
     );
 
-    Ok(HecResponse::success(&state.protocol))
+    Ok(PipelineOk {
+        response: HecResponse::success(&state.protocol),
+        token_id,
+    })
 }
 
 fn report_auth_error(
     state: &AppState,
     ctx: &ReportContext,
     error: HecError,
+    token_id: Option<&str>,
     outcome: &HecResponse,
 ) {
     let fact = match error {
@@ -366,16 +462,18 @@ fn report_auth_error(
         HecError::TokenDisabled => facts::AUTH_TOKEN_DISABLED,
         _ => return,
     };
-    state.reporter.submit(
-        ctx,
-        fact,
-        vec![
-            field::outcome(Outcome::Rejected),
-            field::token_present(!matches!(error, HecError::TokenRequired)),
-            field::hec_code(outcome.code),
-            field::http_status(outcome.status.as_u16()),
-        ],
-    );
+    let mut fields = vec![
+        field::outcome(Outcome::Rejected),
+        field::token_present(!matches!(error, HecError::TokenRequired)),
+        field::reason(error.reason()),
+        field::hec_code(outcome.code),
+        field::http_status(outcome.status.as_u16()),
+        field::failure_reason(outcome.text),
+    ];
+    if let Some(token_id) = token_id {
+        fields.push(field::token_id(token_id.to_string()));
+    }
+    state.reporter.submit(ctx, fact, fields);
 }
 
 fn query_has_token(query: Option<&str>) -> bool {
@@ -403,6 +501,7 @@ fn report_body_error(
         fact,
         vec![
             field::outcome(Outcome::Rejected),
+            field::reason(error.reason()),
             field::hec_code(outcome.code),
             field::http_status(outcome.status.as_u16()),
             field::failure_reason(outcome.text),
@@ -431,10 +530,38 @@ fn report_decode_error(
         vec![
             field::outcome(Outcome::Rejected),
             field::http_body_len(http_body_len),
+            field::reason(error.reason()),
             field::hec_code(outcome.code),
             field::http_status(outcome.status.as_u16()),
+            field::failure_reason(outcome.text),
         ],
     );
+}
+
+fn pipeline_error(error: HecError, token_id: Option<String>, protocol: &Protocol) -> PipelineErr {
+    PipelineErr {
+        response: error.outcome(protocol),
+        token_id,
+        reason: error.reason(),
+    }
+}
+
+fn reason_from_response(outcome: &HecResponse, protocol: &Protocol) -> Reason {
+    if outcome.code == protocol.incorrect_index {
+        Reason::IncorrectIndex
+    } else if outcome.code == protocol.event_field_required {
+        Reason::EventFieldRequired
+    } else if outcome.code == protocol.event_field_blank {
+        Reason::EventFieldBlank
+    } else if outcome.code == protocol.handling_indexed_fields {
+        Reason::IndexedFields
+    } else if outcome.code == protocol.no_data {
+        Reason::NoData
+    } else if outcome.code == protocol.server_busy {
+        Reason::ServerBusy
+    } else {
+        Reason::InvalidDataFormat
+    }
 }
 
 fn outcome_from_response(outcome: &HecResponse) -> Outcome {
@@ -972,12 +1099,19 @@ mod tests {
             .body(Body::from(r#"{"event":"x"}"#))
             .unwrap();
 
-        let response = process_hec_request(state, request, Endpoint::Event).await;
+        let response = process_hec_request(state.clone(), request, Endpoint::Event).await;
         let (parts, body) = response.into_parts();
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::FORBIDDEN);
         assert_eq!(body.as_ref(), br#"{"text":"Token is disabled","code":1}"#);
+        let stats = state.reporter.stats_snapshot();
+        assert_eq!(stats.auth_failures, 1);
+        assert_eq!(
+            stats.reasons["hec.auth.token_disabled"]["token_disabled"],
+            1
+        );
+        assert_eq!(stats.reasons["hec.request.failed"]["token_disabled"], 1);
     }
 
     #[tokio::test]

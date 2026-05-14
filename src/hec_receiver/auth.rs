@@ -13,6 +13,12 @@ pub struct AuthContext {
     pub ack_enabled: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthFailure {
+    pub error: HecError,
+    pub token_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthScheme {
     Splunk,
@@ -121,11 +127,20 @@ impl TokenRegistry {
         Self { tokens }
     }
 
+    #[allow(dead_code)]
     pub fn authenticate(&self, headers: &HeaderMap) -> Result<AuthContext, HecError> {
+        self.authenticate_detailed(headers)
+            .map_err(|failure| failure.error)
+    }
+
+    pub fn authenticate_detailed(&self, headers: &HeaderMap) -> Result<AuthContext, AuthFailure> {
         let parsed = parse_authorization(headers)?;
         if let Some(token) = self.tokens.get(parsed.token.as_ref()) {
             if !token.enabled() {
-                return Err(HecError::TokenDisabled);
+                return Err(AuthFailure {
+                    error: HecError::TokenDisabled,
+                    token_id: Some(token.id().to_string()),
+                });
             }
             Ok(AuthContext {
                 token_id: token.id().to_string(),
@@ -135,7 +150,19 @@ impl TokenRegistry {
                 ack_enabled: token.ack_enabled(),
             })
         } else {
-            Err(HecError::InvalidToken)
+            Err(AuthFailure {
+                error: HecError::InvalidToken,
+                token_id: None,
+            })
+        }
+    }
+}
+
+impl From<HecError> for AuthFailure {
+    fn from(error: HecError) -> Self {
+        Self {
+            error,
+            token_id: None,
         }
     }
 }
@@ -262,6 +289,9 @@ mod tests {
         );
 
         assert_eq!(store.authenticate(&headers), Err(HecError::TokenDisabled));
+        let failure = store.authenticate_detailed(&headers).unwrap_err();
+        assert_eq!(failure.error, HecError::TokenDisabled);
+        assert_eq!(failure.token_id.as_deref(), Some("disabled-id"));
     }
 
     #[test]

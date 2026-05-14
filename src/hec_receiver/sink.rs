@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use tokio::{
-    fs::{create_dir_all, OpenOptions},
+    fs::{create_dir_all, File, OpenOptions},
     io::AsyncWriteExt,
     sync::Mutex,
 };
@@ -10,10 +10,7 @@ use super::event::Event;
 #[derive(Debug)]
 pub enum Sink {
     Drop,
-    CaptureFile {
-        file: FileSink,
-        write_lock: Mutex<()>,
-    },
+    CaptureFile { file: FileSink },
 }
 
 impl Sink {
@@ -24,7 +21,6 @@ impl Sink {
     pub fn capture_file(path: impl Into<PathBuf>) -> Self {
         Self::CaptureFile {
             file: FileSink::new(path),
-            write_lock: Mutex::new(()),
         }
     }
 
@@ -35,8 +31,7 @@ impl Sink {
                 dropped: events.len(),
                 written: 0,
             }),
-            Self::CaptureFile { file, write_lock } => {
-                let _guard = write_lock.lock().await;
+            Self::CaptureFile { file } => {
                 file.write_events(events).await?;
                 Ok(SinkOutcome {
                     accepted: events.len(),
@@ -58,30 +53,47 @@ pub struct SinkOutcome {
 #[derive(Debug)]
 pub struct FileSink {
     path: PathBuf,
+    file: Mutex<Option<File>>,
 }
 
 impl FileSink {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            file: Mutex::new(None),
+        }
     }
 
     pub async fn write_events(&self, events: &[Event]) -> std::io::Result<()> {
-        if let Some(parent) = self.path.parent() {
-            if !parent.as_os_str().is_empty() {
-                create_dir_all(parent).await?;
+        let mut file = self.file.lock().await;
+        if file.is_none() {
+            if let Some(parent) = self.path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    create_dir_all(parent).await?;
+                }
             }
+            *file = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.path)
+                    .await?,
+            );
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .await?;
+        let file = file.as_mut().expect("capture file opened");
         for event in events {
             let json = serde_json::to_vec(event).map_err(std::io::Error::other)?;
             file.write_all(&json).await?;
             file.write_all(b"\n").await?;
         }
-        file.flush().await?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub async fn flush(&self) -> std::io::Result<()> {
+        if let Some(file) = self.file.lock().await.as_mut() {
+            file.flush().await?;
+        }
         Ok(())
     }
 }
@@ -98,8 +110,28 @@ mod tests {
         let sink = FileSink::new(&path);
         let events = vec![Event::from_raw_line("hello".to_string(), Endpoint::Raw)];
         sink.write_events(&events).await.unwrap();
+        sink.flush().await.unwrap();
         let written = tokio::fs::read_to_string(path).await.unwrap();
         assert!(written.contains("\"raw\":\"hello\""));
+    }
+
+    #[tokio::test]
+    async fn file_sink_reuses_open_file_across_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        let sink = FileSink::new(&path);
+
+        sink.write_events(&[Event::from_raw_line("one".to_string(), Endpoint::Raw)])
+            .await
+            .unwrap();
+        sink.write_events(&[Event::from_raw_line("two".to_string(), Endpoint::Raw)])
+            .await
+            .unwrap();
+        sink.flush().await.unwrap();
+
+        let written = tokio::fs::read_to_string(path).await.unwrap();
+        assert!(written.contains("\"raw\":\"one\""));
+        assert!(written.contains("\"raw\":\"two\""));
     }
 
     #[tokio::test]

@@ -1,6 +1,12 @@
 use serde::Serialize;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::{
+    collections::BTreeMap,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Counter {
@@ -44,6 +50,7 @@ pub struct Stats {
     pub sink_failures: AtomicU64,
     pub latency_nanos_total: AtomicU64,
     pub latency_nanos_max: AtomicU64,
+    pub reasons: Mutex<BTreeMap<String, BTreeMap<String, u64>>>,
 }
 
 impl Stats {
@@ -76,7 +83,14 @@ impl Stats {
             sink_failures: load(&self.sink_failures),
             latency_nanos_total: load(&self.latency_nanos_total),
             latency_nanos_max: load(&self.latency_nanos_max),
+            reasons: self.reasons.lock().expect("stats reasons lock").clone(),
         }
+    }
+
+    pub fn increment_reason(&self, fact: &'static str, reason: &'static str) {
+        let mut reasons = self.reasons.lock().expect("stats reasons lock");
+        let fact_reasons = reasons.entry(fact.to_string()).or_default();
+        *fact_reasons.entry(reason.to_string()).or_default() += 1;
     }
 
     pub fn record_latency(&self, elapsed: Duration) {
@@ -140,6 +154,7 @@ pub struct StatsSnapshot {
     pub sink_failures: u64,
     pub latency_nanos_total: u64,
     pub latency_nanos_max: u64,
+    pub reasons: BTreeMap<String, BTreeMap<String, u64>>,
 }
 
 fn load(value: &AtomicU64) -> u64 {

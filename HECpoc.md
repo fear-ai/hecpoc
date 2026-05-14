@@ -617,7 +617,7 @@ Current compatibility baseline:
 
 Problems and gaps:
 
-- incorrect index reporting does not yet include a bounded reason;
+- incorrect index and parse reporting now include bounded top-level reasons, but index-specific subreasons such as syntax, length, reserved name, and allow-list miss are not separated yet;
 - timeout behavior may be Splunk-incompatible;
 - malformed wire/header behavior is partly hidden by Hyper and needs raw-socket verification;
 - raw endpoint is not byte-preserving beyond length evidence;
@@ -625,7 +625,7 @@ Problems and gaps:
 
 Ready implementation work:
 
-1. Add bounded reason values for incorrect index and parse failures. A bounded reason is a closed, documented enum-like value such as `index_too_long`, `index_not_allowed`, or `invalid_json`, not arbitrary user input or a free-form error string.
+1. Add detailed bounded subreason values for incorrect index and parse failures. A bounded reason is a closed, documented enum-like value such as `index_too_long`, `index_not_allowed`, or `invalid_json`, not arbitrary user input or a free-form error string.
 2. Add raw-socket probes for malformed headers, partial headers, truncated chunked body, and slow body behavior.
 3. Rerun Splunk comparison after any body-limit, timeout, or metadata-precedence change.
 
@@ -1091,10 +1091,10 @@ These are observed or strongly suspected from code inspection and the validation
 |------|------------------------|------|-----------------------|
 | Raw parser allocation | creates a `String` and full `Event` per line immediately | high allocation rate for large raw batches | introduce `RawEventRef`/batch representation or bytes-backed event until sink/store boundary |
 | Raw byte preservation | raw endpoint stores lossy/fixed text plus byte length, not original bytes | cannot replay exact binary/log input; unsafe bytes must not flow through string/redaction/logging routines | add optional original-byte field or sidecar gated by size caps and redaction policy; keep fixed text as default |
-| Capture sink | opens and flushes file per HEC request group under a mutex | poor high-concurrency write behavior | persistent buffered writer or write path with explicit flush policy |
+| Capture sink | now keeps one append handle open and no longer flushes each request | better than per-request open/flush; still not a durable or tuned write path | add configurable flush policy, optional buffered writer, and commit-state reporting before durable claims |
 | Reporter field serialization | dynamic fields are collapsed into JSON string for tracing | less useful structured filtering/querying in tracing backend | static fields for hot/common fields or custom `valuable`/JSON layer later |
-| Counter labels | counters are flat atomics without reason labels | loses distinction between rejection causes beyond a few coarse counters | introduce bounded reason enums or structured stats snapshot; do not use unbounded user text as a label/reason |
-| Request failure accounting | benchmark run showed 5 request failures with no detailed counters | possible unclassified failure path or warmup artifact | add `REQUEST_FAILED` reason field and trace failed responses during benchmark repro |
+| Counter labels | stats snapshot now includes `reasons` by fact and bounded reason | better diagnosis without unbounded labels; still not a full metrics backend | add detailed subreasons where useful and map later to Prometheus/OpenMetrics labels |
+| Request failure accounting | `REQUEST_FAILED` now carries bounded `reason` plus text | AB tail/body-read artifact can be separated better, but not fully explained | rerun AB and at least one non-AB load tool with reason stats enabled |
 | Benchmark method | `ab` client metrics omit submitted bytes/sec and server CPU | misleading throughput interpretation | compute receiver-side bytes/sec/events/sec from stats deltas and wall time; add `time`, `ps`, `sample`, and later `dtrace`/Instruments recipes |
 
 ### C.6 Methodology Outcomes
@@ -1126,8 +1126,10 @@ Older result directories were archived under `/Users/walter/Work/Spank/HECpoc/re
 
 - Splunk live curl matrix: `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T004823Z`.
 - HECpoc live curl matrix after fixes: `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T005028Z`.
+- HECpoc live curl matrix after reason/stats and sink changes: `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z`.
+- Splunk live curl matrix rerun after reason/stats and sink changes: `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z`.
 
-The current Splunk and HECpoc curl matrices match HTTP status for all shared cases. Response bodies match for shared JSON/HTML compatibility cases except the advertised-oversize `413` text, where Splunk reports its configured maximum `838860800` bytes and HECpoc reports its configured maximum `1000000` bytes. HECpoc-only cases are disabled-token verification and `/hec/stats`.
+The latest Splunk and HECpoc curl matrices match HTTP status for all shared cases. HECpoc-only cases are disabled-token verification and `/hec/stats`; the Splunk matrix has no disabled-token case because the local Splunk token used for the oracle is enabled. Response bodies match for shared JSON/HTML compatibility cases except the advertised-oversize `413` text, where Splunk reports its configured maximum `838860800` bytes and HECpoc reports its configured maximum `1000000` bytes.
 
 Coverage terms:
 
@@ -1172,6 +1174,8 @@ Coverage terms:
 | health serving body | Splunk returns `{"text":"HEC is healthy","code":17}` | matched by HECpoc live curl matrix |
 | disabled token | HECpoc returns `403/code1` for configured disabled token | unit/handler and live HECpoc confirmed; Splunk disabled-token oracle not yet configured |
 | multiple token records | explicit enabled/disabled tokens and per-token index settings load from TOML | unit covered; live matrix used enabled and disabled HECpoc token records |
+| token ID in reports | known enabled token IDs are emitted on request success/failure; disabled token ID is preserved through detailed auth failure | unit/handler covered; visible through report fields when tracing is enabled |
+| bounded reason stats | `StatsSnapshot.reasons` groups bounded reasons by reporting fact | unit covered and live HECpoc matrix confirmed in `/hec/stats` |
 | raw invalid UTF-8 | lossy acceptance is useful but not replay-grade | document raw text policy and add byte-preserving mode before replay claims |
 | blank raw lines | Splunk returned no-data for blank and whitespace-only raw bodies | current behavior matches for tested cases |
 | direct file success | written, flushed, and durable are different claims | define direct-file commit state and make response/reporting use that state |
@@ -1179,29 +1183,25 @@ Coverage terms:
 
 ### C.8 Pending And Future Work Decomposition
 
-Near-term implementation tasks:
+This is the single short status ledger for items that were previously scattered across "still open" and "not sufficiently covered" lists. Appendix A keeps protocol behavior; Appendix D keeps harness mechanics.
 
-1. Add bounded reason fields to `REQUEST_FAILED`, incorrect index, and parse/reporting paths where coarse counters hide cause.
-2. Add capture sink mode with persistent buffered writer and configurable flush policy.
-3. Add raw-byte preservation design and tests before claiming replay-grade raw ingest.
-4. Add a raw-socket verifier for malformed HTTP and slow input cases that curl cannot generate reliably.
-
-Validation tasks:
-
-1. Extend raw-socket verification for malformed `Content-Length`, partial headers, partial body, and slow headers that never reach Axum handlers.
-2. Send with Vector as HEC client into this receiver and inspect request shapes.
-3. Run full-size syslog and auth.log with raised limits and record bytes/sec/events/sec.
-4. Add gzip expansion tests using both valid high-ratio gzip and malformed gzip.
-5. Add slow-body tests to exercise idle and total body timeouts.
-6. Add no-auth/malformed-auth/bad-token load tests to validate auth rejection cost and logging volume.
-
-Design tasks:
-
-1. Decide raw text versus raw bytes as an explicit product policy. Current default should remain fixed/lossy text plus original byte length; optional original-byte persistence can be added behind size caps and redaction/logging safeguards.
-2. Decide HEC response compatibility for timeout, malformed wire headers, ACK channel states, and raw blank-line edge cases not covered by the current oracle run.
-3. Define sink commit states for drop, capture, flushed, and durable modes.
-4. Define stats schema with bounded reason labels before Prometheus or external metrics.
-5. Decide whether Reporter should own output routing only, or also a source/fact runtime filter table for non-tracing outputs.
+| Item | Status | Next Action |
+|------|--------|-------------|
+| live HECpoc curl matrix | covered | keep `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z` as current evidence |
+| Splunk curl matrix | covered | keep `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z` as current oracle evidence |
+| multiple configured tokens | implemented | extend live tests only when token reload or per-token source metadata exists |
+| token ID in reporting | implemented for known token contexts | add an explicit log-capture assertion if tracing output becomes testable |
+| bounded reason values | implemented at top level | add detailed subreasons for index syntax, length, reserved names, allow-list miss, and JSON parser classes |
+| stats labeled reasons | implemented as `reasons` grouped by reporting fact | decide later how these map to Prometheus/OpenMetrics labels |
+| capture sink open/flush | improved | add configurable flush policy and commit-state semantics before durable claims |
+| raw parser allocation | still open | design `RequestRaw`/`RawEvents` with byte spans or bytes-backed event references |
+| raw byte preservation | still open | implement optional original-byte sidecar or field behind size/redaction controls |
+| Vector-as-client validation | still open | configure Vector `splunk_hec_logs` sink to send raw and event payloads into HECpoc and record request shapes |
+| AB tail/body-read artifact | still open | rerun AB plus another load tool with reason stats and server logs enabled |
+| query metadata | postponed | verify Splunk precedence for raw query metadata, then implement `index`, `host`, `source`, and `sourcetype` parsing |
+| disabled Splunk token oracle | still open | create or disable a dedicated Splunk HEC token and rerun only auth cases |
+| timeout Splunk oracle | still open | use raw-socket verifier to test slow headers, no body, slow body, and truncated body against Splunk and HECpoc |
+| ACK, queue, server-busy taxonomy | postponed | resume only after bounded queue and ACK registry designs exist |
 
 ### C.9 Performance Comparison — Current HECpoc, Earlier Rust Work, And Vendor Signals
 
@@ -1283,6 +1283,63 @@ Curl, AB, and most HTTP libraries are poor tools for malformed-wire tests becaus
 - body cut off mid-frame after route/auth succeeds.
 
 A raw-socket verifier should write exact bytes, control sleeps between writes, capture server response bytes, and record whether the request reached HECpoc handler code or was rejected by Hyper/stack behavior.
+
+Recommended implementation structure:
+
+| Function | Responsibility |
+|----------|----------------|
+| `Case` | name, target host/port/TLS mode, byte segments, inter-segment sleeps, expected close/response policy |
+| `Segment` | one exact byte string plus optional delay before or after write |
+| `run_case` | open `TcpStream`, write segments, shutdown write side if requested, read until EOF/timeout, record bytes and timing |
+| `classify_response` | split status line/headers/body only after capture; never use an HTTP client parser as the generator |
+| `write_artifacts` | save request bytes, response bytes, timing JSON, stderr, and summary TSV |
+
+Python skeleton:
+
+```python
+import socket, time
+from dataclasses import dataclass
+
+@dataclass
+class Segment:
+    data: bytes
+    sleep_after: float = 0.0
+
+@dataclass
+class Case:
+    name: str
+    segments: list[Segment]
+    read_timeout: float = 5.0
+    shutdown_write: bool = True
+
+def run_case(host: str, port: int, case: Case) -> bytes:
+    with socket.create_connection((host, port), timeout=case.read_timeout) as sock:
+        sock.settimeout(case.read_timeout)
+        for segment in case.segments:
+            sock.sendall(segment.data)
+            if segment.sleep_after:
+                time.sleep(segment.sleep_after)
+        if case.shutdown_write:
+            sock.shutdown(socket.SHUT_WR)
+        chunks = []
+        while True:
+            try:
+                chunk = sock.recv(65536)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+```
+
+Initial cases:
+
+- `partial_header_timeout`: send `POST /services/collector/raw HTTP/1.1\r\nHost: x\r\n` and sleep beyond header timeout.
+- `declared_length_no_body`: send valid headers with `Content-Length: 10`, then no body.
+- `declared_length_short_body`: send `Content-Length: 10` and only `abc`.
+- `chunked_truncated`: send chunked framing and omit terminating `0\r\n\r\n`.
+- `slow_body`: send valid headers and body bytes one at a time with delay above/below configured idle timeout.
 
 Raw endpoint byte-preserving tests are also deferred. The current raw path preserves fixed/lossy text plus `raw_bytes_len`; it does not preserve the exact original byte sequence after invalid UTF-8, CRLF normalization, or JSON capture escaping. This is sufficient for a Splunk-compatible local fixture that accepts raw text, but not for forensic replay or byte-identical evidence storage.
 

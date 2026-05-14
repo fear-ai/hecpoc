@@ -5,7 +5,7 @@ use axum::{
 };
 use serde::Serialize;
 
-use super::protocol::Protocol;
+use super::{protocol::Protocol, report::Reason};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HecError {
@@ -30,6 +30,29 @@ pub enum HecError {
 }
 
 impl HecError {
+    pub fn reason(self) -> Reason {
+        match self {
+            Self::TokenRequired => Reason::TokenRequired,
+            Self::InvalidAuthorization => Reason::InvalidAuthorization,
+            Self::InvalidToken => Reason::InvalidToken,
+            Self::TokenDisabled => Reason::TokenDisabled,
+            Self::NoData => Reason::NoData,
+            Self::InvalidDataFormat => Reason::InvalidDataFormat,
+            Self::MalformedGzip => Reason::MalformedGzip,
+            Self::ServerBusy => Reason::ServerBusy,
+            Self::IncorrectIndex => Reason::IncorrectIndex,
+            Self::EventFieldRequired => Reason::EventFieldRequired,
+            Self::EventFieldBlank => Reason::EventFieldBlank,
+            Self::AckDisabled => Reason::AckDisabled,
+            Self::HandlingIndexedFields => Reason::IndexedFields,
+            Self::QueryStringAuthorizationDisabled => Reason::QueryStringAuthorizationDisabled,
+            Self::UnsupportedEncoding => Reason::UnsupportedEncoding,
+            Self::BodyTooLarge => Reason::BodyTooLarge,
+            Self::Timeout => Reason::Timeout,
+            Self::ServerShuttingDown => Reason::ServerShuttingDown,
+        }
+    }
+
     pub fn outcome(self, protocol: &Protocol) -> HecResponse {
         match self {
             Self::TokenRequired => HecResponse::new(
