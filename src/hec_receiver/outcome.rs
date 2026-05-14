@@ -72,7 +72,7 @@ impl HecError {
             ),
             Self::TokenDisabled => HecResponse::new(
                 StatusCode::FORBIDDEN,
-                "Token is disabled",
+                "Token disabled",
                 protocol.token_disabled,
             ),
             Self::NoData => HecResponse::new(StatusCode::BAD_REQUEST, "No data", protocol.no_data),

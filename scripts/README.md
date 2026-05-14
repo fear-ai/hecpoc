@@ -8,6 +8,7 @@ This directory contains local validation, Splunk exploration, and benchmark-supp
 |---|---|---|---|
 | `curl_hec_matrix.sh` | HECpoc/Splunk live HTTP matrix | Sends a broad curl-driven HEC compatibility matrix, including auth, endpoint, JSON/raw, gzip, index, health, and route cases; records status, headers, body, payloads, and summary. | Uses curl, so malformed wire/framing cases remain out of scope; disabled-token case only runs when a disabled token is supplied. |
 | `verify_splunk_hec.sh` | Splunk exploration / oracle capture | Sends selected HEC cases to a live Splunk HEC endpoint and records status, headers, body, curl errors, payloads, and `summary.tsv`. | Does not assert expected values; curl cannot reliably craft every malformed wire condition because it normalizes some headers such as `Content-Length`; raw-socket probes are still needed. |
+| `raw_socket_hec.sh` | Exact-byte wire validation | Runs the Rust `raw_socket_hec` verifier as a command; use `--help` or `--list-cases` for supported arguments, defaults, numbered cases, and artifact layout. | Plain TCP only; TLS support is postponed, so direct Splunk `https://127.0.0.1:8088` probing still needs curl or a future TLS mode. |
 | `bench_hec_ab.sh` | HECpoc benchmark validation | Builds release binary, starts local receiver, runs ApacheBench single/concurrent raw uploads, captures stats before/after, launches system monitor, writes benchmark summary. | Uses `ab`; measures localhost HTTP/drop-sink path only; not a durability, TLS, ACK, or indexing benchmark. |
 | `analyze_bench_run.py` | Benchmark analysis | Parses AB output and HEC stats snapshots into receiver-side requests/sec, MiB/sec, events/sec, and failure counters. | AB-output parsing is format-specific and should be extended carefully if other load tools are added. |
 | `capture_system_stats.sh` | Benchmark/system evidence | Samples process CPU, memory, threads/LWP, descriptors, `top`, VM, `netstat`, `iostat`, and thread listings for a target PID. | Cross-platform best-effort shell script; network grep patterns are tuned for current HEC port ranges and should become parameterized before broader use. |
@@ -38,6 +39,8 @@ HEC_MATRIX_TOKEN='<token>' \
 HEC_MATRIX_INSECURE=1 \
 ./scripts/curl_hec_matrix.sh
 ```
+
+For local raw-socket oracle work, Splunk Enterprise HEC can be configured for plain HTTP by setting HEC SSL off in Splunk Web global HEC settings or by using `enableSSL = 0` for the HEC `[http]` input. Use that only for local testing; production HEC should remain TLS-protected.
 
 ### HECpoc Added-Function Validation
 
@@ -74,4 +77,16 @@ Some conditions cannot be reliably produced by curl or AB:
 - truncated chunked body;
 - header sent with no body followed by idle timeout.
 
-Those need a small raw TCP script or program that writes exact bytes to the socket and controls timing. Until that exists, malformed-wire behavior remains partly unverified and may be Hyper-generated rather than HECpoc-generated.
+Use `scripts/raw_socket_hec.sh` for these cases:
+
+```sh
+scripts/raw_socket_hec.sh --help
+scripts/raw_socket_hec.sh --list-cases
+scripts/raw_socket_hec.sh --addr 127.0.0.1:18088 --token dev-token --case all
+```
+
+Defaults are `--addr 127.0.0.1:18088`, `--token dev-token`, `--case all`, `--read-timeout-ms 8000`, and `--slow-body-delay-ms 6000`.
+
+The command writes numbered request and response artifacts. Cases marked stack-owned may be rejected or timed out before the HEC handler exists in Axum/Hyper request form, so their absence from HEC handler stats is expected evidence rather than automatic receiver failure.
+
+For local HECpoc runs, add `--stats-url http://HOST:PORT/hec/stats` to capture before/after stats per case. With stats enabled, handler-visible cases can report simple `Pass` or `Fail`; stack-owned cases remain `Info` or `Review` because they require socket, server log, or OS-level interpretation.

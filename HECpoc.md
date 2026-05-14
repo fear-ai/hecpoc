@@ -939,197 +939,23 @@ Use visuals to reduce repeated prose, not to create another status layer. Sugges
 
 ---
 
-## Appendix C — Validation And Benchmark Evidence
+## Appendix C — Validation Evidence And Open Work
 
-This appendix records concrete validation and benchmark evidence: what was mapped, what was run, what broke, what was fixed, and what remains open.
+This appendix records current validation evidence and the remaining work that affects validation confidence. It no longer repeats script inventory or generic methodology; script usage lives in `/Users/walter/Work/Spank/HECpoc/scripts/README.md`.
 
-### C.1 Reporter Component Map
+### C.1 Current Compatibility Evidence
 
-Reporter component/source mapping is now part of the stack design and code path.
+Current HECpoc and Splunk evidence directories:
 
-| Reporter component | Tracing target | Processing origin | Typical facts |
-|--------------------|----------------|-------------------|---------------|
-| `Component::Hec` | `hec.receiver` | route, endpoint, request completion | `hec.request.received`, `hec.request.succeeded`, `hec.request.failed` |
-| `Component::Auth` | `hec.auth` | authorization header and token checks | `hec.auth.token_required`, `hec.auth.invalid_authorization`, `hec.auth.token_invalid` |
-| `Component::Body` | `hec.body` | content length, body read, gzip decode | `hec.body.too_large`, `hec.body.timeout`, `hec.body.gzip_request`, `hec.body.gzip_failed` |
-| `Component::Parser` | `hec.parser` | event/raw interpretation | `hec.parser.failed`, `hec.parser.events_parsed` |
-| `Component::Sink` | `hec.sink` | `HecEvents` disposition and capture/drop output path | `hec.sink.failed`, `hec.sink.completed` |
+| Evidence | Directory | Notes |
+|----------|-----------|-------|
+| HECpoc live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z` | includes `/hec/stats` with bounded `reasons` counters and disabled-token case |
+| Splunk live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z` | enabled-token oracle for shared HEC cases |
+| Splunk disabled-token matrix | `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T050659Z-disabled` | disabled token `disabled` / `fa4f8f28-998f-4f34-8998-f7124c9a3e38` returns `403`, `{"text":"Token disabled","code":1}` |
+| AB reason-stat retest | `/Users/walter/Work/Spank/HECpoc/results/bench-ab-reason-20260514T050708Z` | short AB rerun did not reproduce `requests_failed`; final stats show `requests_failed=0`, `body_read_errors=0`, `reasons={}` |
+| Rust raw-socket verifier | `/Users/walter/Work/Spank/HECpoc/results/raw-socket-20260514T072115Z` | numbered exact-byte HTTP cases distinguish handler-visible body errors from Hyper/socket-level nonresponses; optional stats deltas show handler visibility |
 
-Important implementation detail: `tracing` callsite targets must be literals, not dynamic strings. The implementation therefore branches on `Component` and emits through literal targets such as `target: "hec.auth"`. This is mildly repetitive but keeps target-level filtering fast and compatible with `tracing-subscriber::EnvFilter`.
-
-Current filter examples:
-
-```sh
-HEC_OBSERVE_LEVEL='debug'
-HEC_OBSERVE_SOURCES='hec.receiver=debug,hec.auth=debug,hec.body=debug,hec.parser=debug,hec.sink=debug'
-```
-
-Equivalent TOML:
-
-```toml
-[observe]
-level = "debug"
-sources = { "hec.receiver" = "debug", "hec.auth" = "debug", "hec.body" = "debug", "hec.parser" = "debug", "hec.sink" = "debug" }
-```
-
-### C.2 Input Coverage Run
-
-Run directory: `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z`.
-
-Receiver configuration used:
-
-- release binary;
-- capture sink enabled;
-- max HTTP body bytes `30_000_000`;
-- max decoded bytes `60_000_000`;
-- max events `1_000_000`;
-- JSON tracing enabled;
-- console output enabled;
-- all component targets set to debug.
-
-Inputs exercised:
-
-| Input | Source path | Endpoint | Expected result | Observed |
-|-------|-------------|----------|-----------------|----------|
-| syslog sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/syslog` first 200 KB | raw | accepted as raw lines | `200` |
-| auth sample | `/Users/walter/Work/Spank/Logs/spLogs/laz24_20260310_233030/auth.log` first 200 KB | raw | accepted as raw lines | `200` |
-| Apache LogHub | `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log` | raw | accepted as raw lines | `200` |
-| OpenSSH LogHub | `/Users/walter/Work/Spank/Logs/loghub/OpenSSH_2k.log` | raw | accepted as raw lines | `200` |
-| Windows LogHub | `/Users/walter/Work/Spank/Logs/loghub/Windows_2k.log` | raw | accepted as raw lines | `200` |
-| Vector NDJSON | `/Users/walter/Work/Spank/Logs/vector/vector_log.ndjson` | raw | accepted as raw text lines | `200` |
-| Wazuh NDJSON | `/Users/walter/Work/Spank/Logs/wazuh/state.ndjson` | raw | accepted as raw text lines | `200` |
-| CSV | `/Users/walter/Work/Spank/Logs/prices.csv` | raw | accepted as raw text lines | `200` |
-| CRLF | generated `one\r\ntwo\r\nthree\n` | raw | accepted; CR stripped | `200` |
-| embedded NUL | generated `a\0b\n` | raw | accepted; preserved in JSON string escaping | `200` |
-| invalid UTF-8 | generated `0xff 0xfe \n valid\n` | raw | accepted through lossy text conversion | `200` |
-| blank only | generated LF/CRLF blanks | raw | no data | `400`, `{"text":"No data","code":5}` |
-| gzip syslog | gzip of syslog sample | raw | accepted after decode | `200` |
-| valid HEC JSON | generated envelope | event | accepted | `200` |
-| concatenated HEC JSON | generated two envelopes | event | accepted | `200` |
-| missing event | generated JSON without `event` | event | event field required | `400`, code `12` |
-| syslog to event endpoint | syslog bytes | event | invalid data format | `400`, code `6` |
-| missing auth | generated raw | raw | token required | `401`, code `2` |
-| bad token | generated raw | raw | invalid token | `403`, code `4` |
-| malformed auth | generated raw | raw | invalid authorization | `401`, code `3` |
-| unsupported encoding | generated raw with `Content-Encoding: br` | raw | unsupported media | `415`, generic HTML body |
-| advertised oversize | generated raw with huge `Content-Length` | raw | request too large | `413`, generic HTML body |
-| parallel Apache | 32 concurrent requests, 8-way client parallelism | raw | all accepted | all `200` |
-
-Summary stats from `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/stats.json`:
-
-```json
-{"requests_total":54,"requests_ok":46,"requests_failed":8,"auth_failures":3,"body_too_large":1,"timeouts":0,"gzip_requests":1,"gzip_failures":0,"parse_failures":3,"http_body_bytes":6805324,"decoded_bytes":6986001,"events_observed":73813,"events_dropped":0,"events_written":73813,"sink_failures":0,"latency_nanos_total":9151439000,"latency_nanos_max":327345000}
-```
-
-Capture file readback:
-
-- `/Users/walter/Work/Spank/HECpoc/results/validation-20260505T002004Z/capture.jsonl` contains `73_813` records.
-- The capture count matches `events_written`.
-- The run produced target-separated tracing records: `hec.receiver`, `hec.auth`, `hec.body`, and `hec.parser` were all observed.
-
-### C.3 Output, Reporting, Record, Benchmark, And Profile Permutations
-
-Output permutations exercised in this pass:
-
-| Mode | Configuration | Purpose | Outcome |
-|------|---------------|---------|---------|
-| JSON tracing + console + stats + capture | validation run | verify report fan-out and target mapping under real inputs | worked; component targets observed |
-| tracing off + console off + stats on + drop sink | benchmark run | isolate request/raw parsing and stats from output/capture overhead | worked; no request failures from `ab` |
-| redacted show-config | config validation | verify configured redaction text | worked |
-| passthrough show-config | config validation | verify explicit secret passthrough mode | worked |
-
-Benchmark/profile run directory: `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z`.
-
-Payload:
-
-- `/Users/walter/Work/Spank/Logs/loghub/Apache_2k.log`;
-- `171_239` bytes;
-- `1_999` lines/events per request.
-
-`ab` results:
-
-| Run | Complete | Failed | Requests/sec | Mean request time | Notes |
-|-----|----------|--------|--------------|-------------------|-------|
-| `ab -n 500 -c 1` | 500 | 0 | `3250.11` | `0.308 ms` | client-side `ab` summary |
-| `ab -n 2000 -c 16` | 2000 | 0 | `14930.83` | `1.072 ms` | client-side `ab` summary |
-
-Receiver stats after benchmark:
-
-```json
-{"requests_total":2505,"requests_ok":2500,"requests_failed":5,"auth_failures":0,"body_too_large":0,"timeouts":0,"gzip_requests":0,"gzip_failures":0,"parse_failures":0,"http_body_bytes":428097500,"decoded_bytes":428097500,"events_observed":5000000,"events_dropped":5000000,"events_written":0,"sink_failures":0,"latency_nanos_total":1077444000,"latency_nanos_max":2370000}
-```
-
-Interpretation limits:
-
-- These are smoke benchmarks, not capacity claims.
-- `ab` reports response throughput, not submitted payload throughput, so byte/sec must be computed from receiver stats and elapsed wall time if needed.
-- The run used drop sink and output disabled except stats; capture-file results are intentionally separate.
-- The `requests_failed = 5` counter in the benchmark run is unexplained because `ab` reported zero failed requests and detailed error counters remained zero. This needs a focused repro with tracing enabled and stats snapshots before and after warmup/readiness.
-- macOS `sample` captured a process report at `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z/sample-c16.txt`; the run was too short for deep attribution, but it records a physical footprint around 25.5 MB during the sampled interval.
-
-### C.4 Bugs Fixed During This Pass
-
-| Issue | Symptom | Fix | Regression coverage |
-|-------|---------|-----|---------------------|
-| Splunk oracle body shape for `413`/`415` | HECpoc returned HEC JSON for unsupported encoding and body-too-large, while local Splunk returned generic HTML | changed `UnsupportedEncoding` and `BodyTooLarge` outcomes to serialize Splunk-style HTML bodies while preserving status and internal reporting facts | `hec_request::unsupported_encoding_returns_splunk_style_html`, `hec_request::advertised_oversize_increments_body_too_large_counter` |
-| Splunk oracle `fields` semantics | local Splunk accepted direct array values in `fields`, rejected nested object values as code `15`, and rejected top-level `fields` array as code `6` | changed field validation to accept direct arrays, reject nested object values with indexed-fields error, and map non-object `fields` to invalid-data | `parse_event::accepts_array_field_values`, `parse_event::rejects_fields_that_are_not_an_object_as_invalid_data`, `hec_request::array_indexed_field_value_is_accepted`, `hec_request::fields_array_returns_invalid_data_format_code_6` |
-| Unknown HEC route body mismatch | local Splunk returned JSON `404` body for `/services/collector/not-a-real-endpoint`; Axum default did not produce the Splunk body | added route fallback returning `{"text":"The requested URL was not found on this server.","code":404}` | `hec_request::unknown_route_returns_splunk_style_json_404` |
-| Raw byte length after lossy UTF-8 | invalid UTF-8 raw lines stored `raw_bytes_len` after replacement-character expansion, not original byte length | added `Event::from_raw_line_with_len` and passed original byte count from raw parser | `parse_raw::lossy_decodes_non_utf8_without_panic` now checks original byte length |
-| Advertised oversize counter missing | huge `Content-Length` returned 413 but `body_too_large` stayed zero | routed advertised oversize through `report_body_error` | `hec_request::advertised_oversize_increments_body_too_large_counter` |
-| Component target design mismatch | docs described per-component filter targets but Reporter emitted all tracing under one target | branched Reporter tracing emission by component with literal targets | validation run observed `hec.auth`, `hec.body`, `hec.parser`, and `hec.receiver` targets |
-| Disabled token behavior | token state was documented but not fully exercised through live HTTP | kept enabled flag in `HecToken`; disabled records now return `403/code1` | `auth::rejects_disabled_token_with_distinct_internal_error`, `hec_request::disabled_token_returns_code_1`, curl matrix disabled-token case against HECpoc |
-| Multiple token records | config had singleton token semantics only | added explicit `[[hec.tokens]]` records with duplicate ID/secret and per-token index validation | config tests for multiple records and duplicate/default-index errors |
-| Health body order | local Splunk returned health JSON as `{"text":...,"code":17}` while HECpoc emitted code first | routed health through `HecResponse` serialization | `hec_request::health_returns_healthy_code_when_serving`, live curl matrix |
-| Malformed gzip response | local Splunk returned generic HTML `400` for bad gzip, while HECpoc returned HEC JSON code `6` | added `MalformedGzip` outcome with Splunk-style HTML response and separate reporting fact | `hec_request::malformed_gzip_returns_invalid_data_format`, live curl matrix |
-| Curl compatibility matrix | ad hoc curl runs made comparison hard to repeat | added `scripts/curl_hec_matrix.sh` with result directories, payloads, headers, bodies, manifest, and summary | script syntax check plus HECpoc and Splunk live runs |
-
-### C.5 Obvious Inefficiencies And Poor Implementation Areas
-
-These are observed or strongly suspected from code inspection and the validation runs.
-
-| Area | Current implementation | Risk | Improvement direction |
-|------|------------------------|------|-----------------------|
-| Raw parser allocation | creates a `String` and full `Event` per line immediately | high allocation rate for large raw batches | introduce `RawEventRef`/batch representation or bytes-backed event until sink/store boundary |
-| Raw byte preservation | raw endpoint stores lossy/fixed text plus byte length, not original bytes | cannot replay exact binary/log input; unsafe bytes must not flow through string/redaction/logging routines | add optional original-byte field or sidecar gated by size caps and redaction policy; keep fixed text as default |
-| Capture sink | now keeps one append handle open and no longer flushes each request | better than per-request open/flush; still not a durable or tuned write path | add configurable flush policy, optional buffered writer, and commit-state reporting before durable claims |
-| Reporter field serialization | dynamic fields are collapsed into JSON string for tracing | less useful structured filtering/querying in tracing backend | static fields for hot/common fields or custom `valuable`/JSON layer later |
-| Counter labels | stats snapshot now includes `reasons` by fact and bounded reason | better diagnosis without unbounded labels; still not a full metrics backend | add detailed subreasons where useful and map later to Prometheus/OpenMetrics labels |
-| Request failure accounting | `REQUEST_FAILED` now carries bounded `reason` plus text | AB tail/body-read artifact can be separated better, but not fully explained | rerun AB and at least one non-AB load tool with reason stats enabled |
-| Benchmark method | `ab` client metrics omit submitted bytes/sec and server CPU | misleading throughput interpretation | compute receiver-side bytes/sec/events/sec from stats deltas and wall time; add `time`, `ps`, `sample`, and later `dtrace`/Instruments recipes |
-
-### C.6 Methodology Outcomes
-
-Useful method choices from this pass:
-
-- Use result directories under `/Users/walter/Work/Spank/HECpoc/results/` with `summary.tsv`, response bodies, server logs, stats, and manifests.
-- Keep real-log raw acceptance separate from HEC JSON event compatibility.
-- Verify counters against response matrix; the advertised-oversize bug was visible only because response and stats were compared.
-- Run output-heavy validation separately from output-light benchmark/profiling.
-- Treat each benchmark as evidence for one configuration, not as a general performance claim.
-
-Method problems to fix:
-
-- The first benchmark script accidentally used bare `wait`, which waited on the server process and required manual cleanup. Future scripts should wait only on explicit short-lived child process IDs.
-- Benchmarks should snapshot stats before and after each run, not only at the end.
-- Benchmark manifests should record binary hash, git status, command line, payload bytes, payload line count, CPU model, OS, and power mode.
-- Validation scripts should become checked-in scripts only after their names, outputs, and failure semantics are stable.
-
-### C.7 Follow-Up Validations And Decisions
-
-### C.7.1 Splunk Oracle Run 2026-05-12
-
-Local Splunk Enterprise HEC was verified by `/Users/walter/Work/Spank/HECpoc/scripts/verify_splunk_hec.sh` with results under `/Users/walter/Work/Spank/HECpoc/results/splunk-verify-20260512T082128Z`.
-After code updates, the same script was run against HECpoc with results under `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T084259Z`.
-Additional oracle and local comparison runs captured auth, method, JSON-array, health, and index behavior under `/Users/walter/Work/Spank/HECpoc/results/splunk-verify-20260512T084632Z`, `/Users/walter/Work/Spank/HECpoc/results/splunk-extra-20260512T084834Z`, `/Users/walter/Work/Spank/HECpoc/results/splunk-index-20260512T085059Z`, `/Users/walter/Work/Spank/HECpoc/results/spank-verify-20260512T092550Z`, and `/Users/walter/Work/Spank/HECpoc/results/spank-extra-20260512T092625Z`.
-
-Older result directories were archived under `/Users/walter/Work/Spank/HECpoc/results/archive-20260514T004745Z` before the current curl matrix runs. New evidence should cite only the current directories unless a historical comparison is specifically needed:
-
-- Splunk live curl matrix: `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T004823Z`.
-- HECpoc live curl matrix after fixes: `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T005028Z`.
-- HECpoc live curl matrix after reason/stats and sink changes: `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z`.
-- Splunk live curl matrix rerun after reason/stats and sink changes: `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z`.
-
-The latest Splunk and HECpoc curl matrices match HTTP status for all shared cases. HECpoc-only cases are disabled-token verification and `/hec/stats`; the Splunk matrix has no disabled-token case because the local Splunk token used for the oracle is enabled. Response bodies match for shared JSON/HTML compatibility cases except the advertised-oversize `413` text, where Splunk reports its configured maximum `838860800` bytes and HECpoc reports its configured maximum `1000000` bytes.
+The latest HECpoc and Splunk curl matrices match HTTP status for all shared cases. HECpoc-only cases remain `/hec/stats` and local disabled-token configuration. The Splunk disabled-token oracle now confirms code `1` and HTTP `403`; HECpoc uses Splunk's response text `Token disabled`.
 
 Coverage terms:
 
@@ -1137,114 +963,348 @@ Coverage terms:
 - `live HECpoc confirmed`: a running HECpoc process returned the expected HTTP/HEC result through curl.
 - `Splunk confirmed`: local Splunk Enterprise returned the same behavior in the curl matrix or prior oracle run.
 
-| Case | Splunk result | Implementation status |
-|------|---------------|-----------------------|
-| event baseline | `200`, `{"text":"Success","code":0}` | matched |
+### C.2 Compatibility Case Matrix
+
+| Case | Splunk Result | HECpoc Status |
+|------|---------------|---------------|
+| event baseline | `200/code0` | matched |
 | stacked JSON objects | `200/code0` | matched |
-| JSON array batch | `200/code0` | fixed to match |
+| JSON array batch | `200/code0` | matched |
 | missing `event` | `400/code12`, invalid event `0` | matched |
 | blank `event` | `400/code13`, invalid event `0` | matched |
 | malformed JSON object/string | `400/code6`, invalid event `0` | matched |
-| trailing garbage after one event | `400/code6`, invalid event `1` | matched by parser test |
+| trailing garbage after one event | `400/code6`, invalid event `1` | matched by parser test and curl matrix |
 | nested object in `fields` | `400/code15`, invalid event `0` | matched |
-| direct array value in `fields` | `200/code0` | fixed to match |
-| top-level `fields` array | `400/code6`, invalid event `0` | fixed to match |
+| direct array value in `fields` | `200/code0` | matched |
+| top-level `fields` array | `400/code6`, invalid event `0` | matched |
 | raw lines | `200/code0` | matched |
 | blank raw body | `400/code5` | matched |
+| raw whitespace-only body | `400/code5` | matched |
 | raw final line without LF | `200/code0` | matched |
-| raw whitespace-only body | `400/code5` | fixed to match |
-| ACK query when ACK disabled | `400/code14` | matched |
-| unknown HEC path | `404`, `{"text":"The requested URL was not found on this server.","code":404}` | fixed to match body/status |
-| wrong method on known route | `405` with same JSON body/code `404` | fixed to match body/status |
-| `Bearer` auth scheme | `401/code3` | fixed to reject |
-| Basic auth password token | `200/code0` | fixed to accept |
-| query-string token disabled | `400/code16` | fixed to reject before auth/body work |
-| event index `main` | `200/code0` | fixed by compile defaults and allow-list |
-| unknown or invalid event index | `400/code7`, invalid event `1` | fixed for event-body index cases |
-| unsupported content encoding | `415` HTML body | fixed to match generic HTML body |
-| huge/conflicting `Content-Length` | `413` HTML body; script case is not a true malformed-header test | advertised oversize fixed to generic HTML; malformed `Content-Length` is still rejected by Hyper before HEC handler with empty `400` |
+| raw invalid UTF-8 | `200/code0` | matched at response level; HECpoc stores lossy text plus original byte length |
+| no auth / blank auth | `401/code2` | matched |
+| unsupported `Bearer` auth | `401/code3` | matched |
+| wrong token | `403/code4` | matched |
+| disabled token | `403/code1`, `Token disabled` | Splunk confirmed; HECpoc implementation aligned |
+| Basic auth password token | `200/code0` | matched |
+| query-string token disabled | `400/code16` | matched |
+| event index `main` | `200/code0` | matched by compile defaults and allow-list |
+| unknown or invalid event index | `400/code7`, invalid event `1` | matched for event-body index cases |
+| unsupported content encoding | `415` HTML body | matched |
+| malformed gzip | `400` HTML body | matched |
+| huge/conflicting `Content-Length` | `413` HTML body | matched at status/body class; exact max-byte text differs by configured limit |
+| ACK query when ACK disabled | `400/code14` | matched as compatibility stub |
+| health while serving | `200/code17` | matched |
+| unknown HEC path | `404` JSON body with code `404` | matched |
+| wrong method on known HEC route | `405` JSON body with code `404` | matched |
 
-| Area | Current Interpretation | Required Action |
-|------|------------------------|-----------------|
-| Splunk oracle replay | one local run now gives concrete behavior for fields, stacked JSON, raw blank/final-line, ACK-disabled, unknown path, 413, and 415 | keep result directory; rerun after changing body-limit/encoding response policy |
-| benchmark failure accounting | earlier run showed five server-side failures while AB reported zero; later run reproduced the class as body-read tail errors | keep client-tool tail failures separate from successful-throughput reporting; confirm with non-AB clients |
-| unsupported encoding response | Splunk returns generic HTML `415`; HECpoc now does too for handler-owned unsupported encoding | implemented with distinct reporting fact/counter |
-| body-too-large response | Splunk returns generic HTML `413`; HECpoc now does too for handler-owned body-too-large | add raw socket tests for malformed header cases |
-| malformed gzip | Splunk returns generic HTML `400`; HECpoc now does too for handler-owned gzip decode failures | implemented with separate `gzip_failures` counter |
-| health serving body | Splunk returns `{"text":"HEC is healthy","code":17}` | matched by HECpoc live curl matrix |
-| disabled token | HECpoc returns `403/code1` for configured disabled token | unit/handler and live HECpoc confirmed; Splunk disabled-token oracle not yet configured |
-| multiple token records | explicit enabled/disabled tokens and per-token index settings load from TOML | unit covered; live matrix used enabled and disabled HECpoc token records |
-| token ID in reports | known enabled token IDs are emitted on request success/failure; disabled token ID is preserved through detailed auth failure | unit/handler covered; visible through report fields when tracing is enabled |
-| bounded reason stats | `StatsSnapshot.reasons` groups bounded reasons by reporting fact | unit covered and live HECpoc matrix confirmed in `/hec/stats` |
-| raw invalid UTF-8 | lossy acceptance is useful but not replay-grade | document raw text policy and add byte-preserving mode before replay claims |
-| blank raw lines | Splunk returned no-data for blank and whitespace-only raw bodies | current behavior matches for tested cases |
-| direct file success | written, flushed, and durable are different claims | define direct-file commit state and make response/reporting use that state |
-| per-component filters | `EnvFilter` handles tracing but not every output | implement TOML-to-EnvFilter first; add Reporter filters only when another output needs them |
+### C.3 Reporting And Stats Evidence
 
-### C.8 Pending And Future Work Decomposition
+Current reporting/status work:
 
-This is the single short status ledger for items that were previously scattered across "still open" and "not sufficiently covered" lists. Appendix A keeps protocol behavior; Appendix D keeps harness mechanics.
+| Area | Status | Evidence / Next Action |
+|------|--------|------------------------|
+| component tracing targets | implemented | `hec.receiver`, `hec.auth`, `hec.body`, `hec.parser`, and `hec.sink` are emitted through literal tracing targets |
+| token ID in reports | implemented for known token contexts | enabled-token success/failure and disabled-token auth failure preserve `token_id`; add explicit log-capture assertion later if needed |
+| bounded reasons | implemented at top level | `Reason` enum feeds `reason` report field and `/hec/stats.reasons` |
+| reason-labeled stats | implemented | HECpoc matrix stats group reasons by fact; detailed subreasons remain future work |
+| reporter field serialization | needs design | tracing still serializes dynamic fields as one JSON string; decide whether to keep this shape, add static hot fields, or introduce a structured layer |
+
+### C.4 Performance And AB Evidence
+
+The earlier `requests_failed = 5` condition came from `/Users/walter/Work/Spank/HECpoc/results/bench-profile-20260505T002232Z`: AB reported zero failed requests, while HECpoc stats reported five request failures with no detailed reason counters available at that time. A later run reproduced the class with `requests_failed = 1` and `body_read_errors = 1`, suggesting extra/incomplete client-side tail requests after AB had counted its successful requests.
+
+Current status: the focused rerun `/Users/walter/Work/Spank/HECpoc/results/bench-ab-reason-20260514T050708Z` did not reproduce the condition. It ran `100` single-connection and `400` concurrent requests, AB reported zero failed requests, and HECpoc reported `requests_failed=0`, `body_read_errors=0`, and no reason counters.
+
+Interpretation:
+
+- The old `5` is not an active known bug, but remains a benchmark-tool suspicion because the earlier evidence was real.
+- The condition should be considered unresolved until a longer AB run and a non-AB tool such as `oha`, `wrk`, Vector, or a Rust load generator are run with reason stats enabled.
+- Any future benchmark summary must report AB client failures, HECpoc `requests_failed`, HECpoc `body_read_errors`, and `reasons` side by side.
+
+### C.5 Implementation Work Items
 
 | Item | Status | Next Action |
 |------|--------|-------------|
-| live HECpoc curl matrix | covered | keep `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z` as current evidence |
-| Splunk curl matrix | covered | keep `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z` as current oracle evidence |
-| multiple configured tokens | implemented | extend live tests only when token reload or per-token source metadata exists |
-| token ID in reporting | implemented for known token contexts | add an explicit log-capture assertion if tracing output becomes testable |
-| bounded reason values | implemented at top level | add detailed subreasons for index syntax, length, reserved names, allow-list miss, and JSON parser classes |
-| stats labeled reasons | implemented as `reasons` grouped by reporting fact | decide later how these map to Prometheus/OpenMetrics labels |
-| capture sink open/flush | improved | add configurable flush policy and commit-state semantics before durable claims |
-| raw parser allocation | still open | design `RequestRaw`/`RawEvents` with byte spans or bytes-backed event references |
-| raw byte preservation | still open | implement optional original-byte sidecar or field behind size/redaction controls |
-| Vector-as-client validation | still open | configure Vector `splunk_hec_logs` sink to send raw and event payloads into HECpoc and record request shapes |
-| AB tail/body-read artifact | still open | rerun AB plus another load tool with reason stats and server logs enabled |
-| query metadata | postponed | verify Splunk precedence for raw query metadata, then implement `index`, `host`, `source`, and `sourcetype` parsing |
-| disabled Splunk token oracle | still open | create or disable a dedicated Splunk HEC token and rerun only auth cases |
-| timeout Splunk oracle | still open | use raw-socket verifier to test slow headers, no body, slow body, and truncated body against Splunk and HECpoc |
-| ACK, queue, server-busy taxonomy | postponed | resume only after bounded queue and ACK registry designs exist |
+| raw parser allocation | open | replace immediate per-line `String`/`Event` construction with `RequestRaw` plus `RawEvents` spans or bytes-backed references |
+| raw byte preservation | open | add optional original-byte sidecar or field with size caps and redaction/logging protections |
+| query metadata | open | verify Splunk raw endpoint precedence, then implement `index`, `host`, `source`, and `sourcetype` query parsing |
+| detailed reason sublabels | open | split `incorrect_index` into syntax, length, reserved/private name, allow-list miss; split parse failures into bounded parser classes |
+| capture sink flush policy | open | current sink keeps one append handle open; still needs configurable flush policy and commit-state reporting |
+| raw-socket verifier | runnable command, numbered cases, simple verdicts, and optional stats capture complete | run same cases against plain-HTTP Splunk and record mismatches |
 
-### C.9 Performance Comparison — Current HECpoc, Earlier Rust Work, And Vendor Signals
+### C.6 Design And Investigation Work
 
-The current HECpoc numbers measure a localhost HTTP receiver using Axum/Tokio/Hyper, bounded body read, raw line splitting, and the drop sink. They do not include durable file or database commit, indexing, ACK, TLS, remote network, or Splunk-compatible storage/search costs.
+| Topic | Why It Is Not Just Implementation |
+|-------|-----------------------------------|
+| Splunk raw query precedence | Need to know whether query metadata overrides token defaults and whether any body/event metadata equivalent exists for `/raw`; response-only curl cannot prove indexed metadata without searching Splunk or inspecting indexed events |
+| timeout behavior | Curl and AB are HTTP clients, not malformed-wire tools; exact slow-header, no-body, slow-body, and truncated-body behavior needs raw socket generation against Splunk and HECpoc |
+| Vector-as-client validation | Need to observe request shapes from a real shipper: endpoint choice, compression, batching, auth form, retry behavior, and flush behavior |
+| durable capture/store claims | Current capture is a fixture sink; written, flushed, durable, and indexed must stay separate until store commit boundaries exist |
 
-| Source | Workload | Result | Interpretation |
-|--------|----------|--------|----------------|
-| HECpoc current regular run | Apache raw payload, `171_239` bytes and `1_999` events/request, drop sink, `ab -n 500 -c 1` | about `3,000 req/s`; receiver delta about `6.0M events/s`, `489 MiB/s` | HTTP/request overhead visible; very high event rate only because each request carries many raw lines and sink is drop-only |
-| HECpoc current regular run | same payload, `ab -n 2000 -c 16` | about `17,011 req/s`; receiver delta about `33.9M events/s`, `2.7 GiB/s`; one extra body-read failure from AB tail behavior | useful upper smoke signal for in-memory raw splitting, not production ingest capacity |
-| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 1000 -c 1` | about `11,998 req/s`; `0` server failures | measures request overhead with tiny payload, not parsing throughput |
-| HECpoc earlier small-body run | tiny raw body, drop sink, `ab -n 5000 -c 50` | about `38,735 req/s`; `0` server failures | shows the server can answer many tiny local HTTP requests when body work is trivial |
-| SpankMax focused parser harness | generated Apache, `100_000` rows, `memchr`, simple tokenizer, null store | about `2.78M events/s`, `362 MiB/s` | cleaner CPU parser/tokenizer/store-null measurement; no HTTP, Axum, auth, body limits, or sink durability |
-| SpankMax focused parser harness | real Apache-ish input, `13_628` rows, `memchr`, simple tokenizer, null store | about `1.49M events/s`, `444 MiB/s` | parser harness remains the better place to study parser/tokenizer layout |
-| SpankMax focused parser harness | syslog, `9_148` rows, simple tokenizer, null store | about `680k events/s`, `125 MiB/s` | syslog/tokenization path is materially heavier than raw-line HEC splitting |
-| Earlier integrated `spank-hec` crate | Axum `Bytes` extractor, mpsc queue, file sender | no comparable retained benchmark artifact found | code is useful design history but not a current performance baseline; it reads whole bodies before HEC-owned limits and uses a different queue/file path |
+### C.7 RequestRaw / RawEvents Ownership Design
 
-External vendor signals are not apples-to-apples, but they set order-of-magnitude expectations:
+Current raw parsing eagerly turns every nonblank line into owned text and a full `Event`:
 
-- Splunk Stream HEC HTTP raw tests report `streamfwd` sender rates from `13` to `11,437 events/sec` in a 100K-response HTTP test across 8 Mbps to 10 Gbps, and up to `22,411 events/sec` in a 25K-response HTTP test before drop rates appear at higher rates. Source: [Splunk Independent streamfwd HEC HTTP raw tests](https://help.splunk.com/en/splunk-enterprise/collect-stream-data/install-and-configure-splunk-stream/8.0/splunk-stream-performance-tests-and-considerations/independent-streamfwd-hec-tests---http-raw-events).
-- Splunk HEC troubleshooting/performance guidance emphasizes batching, HTTP versus HTTPS, keep-alive, Monitoring Console dashboards, and persistent queue cost rather than a single universal throughput number. Source: [Splunk HEC troubleshooting](https://docs.splunk.com/Documentation/Splunk/9.4.2/Data/TroubleshootHTTPEventCollector).
-- Vector sizing guidance estimates unstructured logs at about `10 MiB/s/vCPU` and structured logs at about `25 MiB/s/vCPU`, explicitly as conservative sizing starting points that vary by workload. Source: [Vector sizing and capacity planning](https://vector.dev/docs/setup/going-to-prod/sizing/).
-- Vector's public positioning says it is high-performance and claims up to `10x` faster than alternatives, but that is vendor positioning, not a replacement for our local apples-to-apples HEC receiver tests. Source: [Vector GitHub README](https://github.com/vectordotdev/vector).
+```rust
+for line in body.split(|byte| *byte == b'\n') {
+    let line = strip_trailing_cr(line);
+    if is_blank_raw_line(line) {
+        continue;
+    }
+    let raw_bytes_len = line.len();
+    let raw = String::from_utf8_lossy(line).into_owned();
+    let mut event = Event::from_raw_line_with_len(raw_bytes_len, raw, Endpoint::Raw);
+    event.index = default_index.map(ToOwned::to_owned);
+    events.push(event);
+}
+```
 
-Current conclusion: HECpoc is already fast enough that the next bottlenecks should be correctness, measurement reliability, and sink/queue design rather than raw Axum/Tokio viability. The parser harness still beats the HEC server as a controlled microbench because it removes HTTP and request lifecycle overhead. Vendor numbers reinforce that batching dominates event/sec comparisons; request/sec without payload size is nearly meaningless.
+That is simple and safe, but it allocates a `String` and full `Event` for each line before the sink/store path has chosen whether it needs text, bytes, both, or neither.
 
-### C.10 Five-Failure Diagnosis And Benchmark Tooling
+Recommended ownership shape:
 
-The previous `requests_failed = 5` anomaly was reproduced as the same class with a smaller count: AB completed the configured request count successfully, while the server observed one or more extra tail requests that failed during body read with HEC code `6`. After adding `body_read_errors`, the regular run recorded `requests_ok = 2500`, `requests_failed = 1`, and `body_read_errors = 1`; AB still reported `0` failed requests.
+```rust
+struct RequestRaw {
+    bytes: bytes::Bytes,
+    default_index: Option<String>,
+}
 
-Likely interpretation: ApacheBench can leave extra/incomplete POST attempts near the end of a concurrent run. Hyper delivers those as body read errors after the HEC handler has accepted the route and auth context. These should not be mixed into the measured successful-request throughput; they should be reported separately as client/tool tail behavior unless reproduced with another client.
+struct RawEventRef {
+    start: usize,
+    end: usize,
+    had_trailing_cr: bool,
+}
 
-Instrumentation and harness details belong in Appendix D. This evidence section records the observed AB/server mismatch and points to the run artifacts; it should not become the script reference.
+struct RawEvents {
+    request: RequestRaw,
+    events: Vec<RawEventRef>,
+}
 
-Long-run benchmark evidence policy:
+impl RawEvents {
+    fn event_bytes(&self, event: &RawEventRef) -> &[u8] {
+        &self.request.bytes[event.start..event.end]
+    }
 
-1. Always keep `stats-before.json`, stage stats, AB output, `summary.json`, server logs, and `system/` samples together under one result directory.
-2. Compare AB-reported failures with HEC `requests_failed` and reason counters.
-3. Treat `body_read_errors` during AB as a benchmark-tool artifact until reproduced with `oha`, `wrk`, Vector, or a raw socket harness.
-4. Report both request/sec and event/sec, plus payload bytes/sec. Request/sec alone is misleading when one request can contain one line or two thousand lines.
-5. Use drop sink, capture sink, queue sink, and durable sink as separate benchmark modes; never blend them into one headline number.
+    fn event_text_lossy(&self, event: &RawEventRef) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(self.event_bytes(event))
+    }
 
+    fn materialize_event(&self, event: &RawEventRef) -> Event {
+        let bytes = self.event_bytes(event);
+        let mut out = Event::from_raw_line_with_len(
+            bytes.len(),
+            String::from_utf8_lossy(bytes).into_owned(),
+            Endpoint::Raw,
+        );
+        out.index = self.request.default_index.clone();
+        out
+    }
+}
+```
 
----
+Equivalent line-scan using `RawEventRef`:
+
+```rust
+fn parse_raw_events(
+    bytes: bytes::Bytes,
+    max_events: usize,
+    default_index: Option<String>,
+) -> Result<RawEvents, HecError> {
+    if bytes.is_empty() {
+        return Err(HecError::NoData);
+    }
+
+    let mut refs = Vec::new();
+    let mut start = 0;
+    let mut cursor = 0;
+
+    loop {
+        let relative_lf = memchr::memchr(b'\n', &bytes[cursor..]);
+        let end = relative_lf
+            .map(|offset| cursor + offset)
+            .unwrap_or(bytes.len());
+
+        let mut line_end = end;
+        if line_end > start && bytes[line_end - 1] == b'\r' {
+            line_end -= 1;
+        }
+
+        if has_non_whitespace(&bytes[start..line_end]) {
+            if refs.len() >= max_events {
+                return Err(HecError::ServerBusy);
+            }
+            refs.push(RawEventRef {
+                start,
+                end: line_end,
+                had_trailing_cr: line_end < end,
+            });
+        }
+
+        match relative_lf {
+            Some(_) => {
+                cursor = end + 1;
+                start = cursor;
+            }
+            None => break,
+        }
+    }
+
+    if refs.is_empty() {
+        return Err(HecError::NoData);
+    }
+
+    Ok(RawEvents {
+        request: RequestRaw {
+            bytes,
+            default_index,
+        },
+        events: refs,
+    })
+}
+
+fn has_non_whitespace(line: &[u8]) -> bool {
+    line.iter().any(|byte| !byte.is_ascii_whitespace())
+}
+```
+
+The above is the conceptual equivalent of the current `for line in body.split(...)` loop, but it shows the intended fast path directly: use a `memchr`-style newline search, trim only a single trailing `\r`, skip all-whitespace records, check `max_events` immediately before `push`, and store byte offsets. The task is deliberately simple; the extra structs exist only to preserve ownership boundaries and delay allocation, not because newline scanning itself is complex.
+
+Raw endpoint newline behavior:
+
+| Input | Current Behavior | Intended `RawEventRef` Behavior |
+|-------|------------------|----------------------------------|
+| `one` | accepted as one event; final `\n` is not required | same |
+| `one\n` | accepted as one event; trailing empty segment is ignored | same |
+| `one\r\n` | accepted as one event with trailing `\r` stripped | same |
+| `\n` | no nonblank events; returns `NoData` | same |
+| `\r\n` | no nonblank events after CR stripping; returns `NoData` | same |
+| `a\rb` | accepted with embedded `\r`; only final CR before LF/end is stripped | same |
+
+Current compatibility conversion to existing sinks/tests:
+
+```rust
+fn materialize_events(raw: &RawEvents) -> Vec<Event> {
+    raw.events
+        .iter()
+        .map(|raw_event| raw.materialize_event(raw_event))
+        .collect()
+}
+
+fn parse_raw_body_compat(
+    body: bytes::Bytes,
+    max_events: usize,
+    default_index: Option<String>,
+) -> Result<Vec<Event>, HecError> {
+    let raw_events = parse_raw_events(body, max_events, default_index)?;
+    Ok(materialize_events(&raw_events))
+}
+```
+
+This keeps the present `Vec<Event>` interface available while creating a later cut point: fast paths can pass `RawEvents` to a byte-preserving store, while compatibility paths can keep materializing `Vec<Event>` at the sink boundary.
+
+Lifetime and ownership rules:
+
+| Scenario | Ownership Choice | Why |
+|----------|------------------|-----|
+| same-task parsing and drop/capture | `RawEvents` owns one `Bytes`; `RawEventRef` stores offsets | no self-referential structs, no per-line allocation until materialization |
+| async queue between HEC receive and sink/store | move `RawEvents` through the queue | `Bytes` is owned and reference-counted, so queued data does not borrow the handler stack |
+| per-event fanout across tasks | use `RawEventOwned { bytes: Bytes, start, end, metadata }` | cloning `Bytes` is cheap and keeps byte storage alive independently |
+| text-only sink | call `event_text_lossy()` or `materialize_event()` at the sink boundary | lossy conversion happens only where text is required |
+| byte-preserving sink | persist `event_bytes()` plus offset/length metadata | exact bytes remain available without trusting UTF-8 |
+| JSON capture fixture | choose explicitly: fixed/lossy text only, original bytes encoded, or both | avoids accidental raw-byte leakage into logs or redaction paths |
+
+Function return values:
+
+- `event_bytes(&self, event) -> &[u8]`: borrowed view into the `Bytes` owned by `RawEvents`; valid only while the `RawEvents` borrow is alive.
+- `event_text_lossy(&self, event) -> Cow<'_, str>`: borrowed `&str` when bytes are valid UTF-8, owned `String` when replacement characters are needed; the borrowed case is tied to `&self`.
+- `materialize_event(&self, event) -> Event`: fully owned compatibility object for current sink/tests; safe to move anywhere, but pays allocation cost.
+
+The key design rule is: do not store `&str` or `&[u8]` inside long-lived event structs. Store owned `Bytes` plus integer ranges. Borrow only inside short method calls.
+
+Benefits:
+
+- one body allocation is shared by all raw events;
+- exact original bytes remain available for optional evidence/replay mode;
+- lossy text conversion happens only if the selected sink/store or parser needs text;
+- line offsets become available for diagnostics and raw-socket/corpus tests.
+
+Costs:
+
+- sinks and parsers must accept a richer input type than `Vec<Event>`;
+- generalized store code must decide when to materialize text, bytes, or both;
+- benchmark comparisons must name whether they measure raw span construction or owned `Event` materialization.
+
+### C.8 Rust Raw-Socket Verifier
+
+The raw-socket verifier is implemented as a Rust binary at `/Users/walter/Work/Spank/HECpoc/src/bin/raw_socket_hec.rs` and wrapped by `/Users/walter/Work/Spank/HECpoc/scripts/raw_socket_hec.sh`. The binary owns its command-line documentation: run `scripts/raw_socket_hec.sh --help` for arguments, defaults, numbered cases, artifact layout, and interpretation notes.
+
+Basic invocation:
+
+```sh
+scripts/raw_socket_hec.sh \
+  --out results/raw-socket-YYYYMMDDTHHMMSSZ/raw-socket \
+  --stats-url http://127.0.0.1:18447/hec/stats
+```
+
+The command defaults are `--addr 127.0.0.1:18088`, `--token dev-token`, `--case all`, `--read-timeout-ms 8000`, `--slow-body-delay-ms 6000`, and `--out results/raw-socket`. The `--stats-url` argument is optional and HECpoc-specific; omit it for Splunk unless an equivalent stats endpoint is intentionally provided by a separate harness.
+
+Implemented cases are numbered in the binary and may be selected by number, by name, or by `all`. The verifier reports `Pass` or `Fail` only where the expectation is simple enough to assess from the response and optional stats delta. Stack-owned cases report `Info` or `Review`, because their purpose is diagnostic evidence rather than HEC protocol compliance.
+
+| ID | Case | Expected Visibility | Purpose |
+|----|------|---------------------|---------|
+| 1 | `valid_raw` | HEC handler | complete raw HEC request succeeds |
+| 2 | `partial_header_timeout` | stack/no handler | unterminated HTTP header block; checks header-stall exposure before a HEC request exists |
+| 3 | `header_length` | HEC handler | `Content-Length` header promises body bytes that never arrive; leave write side open and wait |
+| 4 | `header_length_shutdown` | HEC handler | same as case `3`, but read for `500ms`, then `shutdown(Write)`, then read again |
+| 5 | `header_length_short_body` | HEC handler | fewer body bytes than `Content-Length`, then write half-close |
+| 6 | `chunked_truncated` | HEC handler | incomplete chunked transfer framing |
+| 7 | `slow_body` | HEC handler | segmented body with configurable delay; default delay is `6000ms` |
+| 8 | `malformed_header_bytes` | stack/no handler | invalid header bytes before Axum creates a request; checks parser rejection and process survival |
+
+Validation run `/Users/walter/Work/Spank/HECpoc/results/raw-socket-20260514T072115Z` used HECpoc default body idle timeout `5s`, default total timeout `30s`, and verifier `--stats-url`.
+
+Observed result summary:
+
+| ID | Case | Verdict | Response | Stats Delta | Interpretation |
+|----|------|---------|----------|-------------|----------------|
+| 1 | `valid_raw` | `Pass` | `200` | `requests_total +1` | complete raw request returned HTTP `200` |
+| 2 | `partial_header_timeout` | `Info` | no response; verifier read timeout | no handler counters changed | header never became a HEC request; use stack/server logs and socket observation for this class |
+| 3 | `header_length` | `Pass` | `408` | `requests_failed +1`, `timeouts +1` | complete headers reached handler; body idle timeout was reported |
+| 4 | `header_length_shutdown` | `Pass` | `400` | `requests_failed +1`, `body_read_errors +1` | `500ms` pre-shutdown read timed out, then write shutdown reclassified absent body as EOF/read error |
+| 5 | `header_length_short_body` | `Pass` | `400` | `requests_failed +1`, `body_read_errors +1` | handler-visible short body read failure |
+| 6 | `chunked_truncated` | `Pass` | `400` | `requests_failed +1`, `body_read_errors +1` | handler-visible chunk framing/body read failure |
+| 7 | `slow_body` | `Pass` | `408` | `requests_failed +1`, `timeouts +1` | default `6000ms` delay exceeded receiver default `5s` body idle timeout |
+| 8 | `malformed_header_bytes` | `Info` | no response | no handler counters changed | HTTP parser rejected bytes before HEC handler visibility |
+
+The two no-handler cases are case `2` and case `8`. They are not HEC compliance cases; they define the boundary between HEC handler behavior and HTTP-stack behavior. Their useful signals are process survival, client-side close or timeout, optional server logs, OS socket state, and absence of HEC handler counters.
+
+Goals:
+
+| Goal | Status | Evidence / Remaining Question |
+|------|--------|--------------------------------|
+| generate exact bytes curl cannot generate | complete | numbered request artifacts are written before every case |
+| classify handler-visible body failures | complete | cases `3` through `7` distinguish timeout, EOF/read error, short body, chunk error, and slow-body timeout |
+| identify pre-handler stack boundary | sufficient for now | cases `2` and `8` show no handler counters and no false HEC responses |
+| compare with Splunk over plain HTTP | pending | non-TLS Splunk is assumed available; use the same command without `--stats-url` |
+
+The current case set is deliberately narrow. Additional variants should be added only when they answer a named defect or compatibility question. The main useful extension is a **same-input, different-client-action** comparison: case `3` leaves the write side open and times out; case `4` reads for `500ms`, calls `shutdown(Write)`, and shows EOF/read-error classification. Generic client-drop, abortive close / TCP RST, keep-alive reuse, and extra malformed-header cases are postponed until a concrete failure requires them.
+
+Receiver logging should stay light by default. Existing reporting already supplies request success/failure, reason counters, body read errors, timeouts, and component tracing targets. If raw-socket debugging needs more detail, add optional debug-level facts only at three points:
+
+| Optional Debug Point | Fields | Use |
+|----------------------|--------|-----|
+| handler entered | request id, endpoint, content length, transfer encoding | prove Axum created a HEC request |
+| body read finished or failed | request id, result class, bytes if known, elapsed time | separate timeout, EOF/read error, malformed chunk, and limit cases |
+| response selected | request id, HTTP status, HEC code when applicable, reason | connect internal outcome to client-visible response |
+
+Do not add an owned `accept()` loop for this evidence alone. It becomes useful only for connection admission policy, source limits, slowloris culling, precise open/closed connection accounting, or socket option control beyond Axum/Hyper defaults.
+
+Remaining raw-socket work:
+
+- run the sequential case set against plain-HTTP Splunk and record mismatches;
+- add optional debug-level receiver facts only if Splunk or local behavior cannot be explained from status, response bytes, and stats deltas;
+- postpone generic client-drop, TCP RST, keep-alive reuse, and additional malformed-header variants until a specific defect or compatibility gap requires them.
 
 ## Appendix D — Test Strategy And Harness
 
@@ -1254,7 +1314,7 @@ This appendix owns the testing and harness structure. Appendix A defines behavio
 
 | Category | Question Answered | Primary Tooling |
 |---|---|---|
-| Splunk HEC exploration | What does Splunk actually do for ambiguous or weakly documented behavior? | `scripts/verify_splunk_hec.sh`, future raw-socket verifier |
+| Splunk HEC exploration | What does Splunk actually do for ambiguous or weakly documented behavior? | `scripts/verify_splunk_hec.sh`, `scripts/raw_socket_hec.sh` when plain HTTP is available |
 | HECpoc local implementation tests | Does our parser, handler, reporting fact, or config rule work as specified? | Rust unit and handler tests |
 | HECpoc validation/system tests | Does the running process behave correctly across startup, health, shutdown, stats, and capture? | `scripts/curl_hec_matrix.sh`, shell scripts, curl, stats snapshots, capture files |
 | Performance and load tests | What throughput and resource use occur for a named workload and sink mode? | `bench_hec_ab.sh`, `capture_system_stats.sh`, `analyze_bench_run.py` |
@@ -1266,100 +1326,13 @@ Immediate tests should close known behavior holes before adding new subsystems:
 
 1. completed locally and live-confirmed where possible: event empty body, blank authorization header, disabled token, gzip decode failure, gzip expansion too large, unsupported encoding, health serving response, JSON array input, and invalid-index route;
 2. completed locally only: multiple token config records, duplicate token ID/secret rejection, per-token default-index validation, shutdown/stopping phase, and gzip expansion cap;
-3. next local tests: bounded reason values for parse/index failures once those reason enums exist;
+3. next local tests: detailed bounded subreason values for parse/index failures;
 4. Splunk exploration: timeout, malformed HTTP framing, malformed `Content-Length`, disabled-token oracle configuration, and later-invalid JSON arrays;
 5. system validation: health while stopping and request behavior during graceful drain;
 6. only after design work: ACK registry tests, bounded-queue tests, query-string index tests, and byte-preserving raw-mode tests.
 
 ### D.3 Raw Socket Complexity
 
-Curl, AB, and most HTTP libraries are poor tools for malformed-wire tests because they normalize, reject, or rewrite invalid requests before bytes reach the server. Specific cases needing raw socket control:
+Curl, AB, and most HTTP libraries are poor tools for malformed-wire tests because they normalize, reject, or rewrite invalid requests before bytes reach the server. Specific cases needing raw socket control include partial headers, slowloris header stalls, malformed `Content-Length`, truncated chunked bodies, no-body-after-header cases, and body cutoffs after route/auth succeeds.
 
-- partial headers;
-- slowloris header stall;
-- malformed `Content-Length` that curl would correct or refuse;
-- truncated chunked body;
-- header sent with no body followed by idle timeout;
-- body cut off mid-frame after route/auth succeeds.
-
-A raw-socket verifier should write exact bytes, control sleeps between writes, capture server response bytes, and record whether the request reached HECpoc handler code or was rejected by Hyper/stack behavior.
-
-Recommended implementation structure:
-
-| Function | Responsibility |
-|----------|----------------|
-| `Case` | name, target host/port/TLS mode, byte segments, inter-segment sleeps, expected close/response policy |
-| `Segment` | one exact byte string plus optional delay before or after write |
-| `run_case` | open `TcpStream`, write segments, shutdown write side if requested, read until EOF/timeout, record bytes and timing |
-| `classify_response` | split status line/headers/body only after capture; never use an HTTP client parser as the generator |
-| `write_artifacts` | save request bytes, response bytes, timing JSON, stderr, and summary TSV |
-
-Python skeleton:
-
-```python
-import socket, time
-from dataclasses import dataclass
-
-@dataclass
-class Segment:
-    data: bytes
-    sleep_after: float = 0.0
-
-@dataclass
-class Case:
-    name: str
-    segments: list[Segment]
-    read_timeout: float = 5.0
-    shutdown_write: bool = True
-
-def run_case(host: str, port: int, case: Case) -> bytes:
-    with socket.create_connection((host, port), timeout=case.read_timeout) as sock:
-        sock.settimeout(case.read_timeout)
-        for segment in case.segments:
-            sock.sendall(segment.data)
-            if segment.sleep_after:
-                time.sleep(segment.sleep_after)
-        if case.shutdown_write:
-            sock.shutdown(socket.SHUT_WR)
-        chunks = []
-        while True:
-            try:
-                chunk = sock.recv(65536)
-            except socket.timeout:
-                break
-            if not chunk:
-                break
-            chunks.append(chunk)
-        return b"".join(chunks)
-```
-
-Initial cases:
-
-- `partial_header_timeout`: send `POST /services/collector/raw HTTP/1.1\r\nHost: x\r\n` and sleep beyond header timeout.
-- `declared_length_no_body`: send valid headers with `Content-Length: 10`, then no body.
-- `declared_length_short_body`: send `Content-Length: 10` and only `abc`.
-- `chunked_truncated`: send chunked framing and omit terminating `0\r\n\r\n`.
-- `slow_body`: send valid headers and body bytes one at a time with delay above/below configured idle timeout.
-
-Raw endpoint byte-preserving tests are also deferred. The current raw path preserves fixed/lossy text plus `raw_bytes_len`; it does not preserve the exact original byte sequence after invalid UTF-8, CRLF normalization, or JSON capture escaping. This is sufficient for a Splunk-compatible local fixture that accepts raw text, but not for forensic replay or byte-identical evidence storage.
-
-The byte-preserving requirement is therefore real only for product modes that claim replay, forensic evidence, or exact source retention. Public Vector documentation describes Splunk HEC source output as log events with a required `message` field containing the raw line, and its Splunk HEC sink can send events to the raw endpoint, but those docs do not promise a byte-identical archive of original HEC wire bytes. HECpoc should default to fixed text only, optionally persist original bytes with size and redaction controls, and never pass unprocessed original bytes through routines that expect valid strings, cleaned text, or safe log output.
-
-### D.4 Script Inventory
-
-| Script | Category | Purpose | Limitation |
-|---|---|---|---|
-| `scripts/verify_splunk_hec.sh` | Splunk exploration | captures Splunk response status, headers, body, curl errors, payloads, and summary | does not assert expectations; not enough for malformed wire cases |
-| `scripts/curl_hec_matrix.sh` | Splunk/HECpoc live matrix | exercises shared event/raw/auth/gzip/index/health/route cases against either Splunk or HECpoc and records payloads, headers, bodies, status, manifest, and summary | curl cannot reliably generate malformed HTTP framing, slowloris, or truncated body cases |
-| `scripts/bench_hec_ab.sh` | benchmark validation | builds release receiver, runs AB stages, captures stats and monitor output | localhost HTTP/drop-sink benchmark only unless configured otherwise |
-| `scripts/analyze_bench_run.py` | benchmark analysis | computes receiver-side request, byte, and event rates from AB and stats | AB-output parser is tool-specific |
-| `scripts/capture_system_stats.sh` | system evidence | samples CPU, memory, descriptors, threads, VM, network, and IO | platform best-effort; not a profiler |
-| `scripts/capture_net_observe.sh` | network observation | samples `netstat`, `lsof`, `sysctl`, `ulimit`, and stats endpoint | macOS-oriented defaults; active port must be checked |
-| `scripts/README.md` | script guide | keeps script purpose and limitations close to scripts | should stay brief and defer behavior expectations to Appendix A |
-
-### D.5 Evidence Placement
-
-- Expected behavior belongs in Appendix A.
-- Test/harness purpose belongs in Appendix D.
-- Completed run facts, result directories, and benchmark numbers belong in Appendix C.
-- Script implementation detail belongs in `/Users/walter/Work/Spank/HECpoc/scripts/README.md` and the scripts themselves.
+The raw-socket verifier is implemented in Rust and described in Appendix C.8. Appendix D only records why this is a separate test category.

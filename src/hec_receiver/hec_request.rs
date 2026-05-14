@@ -1104,7 +1104,7 @@ mod tests {
         let body = to_bytes(body, usize::MAX).await.unwrap();
 
         assert_eq!(parts.status, StatusCode::FORBIDDEN);
-        assert_eq!(body.as_ref(), br#"{"text":"Token is disabled","code":1}"#);
+        assert_eq!(body.as_ref(), br#"{"text":"Token disabled","code":1}"#);
         let stats = state.reporter.stats_snapshot();
         assert_eq!(stats.auth_failures, 1);
         assert_eq!(
