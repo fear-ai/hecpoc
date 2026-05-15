@@ -23,11 +23,12 @@ const AFTER_LONG_HELP: &str = r#"Case reference:
   8    malformed_header_bytes    Invalid header bytes; usually stack-owned/no handler.
 
 Artifacts:
-  requests/NN_name.bin   exact bytes written to the TCP socket
-  responses/NN_name.bin  exact bytes read from the TCP socket
-  stats/NN_name_before.json and stats/NN_name_after.json when --stats-url is set
-  summary.tsv            compact human review table
-  results.json           machine-readable result records
+  OUT/YYYYMMDDThhmmssZ/show-config.log  run configuration and selected cases
+  OUT/YYYYMMDDThhmmssZ/requests/NN_name.bin   exact bytes written to the TCP socket
+  OUT/YYYYMMDDThhmmssZ/responses/NN_name.bin  exact bytes read from the TCP socket
+  OUT/YYYYMMDDThhmmssZ/stats/NN_name_before.json and stats/NN_name_after.json when --stats-url is set
+  OUT/YYYYMMDDThhmmssZ/summary.tsv            compact human review table
+  OUT/YYYYMMDDThhmmssZ/results.json           machine-readable result records
 
 Interpretation:
   A status value means an HTTP response was read from the target.
@@ -52,7 +53,7 @@ struct Cli {
     #[arg(
         long,
         default_value = "results/raw-socket",
-        help = "Output directory for request, response, summary, and JSON artifacts"
+        help = "Output root; each run creates a UTC timestamp subdirectory"
     )]
     out: PathBuf,
     #[arg(
@@ -150,41 +151,67 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    create_dir_all(cli.out.join("requests"))?;
-    create_dir_all(cli.out.join("responses"))?;
+    let run_dir = cli.out.join(run_timestamp());
+    create_dir_all(run_dir.join("requests"))?;
+    create_dir_all(run_dir.join("responses"))?;
     if cli.stats_url.is_some() {
-        create_dir_all(cli.out.join("stats"))?;
+        create_dir_all(run_dir.join("stats"))?;
     }
 
     let cases = select_cases(&cli.case, &cli.token, cli.slow_body_delay_ms)?;
+    write_run_config(&run_dir, &cli, &cases)?;
     let mut results = Vec::new();
     let stats_timeout = Duration::from_millis(cli.stats_timeout_ms);
     for case in cases {
-        let request_file = cli
-            .out
+        let request_file = run_dir
             .join("requests")
             .join(format!("{}.bin", case.file_stem()));
         write_request_file(&request_file, &case)?;
         let stats_before = match &cli.stats_url {
-            Some(url) => snapshot_stats(&cli.out, &case, url, stats_timeout, "before"),
+            Some(url) => snapshot_stats(&run_dir, &case, url, stats_timeout, "before"),
             None => None,
         };
         let result = run_case(cli.addr, &case, Duration::from_millis(cli.read_timeout_ms));
         let stats_after = match &cli.stats_url {
-            Some(url) => snapshot_stats(&cli.out, &case, url, stats_timeout, "after"),
+            Some(url) => snapshot_stats(&run_dir, &case, url, stats_timeout, "after"),
             None => None,
         };
-        results.push(write_result(
-            &cli.out,
-            &case,
-            result,
-            stats_before,
-            stats_after,
-        )?);
+        results.push(write_result(&run_dir, &case, result, stats_before, stats_after)?);
     }
-    write_summary(&cli.out, &results)?;
-    serde_json::to_writer_pretty(File::create(cli.out.join("results.json"))?, &results)?;
-    println!("{}", cli.out.display());
+    write_summary(&run_dir, &results)?;
+    serde_json::to_writer_pretty(File::create(run_dir.join("results.json"))?, &results)?;
+    println!("{}", run_dir.display());
+    Ok(())
+}
+
+fn run_timestamp() -> String {
+    humantime::format_rfc3339_seconds(std::time::SystemTime::now())
+        .to_string()
+        .replace(['-', ':'], "")
+}
+
+fn write_run_config(
+    out: &std::path::Path,
+    cli: &Cli,
+    cases: &[RawHttpCase],
+) -> std::io::Result<()> {
+    let mut file = File::create(out.join("show-config.log"))?;
+    writeln!(file, "addr={}", cli.addr)?;
+    writeln!(file, "case={}", cli.case)?;
+    writeln!(file, "read_timeout_ms={}", cli.read_timeout_ms)?;
+    writeln!(file, "slow_body_delay_ms={}", cli.slow_body_delay_ms)?;
+    writeln!(file, "stats_url={}", cli.stats_url.as_deref().unwrap_or("-"))?;
+    writeln!(file, "stats_timeout_ms={}", cli.stats_timeout_ms)?;
+    writeln!(file, "token_present={}", !cli.token.is_empty())?;
+    writeln!(file)?;
+    writeln!(file, "selected_cases:")?;
+    for case in cases {
+        writeln!(
+            file,
+            "  {} {}: {} ({})",
+            case.id, case.name, case.purpose, case.handler_expectation
+        )?;
+    }
     Ok(())
 }
 
@@ -375,7 +402,7 @@ fn slow_body(token: &str, slow_body_delay_ms: u64) -> RawHttpCase {
             segment(b"a".to_vec(), slow_body_delay_ms),
             segment(b"\nb\n".to_vec(), 0),
         ],
-        true,
+        false,
     )
 }
 
@@ -631,23 +658,32 @@ fn diagnose(
             info("partial header did not become a HEC request; inspect socket/stack behavior")
         }
         2 => review("partial header produced handler-visible or unexpected HTTP behavior"),
-        3 if status == Some(408) => passed("Content-Length body absence returned HTTP 408 timeout"),
-        3 => failed("Content-Length body absence did not return HTTP 408"),
-        4 if status == Some(400) => {
-            passed("Content-Length body absence plus shutdown returned HTTP 400 EOF/read error")
+        3 if status == Some(408) => review("server returned HTTP 408 for missing body bytes"),
+        3 if status.is_none() && (timed_out || error.is_some()) => {
+            review("no HTTP response for missing body bytes; common stack behavior is wait, close, or log socket error")
         }
-        4 if status == Some(408) => {
-            review("Content-Length body absence plus shutdown still returned HTTP 408 timeout")
+        3 => review("missing body bytes produced target-specific behavior"),
+        4 if status == Some(400) || status == Some(408) => {
+            review("server returned an explicit response after body absence plus write shutdown")
         }
-        4 => {
-            failed("Content-Length body absence plus shutdown did not return HTTP 400 or HTTP 408")
+        4 if status.is_none() || error.is_some() => {
+            review("no HTTP response after body absence plus write shutdown; common stack behavior is close/log socket error")
         }
-        5 if status == Some(400) => {
-            passed("short Content-Length body returned HTTP 400 read error")
+        4 => review("body absence plus write shutdown produced target-specific behavior"),
+        5 if status == Some(400) || status == Some(408) => {
+            review("server returned an explicit response for short Content-Length body")
         }
-        5 => failed("short Content-Length body did not return HTTP 400"),
-        6 if status == Some(400) => passed("truncated chunked body returned HTTP 400 read error"),
-        6 => failed("truncated chunked body did not return HTTP 400"),
+        5 if status.is_none() || error.is_some() => {
+            review("no HTTP response for short Content-Length body; common stack behavior is close/log socket error")
+        }
+        5 => review("short Content-Length body produced target-specific behavior"),
+        6 if status == Some(400) || status == Some(408) => {
+            review("server returned an explicit response for truncated chunked body")
+        }
+        6 if status.is_none() || error.is_some() => {
+            review("no HTTP response for truncated chunked body; common stack behavior is close/log socket error")
+        }
+        6 => review("truncated chunked body produced target-specific behavior"),
         7 if status == Some(200) => {
             review("slow body returned HTTP 200; delay stayed within server timeout")
         }

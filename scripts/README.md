@@ -14,6 +14,16 @@ This directory contains local validation, Splunk exploration, and benchmark-supp
 | `capture_system_stats.sh` | Benchmark/system evidence | Samples process CPU, memory, threads/LWP, descriptors, `top`, VM, `netstat`, `iostat`, and thread listings for a target PID. | Cross-platform best-effort shell script; network grep patterns are tuned for current HEC port ranges and should become parameterized before broader use. |
 | `capture_net_observe.sh` | Network observation | Samples `netstat`, `lsof`, selected `sysctl` values, `ulimit`, and stats endpoint for repeated network-observation runs. | macOS-oriented defaults; default port may not match the active receiver; stats endpoint must be supplied when running non-default ports. |
 
+## Config Inventory
+
+| Config | Purpose | Invocation |
+|---|---|---|
+| `config/otel-splunk-hec.yaml` | OpenTelemetry Collector contrib Splunk HEC receiver on port `18089`, debug exporter | `otelcol-contrib --config scripts/config/otel-splunk-hec.yaml` or Docker image equivalent |
+| `config/vector-hec-receiver.yaml` | Vector Splunk HEC receiver on port `18090`, console JSON output | `vector --config scripts/config/vector-hec-receiver.yaml` |
+| `config/vector-to-hecpoc-raw.yaml` | Vector stdin source to HECpoc raw endpoint on `127.0.0.1:18088` | `vector --config scripts/config/vector-to-hecpoc-raw.yaml` |
+
+These files are integration-harness assets. They are kept with scripts because they launch third-party tools for evidence capture; they are not Rust unit tests and do not define product runtime defaults.
+
 ## Use Categories
 
 ### Splunk Exploration
@@ -87,6 +97,6 @@ scripts/raw_socket_hec.sh --addr 127.0.0.1:18088 --token dev-token --case all
 
 Defaults are `--addr 127.0.0.1:18088`, `--token dev-token`, `--case all`, `--read-timeout-ms 8000`, and `--slow-body-delay-ms 6000`.
 
-The command writes numbered request and response artifacts. Cases marked stack-owned may be rejected or timed out before the HEC handler exists in Axum/Hyper request form, so their absence from HEC handler stats is expected evidence rather than automatic receiver failure.
+The command creates a UTC timestamp run directory below `--out`, such as `results/raw-socket/20260515T181007Z`, and writes `show-config.log`, numbered request artifacts, response artifacts, summary, and JSON results there. Cases marked stack-owned may be rejected or timed out before the HEC handler exists in Axum/Hyper request form, so their absence from HEC handler stats is expected evidence rather than automatic receiver failure.
 
 For local HECpoc runs, add `--stats-url http://HOST:PORT/hec/stats` to capture before/after stats per case. With stats enabled, handler-visible cases can report simple `Pass` or `Fail`; stack-owned cases remain `Info` or `Review` because they require socket, server log, or OS-level interpretation.

@@ -1,0 +1,16 @@
+receivers:
+  splunk_hec:
+    endpoint: 0.0.0.0:18089
+    raw_path: /services/collector/raw
+    splitting: line
+    health_path: /services/collector/health
+
+exporters:
+  debug:
+    verbosity: detailed
+
+service:
+  pipelines:
+    logs:
+      receivers: [splunk_hec]
+      exporters: [debug]

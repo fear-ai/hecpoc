@@ -286,6 +286,33 @@ Recommended initial model:
 
 A dedicated execution path for one huge file, one dominant sourcetype, or one high-cost parser may be justified. That is routing and scheduling, not a reason to create a separate database family during ingest.
 
+### 6.6 Backend Abstraction Must Not Hide Performance Truth
+
+A common store interface is useful only if it preserves the operational differences that matter for correctness and performance. File append, buffered JSONL capture, length-delimited raw chunks, SQLite transactions, DuckDB batches, segment files, and a null/drop sink do not have the same write granularity, flush behavior, commit cost, failure modes, or readback capability.
+
+The interface must expose capabilities and policies rather than pretending every backend is interchangeable.
+
+Backend capability metadata should include:
+
+- accepted input units: `HecEvents`, `RawEvents`, owned event objects, or `WriteBlock`;
+- preferred write granularity: event count, byte size, elapsed time, or explicit flush boundary;
+- commit states supported: written, flushed, durable, indexed;
+- byte preservation: raw bytes, decoded text, dual raw+decoded, or structured-only;
+- backpressure behavior: immediate reject, bounded wait, spill, drop, or internal buffering;
+- replay support: can rebuild parsed fields, token indexes, and search-prep sidecars;
+- ordering guarantee: per request, per source, per token/index, or only per store partition;
+- observability fields: queue time, write time, flush time, commit time, and failure reason.
+
+Do not hide backend cost behind a single `store.write(events)` claim without naming what that call proves. A null sink can measure HEC protocol and parsing overhead. A buffered file sink can measure append throughput. A durable store measures commit throughput. Those numbers are not substitutes for one another.
+
+Recommended first interface shape:
+
+- keep current fixture capture simple and explicit;
+- add capability metadata before adding multiple production backends;
+- choose `WriteBlock` construction from backend capability and benchmark profile;
+- keep commit state in the caller-visible result, not buried inside backend logging;
+- avoid early trait-object generality until two real backends need the same call shape.
+
 ---
 
 ## 7. Tokenization And Index Construction

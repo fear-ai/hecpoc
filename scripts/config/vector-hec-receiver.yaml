@@ -1,0 +1,14 @@
+data_dir: target/vector-data
+
+sources:
+  hec:
+    type: splunk_hec
+    address: "0.0.0.0:18090"
+    store_hec_token: true
+
+sinks:
+  out:
+    type: console
+    inputs: ["hec"]
+    encoding:
+      codec: json
