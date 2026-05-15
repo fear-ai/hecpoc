@@ -1044,6 +1044,18 @@ Interpretation:
 
 ### C.7 RequestRaw / RawEvents Ownership Design
 
+This section defines a proposed Spank raw-event processing architecture. It is not a Rust exercise for its own sake. The purpose is to keep raw ingest correct while creating room for faster parsing, byte-preserving storage, and later indexing without forcing every raw line through immediate string allocation.
+
+The raw HEC endpoint receives one HTTP body. That body may contain one line, many newline-separated lines, CRLF lines, invalid UTF-8, NUL bytes, or a final line without a terminating newline. The current implementation immediately converts each nonblank line into an owned `Event`. That is simple and is the compatibility baseline. The proposed `RawEvents` path instead keeps the request body as one owned byte buffer and stores per-line offsets into that buffer.
+
+The strategic point is not that line splitting is hard. The line scan is deliberately simple: find `\n`, optionally trim one trailing `\r`, skip blank lines, and record offsets. The architectural point is where allocation and interpretation happen:
+
+| Representation | What It Stores | Best Use |
+|----------------|----------------|----------|
+| `Vec<Event>` | one owned text/string event per raw line | current compatibility path, tests, simple capture |
+| `RawEvents` | one owned request byte buffer plus line offsets | scan-only benchmarks, byte-preserving store, tokenizer/indexer input |
+| `RawEventOwned` | cheap `Bytes` handle plus one event offset range | per-event queue/fanout where the whole `RawEvents` batch is not moved together |
+
 Current raw parsing eagerly turns every nonblank line into owned text and a full `Event`:
 
 ```rust
@@ -1060,9 +1072,9 @@ for line in body.split(|byte| *byte == b'\n') {
 }
 ```
 
-That is simple and safe, but it allocates a `String` and full `Event` for each line before the sink/store path has chosen whether it needs text, bytes, both, or neither.
+That code remains the behavioral reference. It is safe and readable, but it allocates a `String` and full `Event` for each line before the sink/store path has chosen whether it needs text, bytes, both, or neither.
 
-Recommended ownership shape:
+Recommended ownership shape for the parallel implementation:
 
 ```rust
 struct RequestRaw {
@@ -1203,6 +1215,27 @@ fn parse_raw_body_compat(
 
 This keeps the present `Vec<Event>` interface available while creating a later cut point: fast paths can pass `RawEvents` to a byte-preserving store, while compatibility paths can keep materializing `Vec<Event>` at the sink boundary.
 
+Parallel implementation and transition path:
+
+| Phase | Implementation State | Effect On Ongoing Work |
+|-------|----------------------|------------------------|
+| 1. Keep current parser | `parse_raw_body(...) -> Vec<Event>` remains the production path | HEC compatibility, Splunk verification, and sink work continue unchanged |
+| 2. Add scanner in parallel | add `scan_raw_events(...) -> RawEvents` with tests mirroring `parse_raw_body` | no runtime behavior change; validates newline, CRLF, blank, invalid UTF-8, NUL, and max-event behavior |
+| 3. Benchmark side by side | measure current parser, scan-only, and scan-plus-materialize | proves whether `RawEvents` helps before store/sink interfaces change |
+| 4. Bridge compatibility | optionally implement current parser as `scan_raw_events(...).materialize_events()` after tests prove equivalence | reduces duplicate parsing logic while preserving `Vec<Event>` output |
+| 5. Add direct consumers | selected sinks/store/tokenizer accept `&RawEvents` or owned `RawEventOwned` | only performance-sensitive paths bypass `Vec<Event>`; simple paths keep compatibility |
+
+Expected Store and sink effects:
+
+| Area | Near-Term Behavior | Later `RawEvents` Behavior |
+|------|--------------------|----------------------------|
+| drop sink | count/drop materialized `Event` values | count offsets without allocating per-line text |
+| JSON capture fixture | keep current lossy/fixed text output | optionally add explicit original-byte evidence mode, guarded by size and redaction policy |
+| file/block store | receive `Vec<Event>` until store contract is stable | write raw byte spans plus metadata, or write fixed text only when configured |
+| tokenizer/indexer | tokenize materialized text | tokenize byte slices first; decode only fields/formats that require text |
+| queue between receive and store | move `Vec<Event>` | move `RawEvents` as a batch, or `RawEventOwned` per event when fanout requires it |
+| observability/reporting | report counts, reasons, and byte lengths | never emit raw bytes by default; log offsets/lengths or redacted excerpts only when explicitly enabled |
+
 Lifetime and ownership rules:
 
 | Scenario | Ownership Choice | Why |
@@ -1234,6 +1267,14 @@ Costs:
 - sinks and parsers must accept a richer input type than `Vec<Event>`;
 - generalized store code must decide when to materialize text, bytes, or both;
 - benchmark comparisons must name whether they measure raw span construction or owned `Event` materialization.
+
+Decision guardrails:
+
+- do not replace the production raw parser until the parallel scanner matches all current behavior;
+- do not add borrowed `&[u8]` or `&str` values to queues, store records, or long-lived event structs;
+- do not emit raw bytes in logs/reports unless a redacted or explicitly enabled evidence mode exists;
+- do not change sink/store interfaces until benchmarks show the allocation cost matters for target workloads;
+- keep `Vec<Event>` materialization available as the compatibility boundary.
 
 ### C.8 Rust Raw-Socket Verifier
 

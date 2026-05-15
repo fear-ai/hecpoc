@@ -10,6 +10,8 @@ mod outcome;
 mod parse_event;
 mod parse_raw;
 mod protocol;
+#[cfg(test)]
+mod raw_events;
 mod report;
 mod sink;
 mod stats;
