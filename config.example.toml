@@ -10,6 +10,7 @@
 # default_index = "main"
 # allowed_indexes = ["main"]
 # capture = "/tmp/hec-events.jsonl"
+# raw_mode = "split_lines" # split_lines is Spank's default; preserve_body remains available for comparison tests
 
 # For more than one token, keep the shorthand fields above as compatibility
 # defaults or replace them with explicit token records.

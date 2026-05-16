@@ -268,7 +268,7 @@ fn has_non_whitespace(line: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::hec_receiver::parse_raw::parse_raw_body;
+    use crate::hec_receiver::parse_raw::{parse_raw_body, RawMode};
     use std::borrow::Cow;
 
     fn scan(bytes: &'static [u8]) -> RawEvents {
@@ -350,7 +350,13 @@ mod tests {
         ];
 
         for body in cases {
-            let current = parse_raw_body(&Bytes::copy_from_slice(body), 10, Some("main")).unwrap();
+            let current = parse_raw_body(
+                &Bytes::copy_from_slice(body),
+                10,
+                Some("main"),
+                RawMode::SplitLines,
+            )
+            .unwrap();
             let compat =
                 parse_raw_body_compat(Bytes::copy_from_slice(body), 10, Some("main".to_string()))
                     .unwrap();

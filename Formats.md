@@ -230,7 +230,7 @@ Priority is based on local logs, Splunk/Vector/Sigma relevance, parser cost, and
 
 | Priority | Format Family | Why It Matters | Initial Parser Tier |
 |---:|---|---|---|
-| 1 | HEC raw line payloads | current receiver path, lowest-friction validation | byte split + raw preservation |
+| 1 | HEC raw line payloads | current receiver path, lowest-friction validation | LF split, CR-before-LF text trimming, raw-byte preservation path |
 | 2 | Linux syslog/auth.log | local production corpus, security review, SSH/sudo/PAM | syslog prefix parser + sshd/auth subparser |
 | 3 | Apache access/error | tutorial/sample corpora, web attack detection, benchmarks | format-specific parser |
 | 4 | Nginx access/error/ingress | modern reverse proxy and Kubernetes ingress | format-specific parser; ingress variant supported explicitly |

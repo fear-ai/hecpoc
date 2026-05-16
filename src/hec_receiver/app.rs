@@ -2,6 +2,7 @@ use super::{
     auth::TokenRegistry,
     health::HealthState,
     hec_request,
+    parse_raw::RawMode,
     protocol::Protocol,
     report::{ReportOutputs, Reporter},
     sink::Sink,
@@ -38,6 +39,7 @@ pub struct AppState {
     pub health: HealthState,
     pub sink: Sink,
     pub protocol: Protocol,
+    pub raw_mode: RawMode,
 }
 
 impl AppState {
@@ -125,6 +127,11 @@ impl AppState {
         self
     }
 
+    pub fn with_raw_mode(mut self, raw_mode: RawMode) -> Self {
+        self.raw_mode = raw_mode;
+        self
+    }
+
     fn new(
         tokens: Vec<String>,
         limits: Limits,
@@ -155,6 +162,7 @@ impl AppState {
             health: HealthState::serving(),
             sink,
             protocol,
+            raw_mode: RawMode::SplitLines,
         }
     }
 }

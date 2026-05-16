@@ -44,7 +44,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => AppState::drop_events_with_registry(tokens, config.limits, report_outputs),
         }
-        .with_protocol(config.protocol),
+        .with_protocol(config.protocol)
+        .with_raw_mode(config.raw_mode),
     );
     let app = hec_receiver::router(Arc::clone(&state));
     let listener = TcpListener::bind(addr).await?;

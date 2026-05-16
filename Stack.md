@@ -106,6 +106,36 @@ Configured defaults:
 | `limits.total_timeout` | `30s` | max elapsed body-read duration after a request exists |
 | `limits.gzip_buffer_bytes` | `8_192` | scratch buffer while expanding gzip |
 
+Observed plain-HTTP timeout behavior from raw-socket probes:
+
+Findings:
+
+| Finding | Design Consequence |
+|---|---|
+| slow-body tolerance and slow-body defense are opposing goals | define compatibility profiles separately from safe local defaults |
+| body timers start only after Hyper creates a request | pre-header slowloris defense needs stack/accept-loop control, not HEC handler code |
+| no-body-after-header can consume connection/task time without useful payload | keep idle and total body timers even if Splunk waits longer |
+| response-code compatibility is not enough for attack handling | record timing, connection result, logs, and stats deltas for malformed-wire tests |
+
+- Local Splunk accepted a declared-length request whose body arrived after a 35s delay.
+- Local Splunk did not return an application response within a 35s observation window for declared length with no body.
+- HECpoc accepts the 35s slow-body case when `limits.idle_timeout` and `limits.total_timeout` are configured above the delay.
+- HECpoc default `5s` idle timeout rejects the raw-socket `slow_body` case with `408/code9` when the body segment delay is `6000ms`.
+- These results are stack timing evidence, not a HEC response-code contract.
+
+Slow-body and slowloris defense policy:
+
+| Control | Current / Proposed Role | Compatibility Impact |
+|---|---|---|
+| body idle timeout | reject a request when the next body frame is not received quickly enough after headers are parsed | default `5s` is stricter than observed Splunk; raise per test/profile when emulating Splunk tolerance |
+| total body timeout | cap complete body read time even if trickle traffic stays under idle timeout | protects worker occupancy and memory retention; should scale with max body size and expected minimum byte rate |
+| advertised/actual body byte limits | bound memory before and during body read | compatible with Splunk status class for oversized bodies, exact text may differ |
+| future header timeout | needed for pre-request header stalls that Axum handlers cannot currently see | requires owned accept/Hyper path or server-stack configuration beyond current Axum surface |
+| future connection/source limits | cap concurrent slow clients by peer/IP range, token, or listener | product resilience feature; requires connection accounting not currently exposed by handler code |
+| future minimum data-rate policy | reject clients that deliver body bytes below configured bytes/sec after a grace period | useful against slow body attacks; must be configurable because Splunk tolerated at least one 35s delayed body |
+
+Proceed by keeping strict safe defaults for Spank and using configuration profiles for compatibility experiments. The default should protect a small local receiver from easy socket/task exhaustion. Splunk-emulation runs can raise idle/total timeouts and then record the changed effective config beside results.
+
 Gaps:
 
 - Header-read timeout and header-size limit are not exposed through the current `axum::serve` path.

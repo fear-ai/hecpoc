@@ -377,6 +377,7 @@ async fn process_hec_request_pipeline(
             &decoded,
             state.limits.max_events_per_request,
             auth.default_index.as_deref(),
+            state.raw_mode,
         )
         .map_err(|error| {
             if matches!(error, HecError::InvalidDataFormat | HecError::NoData) {

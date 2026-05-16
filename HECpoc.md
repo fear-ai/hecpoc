@@ -105,8 +105,8 @@ Core entities:
 | `HecRequest` | Method, path, headers, body stream, route, peer facts when exposed | Stack/HEC receiver boundary |
 | `HecCredential` | Parsed auth scheme and token class | HEC auth |
 | `HecEnvelope` | One JSON object decoded from `/services/collector/event` | HEC decode |
-| `RequestRaw` | Decoded `/raw` HTTP body before LF splitting | HEC raw endpoint |
-| `RawEvents` | Non-empty raw events produced by LF splitting `RequestRaw` | HEC raw endpoint |
+| `RequestRaw` | Decoded `/raw` HTTP body before raw-mode event formation | HEC raw endpoint |
+| `RawEvents` | Optional split-line/raw-span representation derived from `RequestRaw` | HEC raw endpoint and future file/TCP ingest |
 | `HecEvent` | One normalized accepted HEC event | HEC validation |
 | `HecEvents` | Valid HEC events from one HTTP request after HEC decode and validation | HEC receiver; passed to queue/write path |
 | `ParseBatch` | Optional group selected for format interpretation | Format/search preparation only |
@@ -121,7 +121,7 @@ Appendix B records naming rationale and external terminology comparisons. It is 
 Minimum surface:
 
 - `/services/collector/event`: accept one or more stacked JSON `HecEnvelope` objects and JSON array batches observed from Splunk verification.
-- `/services/collector/raw`: accept LF-framed raw events with documented CRLF behavior.
+- `/services/collector/raw`: keep the request body bytes unmodified at the boundary, form one event per nonblank LF-delimited line, optionally strip the CR immediately before LF for text compatibility, and process each line/event separately.
 - `/services/collector/health`: report availability and lifecycle phase.
 - `/services/collector/ack`: return a deliberate disabled/unsupported response until ACK commit semantics exist.
 - Body encoding: identity and gzip, with explicit pre-decode and post-decode size policy.
@@ -149,7 +149,7 @@ Protocol validation belongs here because it defines externally visible HEC behav
 |-------|-----------------|--------|
 | Auth | missing, malformed, wrong scheme, empty token, invalid token, valid token | keep distinct enough for Splunk comparison and operator diagnosis |
 | JSON | empty, malformed, stacked envelopes, later invalid envelope, missing/null/blank `event`, object/array/scalar event | reject whole request unless Splunk verification requires a different policy |
-| Raw | empty body, trailing newline, CRLF, blank line, whitespace-only line, invalid UTF-8 if text output is used | define LF splitting and byte/text preservation before optimizing |
+| Raw | empty body, trailing newline, CRLF, blank body, whitespace-only line, invalid UTF-8 if text output is used, optional broader whitespace filtering | keep LF line/event formation as default; byte preservation remains a store/evidence decision |
 | Gzip and size | valid gzip, malformed gzip, empty decoded body, pre-decode limit, post-decode limit | enforce both advertised and decoded caps |
 | Metadata | missing values, explicit empty strings, nested fields, non-scalar fields | store what is supported; reject or preserve unsupported forms deliberately |
 | Backpressure | full queue, slow sink, write failure after accepted queue/write disposition | respond retryably; do not silently drop in correctness mode |
@@ -340,7 +340,7 @@ Decision rows are grouped by expected validity. Revisit only when the trigger oc
 
 | Class | Decision | Current Position | Revisit Trigger |
 |-------|----------|------------------|-----------------|
-| Contract | HEC JSON/raw endpoints and response shape | compare with Splunk for selected edge cases | Splunk/shipper comparison contradicts current behavior |
+| Contract | HEC JSON/raw endpoints and response shape | match observed Splunk response behavior by default; use Spank line/event raw handling unless configured otherwise | Splunk/shipper comparison contradicts current behavior |
 | Contract | Metadata preservation | preserve `time`, `host`, `source`, `sourcetype`, `index`, `fields` where supported | supported client emits a case we mishandle |
 | Implementation stage | Direct capture before bounded queue | acceptable fixture phase | queue/backpressure bundle starts |
 | Implementation stage | All-or-nothing JSON request parsing | default until Splunk oracle says otherwise | Splunk accepts partial success for a target case |
@@ -380,7 +380,7 @@ Boundary-straddling cases:
 | Auth token settings | `HECpoc.md` | `InfraHEC.md` | HECpoc owns token semantics, Basic/Splunk/query-token behavior, default index, and allowed-index policy; Infra owns secret redaction, loading, validation style, and error/reporting infrastructure. |
 | Runtime/Tokio worker policy | `Stack.md` | `InfraHEC.md` | Stack owns I/O/CPU scheduling design and when to split runtimes; Infra owns startup/runtime configuration machinery and lifecycle integration. |
 | Queue/backpressure | `Store.md` | `HECpoc.md`, `Stack.md`, `InfraHEC.md` | Store owns queue unit, capacity, disposition, and commit truth; HECpoc owns external HEC response; Stack owns network symptoms; Infra owns metrics/reporting/config pattern. |
-| Raw line handling | `HECpoc.md` until accepted, then `Formats.md` for deeper interpretation | `Stack.md`, `Store.md` | HECpoc owns raw endpoint line/event formation and response; Formats owns later source-format parsing; Stack owns byte/body mechanics; Store owns evidence preservation. |
+| Raw endpoint event formation | `HECpoc.md` | `Formats.md`, `Stack.md`, `Store.md` | HECpoc owns `/raw` LF split behavior, comparison modes, and response; Formats owns later source-format parsing; Stack owns byte/body mechanics; Store owns evidence preservation. |
 | Validation runs | subsystem being proven | `HECpoc.md` for protocol matrix | Keep tests and evidence with the behavior under proof: protocol in HECpoc, mechanics in Stack, config/reporting in Infra, storage in Store, parser correctness in Formats. |
 
 ---
@@ -435,7 +435,7 @@ This is the canonical status/code table. Use it to determine whether coverage is
 | `4` | `403` | invalid token | implemented | handler test covers wrong token |
 | `5` | `400` | no data | implemented | raw blank/whitespace and event empty-body tests exist |
 | `6` | `400` | invalid data format | implemented | malformed JSON, invalid `fields`, and malformed gzip tests exist; raw-socket malformed-header probes remain separate |
-| `7` | `400` | incorrect index | implemented for event body | syntax, length, reserved/private-looking, and allow-list tests exist; query-string index postponed |
+| `7` | `400` | incorrect index | implemented for event body; query design documented | syntax, length, reserved/private-looking, and allow-list tests exist; query-string index implementation pending |
 | `8` | `500` | internal server error | not implemented | reserve for true internal/runtime/sink failures that should be HEC JSON rather than process failure |
 | `9` | `503` | server busy | partly implemented, final taxonomy postponed | current uses cover max-events, timeout, sink failure, and non-serving phase; bounded queue/server-busy policy remains future work |
 | `10` | `400` | data channel missing | postponed | ACK/channel feature required |
@@ -483,7 +483,7 @@ Endpoint behavior is separate from content parsing. The endpoint determines rout
 | Endpoint | Current Behavior |
 |---|---|
 | `/services/collector`, `/services/collector/event`, `/services/collector/event/1.0` | requires token; decodes JSON event envelopes; accepts stacked JSON objects and JSON arrays |
-| `/services/collector/raw`, `/services/collector/raw/1.0` | requires token; reads body and splits raw events on LF after content decoding |
+| `/services/collector/raw`, `/services/collector/raw/1.0` | requires token; reads and decodes body; default `split_lines` creates one event per nonblank LF-delimited line; `preserve_body` remains only as an explicit comparison mode |
 | `/services/collector/ack`, `/services/collector/ack/1.0` | requires token; returns ACK disabled while ACK is postponed |
 | `/services/collector/health`, `/services/collector/health/1.0` | no token required; reports process health phase |
 | `/hec/stats` | local fixture stats endpoint, not a Splunk HEC endpoint |
@@ -529,22 +529,36 @@ This section covers separators and structure inside an already admitted and deco
 
 For `/event`, braces, brackets, quotes, commas, and string escaping are JSON syntax. Malformed JSON, unterminated strings, trailing garbage, or invalid array elements map to invalid data with the relevant event number when the parser can identify one.
 
-For `/raw`, bytes are treated as raw line-oriented input. JSON punctuation has no special meaning.
+For `/raw`, bytes are treated as raw input. JSON punctuation has no special meaning. The Spank default is `split_lines`: keep the decoded request bytes as the source of truth, split events on LF, optionally strip the CR immediately before LF from the text view, drop lines that are empty or ASCII-whitespace-only, and process each produced line/event separately. `preserve_body` remains available only for comparison tests.
 
 | Body Form | Event Boundary |
 |---|---|
 | `/event` single JSON object | one HEC event |
 | `/event` concatenated JSON objects | one HEC event per object |
 | `/event` JSON array | one HEC event per array element |
-| `/raw` body | one raw event per nonblank LF-delimited line |
+| `/raw` body, `split_lines` default | one raw event per nonblank LF-delimited line |
+| `/raw` body, `preserve_body` comparison mode | one raw event for the nonblank body; a single final LF or CRLF is not retained in text output |
 
-Raw line rules:
+Raw rules:
 
-- LF is the separator.
-- A single CR before LF is stripped.
-- Interior CR and NUL are preserved in the current text representation and escaped by JSON output.
-- Blank and ASCII-whitespace-only raw bodies return no data.
-- Final line without LF is accepted if nonblank.
+- Empty and ASCII-whitespace-only raw bodies return no data.
+- In default `split_lines`, LF is the separator, a single CR before LF is stripped from the text view, blank lines are skipped, and a final line without LF is accepted if nonblank.
+- Interior NUL, non-UTF-8 bytes, non-ASCII bytes, and other control bytes are not filtered before event formation.
+- Invalid UTF-8 is accepted for `/raw` and converted with replacement characters in text output while `raw_bytes_len` records the pre-conversion byte length.
+- `preserve_body` comparison mode exists only to test one-body behavior; it is not the Spank default.
+
+Testing distinction:
+
+- Parser/unit tests prove both modes directly: default `split_lines` produces `one` and `two` from `one\r\ntwo\n`; explicit `preserve_body` keeps it as one event with interior CRLF.
+- Live HECpoc capture with default `split_lines` stores `one\ntwo\n` as two raw events `one` and `two`, each with `raw_bytes_len = 3`.
+- Prior live HECpoc capture with explicit `preserve_body` stored the same body as one raw event `one\ntwo`; this is retained only as comparison evidence.
+- Splunk curl/raw-socket tests confirm response compatibility for raw success/no-data/invalid-UTF-8 cases; precise Splunk stored event boundaries still require search/export verification per client shape.
+
+Whitespace policy note:
+
+- Current blank-line detection uses Rust ASCII whitespace.
+- Add a future option to expand blank filtering to bytes `<= b' '` and/or bytes `>= 128` for sources where control or non-ASCII bytes should be treated as ignorable or suspicious.
+- That option must be explicit because dropping high-bit bytes can destroy real log evidence.
 
 ### A.7 Metadata, Indexed Fields, And Defaults
 
@@ -559,14 +573,45 @@ Metadata is per event unless a later endpoint-specific request metadata rule is 
 
 Accepted decision: default index is `main`, stored as token metadata, and applied when input omits `index`.
 
-Recommended precedence for metadata once query metadata is implemented:
+Query-string metadata support is a Spank requirement for `/raw`, because raw bodies have no JSON envelope where `index`, `host`, `source`, or `sourcetype` can be carried. It is optional for `/event` because event envelopes already carry those fields; Spank should parse it there only after Splunk precedence is verified.
 
-1. HEC event/body metadata wins for `/event`, because it is the most specific per-event declaration.
-2. Query metadata wins for `/raw`, because raw bodies have no JSON envelope to carry `index`, `host`, `source`, or `sourcetype`.
+Findings:
+
+| Finding | Status | Impact |
+|---|---|---|
+| `/raw` needs URL metadata | accepted | raw bodies cannot carry HEC envelope metadata, so query `index`, `host`, `source`, and `sourcetype` are required for practical compatibility |
+| query `token` is authentication | accepted | do not mix query token handling with metadata parsing; keep disabled by default and preserve code `16` |
+| response status is insufficient proof | accepted | Splunk metadata precedence must be verified by search/export, not only curl response bodies |
+| duplicate query keys are dangerous | design default | reject duplicates unless Splunk oracle proves a required first/last rule |
+
+Supported query metadata design:
+
+| Query Key | Endpoint Scope | Validation | Application Rule |
+|---|---|---|---|
+| `index` | `/raw` initially; `/event` later only after verification | same syntax, length, reserved-name, and token allow-list checks as event-body `index` | sets the index for all raw line/events produced from the request |
+| `host` | `/raw` initially | non-empty string after URL decoding; max length/config policy still needed | sets `host` for all raw line/events when accepted |
+| `source` | `/raw` initially | non-empty string after URL decoding; max length/config policy still needed | sets `source` for all raw line/events when accepted |
+| `sourcetype` | `/raw` initially | non-empty string after URL decoding; max length/config policy still needed | sets `sourcetype` for all raw line/events when accepted |
+| duplicate metadata key | all supported query metadata | reject unless Splunk verification proves a first/last rule | avoids invisible precedence surprises |
+| unknown query key | all HEC endpoints | ignore and report at debug level only if configured | avoids rejecting shipper-specific harmless parameters |
+
+Precedence accepted for Spank implementation:
+
+1. `/event`: JSON envelope metadata wins; query metadata is ignored or rejected until Splunk verification defines a compatibility need.
+2. `/raw`: query metadata wins because raw bodies cannot carry HEC metadata.
 3. Token metadata supplies defaults when the request does not specify a value.
 4. Receiver compile/config defaults are used only to build token metadata at startup.
 
-Current gap: query-string metadata for raw endpoint, including `index`, is postponed until Splunk behavior and security policy are verified.
+Query-string token support is separate from query metadata. `?token=...` is authentication, not event metadata. Spank keeps query-token authentication disabled by default and returns code `16` because URL tokens leak through logs, browser history, proxies, metrics, and test artifacts. If implemented later, it must be behind an explicit setting such as `hec.query_token = "disabled|enabled"`, must be reported as a distinct auth path, and must not silently take precedence over an `Authorization` header.
+
+Implementation sequence:
+
+1. Add a small query parser that URL-decodes keys/values and returns bounded, typed metadata plus duplicate/invalid reasons.
+2. Reject `token` before body read when query-token auth is disabled, preserving current code `16` behavior.
+3. Apply `/raw` query metadata after token authentication and before raw line/event formation so every produced raw event receives the same request metadata.
+4. Reuse existing index validation and reason/reporting paths for query `index`; add `query_metadata_invalid` reason sublabels only where distinct diagnosis is useful.
+5. Add curl tests for accepted `index`, invalid `index`, duplicate `index`, `host/source/sourcetype`, unknown query keys, and `token` disabled.
+6. Add Splunk oracle tests for the same cases and compare not only response status but stored metadata through search/export.
 
 ### A.8 Character Encoding And Incomplete Input
 
@@ -609,7 +654,7 @@ Incomplete input split:
 
 Current compatibility baseline:
 
-- Prefer Splunk-compatible behavior by default.
+- Prefer Splunk-compatible response codes by default, while using Spank line/event raw handling unless a specific compatibility mode is configured.
 - Keep concatenated JSON objects and JSON array input for `/event`.
 - Keep generic HTML for handler-owned `413` and `415` because local Splunk produced that shape.
 - Keep ACK as disabled-only compatibility until the ACK registry exists.
@@ -620,7 +665,7 @@ Problems and gaps:
 - incorrect index and parse reporting now include bounded top-level reasons, but index-specific subreasons such as syntax, length, reserved name, and allow-list miss are not separated yet;
 - timeout behavior may be Splunk-incompatible;
 - malformed wire/header behavior is partly hidden by Hyper and needs raw-socket verification;
-- raw endpoint is not byte-preserving beyond length evidence;
+- raw endpoint now forms line/events by default but is not byte-preserving beyond length evidence until `RequestRaw`/`RawEvents` is wired into a store path;
 - server-busy currently covers too many unrelated conditions.
 
 Ready implementation work:
@@ -634,7 +679,7 @@ Delayed pending further definition or subsystem work:
 - ACK registry and ACK channel codes;
 - bounded queue and queue-full/approaching-full codes;
 - final server-busy taxonomy;
-- query-string `index` and raw request metadata policy;
+- query-string metadata implementation and Splunk stored-metadata verification;
 - byte-preserving raw mode and replay guarantees.
 
 ### A.11 References And Implementation Anchors
@@ -653,7 +698,7 @@ Implementation anchors:
 3. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/config.rs` — CLI/env/TOML/default limits and validation.
 4. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/body.rs` — advertised length, HTTP body, timeout, and gzip limit handling.
 5. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_event.rs` — `/services/collector/event` JSON envelope parsing.
-6. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_raw.rs` — `/services/collector/raw` line splitting and lossy text conversion.
+6. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/parse_raw.rs` — `/services/collector/raw` split-line default, preserve-body comparison mode, and lossy text conversion.
 7. `/Users/walter/Work/Spank/HECpoc/src/hec_receiver/hec_request.rs` — route adapters, HEC request processing, health response, and current request-level tests.
 
 ---
@@ -674,7 +719,7 @@ Use these terms with exact scope:
 | HTTP headers | request metadata parsed before body read | header map | authorization, content encoding, content length, HEC channel, source metadata in query params |
 | HTTP body | bounded body read before content decoding | body stream chunks accumulated under limits | advertised length, actual read length, body read timing |
 | decoded body | HTTP body after content decoding such as gzip | decoded body buffer | decoded length, content encoding, decode errors |
-| raw line | one LF-delimited unit from `/services/collector/raw` after raw endpoint line splitting | bytes or text, depending mode | line number, byte offset/length, blank/invalid flags |
+| raw line | one LF-delimited unit from default `/raw` handling, file input, or a source format that defines line boundaries | bytes or text, depending mode | line number, byte offset/length, blank/invalid flags |
 | HEC event | one HEC event object or one raw endpoint event candidate | event payload plus HEC metadata | `time`, `host`, `source`, `sourcetype`, `index`, `fields`, token/channel/request id |
 | log record | application log structure inside an event, such as syslog, Apache, auditd, JSON Lines, or logfmt | event text or structured event value | parser family, parser variant, parse status/reason |
 | `HecEvents` | valid HEC events produced from one HEC HTTP request after endpoint-specific decoding and validation | event vector plus raw references | request id, token/channel, endpoint, event count, body lengths, selected commit state |
@@ -683,7 +728,7 @@ Do not use `slice` for project planning or implementation partitioning. In this 
 
 `request` means the HTTP request after HTTP processing, not raw `recv()` data. Current Axum/Hyper code does not expose raw `recv()` bytes at the handler layer. If discussing lower-level receive behavior, say `transport stream`; if discussing data visible to HEC code, say `HTTP body`.
 
-`line` exists only where a format or endpoint defines it. HEC `/raw` uses line splitting. HEC `/event` uses JSON envelope boundaries, not newline boundaries. Syslog, Apache, and other file formats may be line-oriented, but multiline parsers can combine several physical lines into one log record.
+`line` exists only where a format or configured mode defines it. HEC `/raw` now defaults to LF-delimited line/event formation. HEC `/event` uses JSON envelope boundaries, not newline boundaries. Multiline parsers can combine several physical lines into one log record.
 
 ### B.2 HEC Token And Index Entity Terms
 
@@ -706,12 +751,12 @@ Endpoint relationship to tokens:
 | Endpoint | Token Requirement | Token Metadata Use |
 |---|---|---|
 | `/services/collector`, `/services/collector/event`, `/services/collector/event/1.0` | requires valid `Splunk` token or Basic password-token | default index applies when envelope omits `index`; allowed-index list validates envelope `index` |
-| `/services/collector/raw`, `/services/collector/raw/1.0` | requires valid `Splunk` token or Basic password-token | default index applies to produced raw events; raw query metadata is not implemented yet |
+| `/services/collector/raw`, `/services/collector/raw/1.0` | requires valid `Splunk` token or Basic password-token | query metadata should apply to produced raw events when implemented; token default index applies when query `index` is absent |
 | `/services/collector/ack`, `/services/collector/ack/1.0` | authenticates first, then returns ACK-disabled while ACK is not implemented | token record stores ACK-enabled flag, but no ACK registry exists yet |
 | `/services/collector/health`, `/services/collector/health/1.0` | no token required | reports process health phase, not token state |
 | `/hec/stats` | no token required in current local fixture | reports local receiver stats; not a Splunk HEC endpoint |
 
-Query-string `token` is currently rejected before authorization/body processing on HEC endpoints because query-string authorization is disabled by default for Splunk compatibility.
+Query-string `token` is currently rejected before authorization/body processing on HEC endpoints because query-string authorization is disabled by default. Query metadata such as `index`, `host`, `source`, and `sourcetype` is separate from query-token authentication.
 
 ### B.3 Main Data Path Reference
 
@@ -725,9 +770,9 @@ The definitive data path, state sequence, and core entities are in Section 2.1. 
 | header/auth validation | validate HEC-visible request metadata before reading the full body when possible | HTTP headers and query | accepted request metadata or HEC error | auth scheme/token, channel, content encoding, content length, source query params, route alias |
 | body read | enforce HTTP body length and time bounds | HTTP body stream | bounded HTTP body | advertised length, actual read length, idle/total timing, body read error |
 | content decode | decode content encoding after enough HTTP body data exists | HTTP body | decoded body | content encoding, decoded length, gzip error, expansion-limit reason |
-| HEC decode | decode HEC protocol body | decoded body | HEC event candidates | endpoint kind, raw line number or JSON object number, envelope metadata |
+| HEC decode | decode HEC protocol body | decoded body | HEC event candidates | endpoint kind, raw body or raw line mode, JSON object number, envelope metadata |
 | HEC event validation | validate HEC-visible event requirements | HEC event candidates | valid HEC events or HEC error | missing/blank event, invalid fields, invalid index when configured, invalid event number |
-| HecEvents formation | collect valid HEC events produced by one HTTP request | valid HEC events | `HecEvents` | request id, token/channel, endpoint, event count, HTTP body length, decoded length, event payload lengths |
+| HecEvents formation | collect valid HEC events produced by one HTTP request | valid HEC events | `HecEvents` | request id, token/channel, endpoint, event count, raw mode, HTTP body length, decoded length, event payload lengths |
 | disposition | choose concrete next action | `HecEvents` | queued/written/dropped/rejected result | disposition kind, queue name if any, write target if any, overflow/busy reason |
 | commit state | record strongest completed state | disposition result | response/ACK/reporting state | accepted, queued, written, flushed, durable, indexed |
 | format interpretation | parse log-record structure inside events | raw/event payload | parsed record fields | parser family/variant/version, parse status/reason, field aliases |
@@ -769,7 +814,7 @@ Splunk's public data-pipeline model is `Input -> Parsing -> Indexing -> Search`.
 |-------------------------|-----------------------|------------------|-----------------------|
 | input segment | source acquisition before parsing queue | consume external data, split into blocks, annotate source-level metadata | HTTP request/framing and body read |
 | `parsingQueue` | input processors -> parsing pipeline | UTF-8/encoding, line breaker, data-header recognition | content decode and endpoint-specific event boundary work |
-| parsing pipeline | consumes `parsingQueue` | line breaking and data-header processing | HEC decode for HEC input; raw line splitting for `/raw` |
+| parsing pipeline | consumes `parsingQueue` | line breaking and data-header processing | HEC decode for HEC input; raw line splitting only when configured or required by source type |
 | `aggQueue` | parsing pipeline -> merging/aggregation pipeline | queue before aggregator/line-merging work | relevant to multiline file/TCP input, less central to HEC `/event` |
 | merging / aggregation pipeline | consumes `aggQueue` | line merging, timestamp extraction, event boundary refinement | future multiline/event breaker work for file/TCP inputs |
 | `typingQueue` | merging pipeline -> typing pipeline | queue before regex/typing work | future format interpretation and metadata transforms |
@@ -856,8 +901,8 @@ Approved naming direction:
 
 - Use `HecEnvelope` for one decoded JSON object from `/services/collector/event`.
 - Use `HecEvents` for valid HEC events after HEC decode and HEC validation.
-- Use `RequestRaw` for the decoded `/services/collector/raw` HTTP body before raw line splitting.
-- Use `RawEvents` for raw endpoint events after LF splitting.
+- Use `RequestRaw` for the decoded `/services/collector/raw` HTTP body before raw-mode event formation.
+- Use `RawEvents` for raw-span processing derived from `RequestRaw`; the current production path still materializes `Vec<Event>` per accepted line.
 - Use `Batch` only to describe the HEC HTTP input structure or explicit HEC sender batching, where Splunk already uses the term.
 - Use `ParseBatch` only if format parsing is actually performed on a grouped set of events. Otherwise parse events individually.
 - Use `WriteBlock` for store/output aggregation for now, because output granularity should not inherit whatever grouping the shipper happened to send. Revisit this name when designing a generalized `Store` interface that must cover append-only files, segment files, SQLite/DuckDB-style databases, and future search-prep storage.
@@ -866,9 +911,9 @@ Approved naming direction:
 |------|----------------|-----|
 | `HecEnvelope` | one JSON object decoded from `/services/collector/event` | HEC event endpoint input structure |
 | `HecBatch` | multiple `HecEnvelope` objects stacked in one HEC HTTP request | Splunk-compatible HEC batch terminology only |
-| `RequestRaw` | decoded `/raw` HTTP body before LF splitting | raw endpoint input structure |
-| `RawEvents` | non-empty raw events produced by LF splitting `RequestRaw` | HEC events for raw endpoint |
-| `HecEvents` | valid HEC events from either `HecEnvelope` or `RawEvents` | common post-validation representation |
+| `RequestRaw` | decoded `/raw` HTTP body before raw-mode event formation | raw endpoint input structure |
+| `RawEvents` | non-empty raw spans produced from `RequestRaw`, with offsets into the unmodified request bytes | future fast path, byte-preserving store, and file/TCP-style raw ingest |
+| `HecEvents` | valid HEC events from `HecEnvelope`, preserved raw body, or optional `RawEvents` | common post-validation representation |
 | `ParseBatch` | explicit group selected for format parsing | only if parser design groups events for CPU/cache behavior |
 | `WriteBlock` | store/output aggregation unit selected for append/write efficiency | current preferred term for file/store output grouping |
 | `Segment` | durable/search-prep storage unit with metadata | later store/search layout |
@@ -949,13 +994,18 @@ Current HECpoc and Splunk evidence directories:
 
 | Evidence | Directory | Notes |
 |----------|-----------|-------|
-| HECpoc live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/hecpoc-curl-20260514T041639Z` | includes `/hec/stats` with bounded `reasons` counters and disabled-token case |
-| Splunk live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T041656Z` | enabled-token oracle for shared HEC cases |
-| Splunk disabled-token matrix | `/Users/walter/Work/Spank/HECpoc/results/splunk-curl-20260514T050659Z-disabled` | disabled token `disabled` / `fa4f8f28-998f-4f34-8998-f7124c9a3e38` returns `403`, `{"text":"Token disabled","code":1}` |
+| HECpoc live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/hec-curl-matrix-hecpoc-20260516T005932Z` | fresh run after split-line default; includes disabled-token case, `/hec/stats`, and capture evidence showing `one\ntwo\n` becomes two raw events |
+| Splunk live curl matrix | `/Users/walter/Work/Spank/HECpoc/results/hec-curl-matrix-splunk-20260516T010013Z` | plain-HTTP oracle for shared HEC cases, including disabled token and invalid UTF-8 raw response behavior |
+| Splunk disabled-token matrix | `/Users/walter/Work/Spank/HECpoc/results/hec-curl-matrix-splunk-20260516T010013Z` | disabled token `disabled` / `fa4f8f28-998f-4f34-8998-f7124c9a3e38` returns `403`, `{"text":"Token disabled","code":1}` |
 | AB reason-stat retest | `/Users/walter/Work/Spank/HECpoc/results/bench-ab-reason-20260514T050708Z` | short AB rerun did not reproduce `requests_failed`; final stats show `requests_failed=0`, `body_read_errors=0`, `reasons={}` |
-| Rust raw-socket verifier | `/Users/walter/Work/Spank/HECpoc/results/raw-socket-20260514T072115Z` | numbered exact-byte HTTP cases distinguish handler-visible body errors from Hyper/socket-level nonresponses; optional stats deltas show handler visibility |
+| Rust raw-socket verifier | `/Users/walter/Work/Spank/HECpoc/results/raw-socket-hecpoc-20260516T005938Z`, `/Users/walter/Work/Spank/HECpoc/results/raw-socket-splunk-20260515T222417Z`, and `/Users/walter/Work/Spank/HECpoc/results/raw-socket-splunk-20260515T222417Z-case1` | HECpoc raw-socket script retested after unique-directory update; Splunk accepts valid raw and 35s slow body; HECpoc default timeout rejects 6s slow body with 5s idle timeout |
+| OTel curl matrix | `/Users/walter/Work/Spank/HECpoc/results/hec-curl-matrix-otel-20260516T061407Z` | OpenTelemetry Collector contrib `0.152.0` with `/Users/walter/Work/Spank/HECpoc/scripts/config/otel-splunk-hec.yaml`; useful as adjacent implementation evidence, not the Splunk compatibility oracle |
+| OTel raw-socket comparison | `/Users/walter/Work/Spank/HECpoc/results/raw-socket-otel/20260516T061428Z` | OTel accepted valid raw, accepted blank and whitespace raw bodies, accepted missing/wrong auth with this unauthenticated config, and differs from Splunk/HECpoc on unknown route and unsupported encoding status |
+| OTel captured debug output | `/Users/walter/Work/Spank/HECpoc/results/otel-captured-log-20260516T061632Z` | focused raw/event smoke run with collector stdout saved; confirms `cap-one\ncap-two\n` becomes two OTel log records and JSON `fields` becomes log attributes |
 
-The latest HECpoc and Splunk curl matrices match HTTP status for all shared cases. HECpoc-only cases remain `/hec/stats` and local disabled-token configuration. The Splunk disabled-token oracle now confirms code `1` and HTTP `403`; HECpoc uses Splunk's response text `Token disabled`.
+The latest Splunk plain-HTTP and HECpoc curl matrices are current. HECpoc source now uses split-line raw handling by default, shared HECpoc/Splunk HTTP statuses match for 31 cases, and local tests pass. The Splunk disabled-token oracle confirms code `1` and HTTP `403`; HECpoc uses Splunk's response text `Token disabled`.
+
+OTel comparison status is current for `otelcol-contrib 0.152.0`. The OTel config used here does not enforce HEC tokens, so auth cases are transport and parser evidence only. The notable OTel/Splunk differences are: missing or wrong auth returns success under this config; blank and whitespace raw bodies return success; invalid `index` is accepted as a resource attribute; unsupported `Content-Encoding` returns HTTP `400` text instead of Splunk's `415`; unknown HEC paths and wrong methods return HTTP `400` text instead of Splunk/HECpoc `404`/`405`.
 
 Coverage terms:
 
@@ -977,7 +1027,7 @@ Coverage terms:
 | nested object in `fields` | `400/code15`, invalid event `0` | matched |
 | direct array value in `fields` | `200/code0` | matched |
 | top-level `fields` array | `400/code6`, invalid event `0` | matched |
-| raw lines | `200/code0` | matched |
+| raw nonblank body | `200/code0` | matched at response level; stored event boundary requires direct Splunk search/export verification for each client shape |
 | blank raw body | `400/code5` | matched |
 | raw whitespace-only body | `400/code5` | matched |
 | raw final line without LF | `200/code0` | matched |
@@ -1026,9 +1076,9 @@ Interpretation:
 
 | Item | Status | Next Action |
 |------|--------|-------------|
-| raw parser allocation | open | replace immediate per-line `String`/`Event` construction with `RequestRaw` plus `RawEvents` spans or bytes-backed references |
+| raw parser allocation | open | default raw mode allocates one `String`/`Event` per accepted raw line; evaluate `RequestRaw` plus `RawEvents` spans before wiring byte-backed stores |
 | raw byte preservation | open | add optional original-byte sidecar or field with size caps and redaction/logging protections |
-| query metadata | open | verify Splunk raw endpoint precedence, then implement `index`, `host`, `source`, and `sourcetype` query parsing |
+| query metadata | designed, not implemented | implement `/raw` query `index`, `host`, `source`, and `sourcetype`; keep `/event` query metadata ignored or rejected until Splunk precedence is verified |
 | detailed reason sublabels | open | split `incorrect_index` into syntax, length, reserved/private name, allow-list miss; split parse failures into bounded parser classes |
 | capture sink flush policy | open | current sink keeps one append handle open; still needs configurable flush policy and commit-state reporting |
 | raw-socket verifier | runnable command, numbered cases, simple verdicts, and optional stats capture complete | run same cases against plain-HTTP Splunk and record mismatches |
@@ -1037,7 +1087,7 @@ Interpretation:
 
 | Topic | Why It Is Not Just Implementation |
 |-------|-----------------------------------|
-| Splunk raw query precedence | Need to know whether query metadata overrides token defaults and whether any body/event metadata equivalent exists for `/raw`; response-only curl cannot prove indexed metadata without searching Splunk or inspecting indexed events |
+| Splunk raw query precedence | Spank design says raw query metadata overrides token defaults; Splunk oracle still needed to confirm stored metadata and duplicate-key behavior because response-only curl cannot prove indexed metadata |
 | timeout behavior | Curl and AB are HTTP clients, not malformed-wire tools; exact slow-header, no-body, slow-body, and truncated-body behavior needs raw socket generation against Splunk and HECpoc |
 | Vector-as-client validation | Need to observe request shapes from a real shipper: endpoint choice, compression, batching, auth form, retry behavior, and flush behavior |
 | durable capture/store claims | Current capture is a fixture sink; written, flushed, durable, and indexed must stay separate until store commit boundaries exist |
@@ -1046,17 +1096,9 @@ Interpretation:
 
 This section defines a proposed Spank raw-event processing architecture. It is not a Rust exercise for its own sake. The purpose is to keep raw ingest correct while creating room for faster parsing, byte-preserving storage, and later indexing without forcing every raw line through immediate string allocation.
 
-The raw HEC endpoint receives one HTTP body. That body may contain one line, many newline-separated lines, CRLF lines, invalid UTF-8, NUL bytes, or a final line without a terminating newline. The current implementation immediately converts each nonblank line into an owned `Event`. That is simple and is the compatibility baseline. The proposed `RawEvents` path instead keeps the request body as one owned byte buffer and stores per-line offsets into that buffer.
+The raw HEC endpoint receives one HTTP body. That body may contain one line, many newline-separated lines, CRLF lines, invalid UTF-8, NUL bytes, or a final line without a terminating newline. Current production behavior has two explicit modes: `split_lines`, the Spank default, and `preserve_body`, a comparison mode.
 
-The strategic point is not that line splitting is hard. The line scan is deliberately simple: find `\n`, optionally trim one trailing `\r`, skip blank lines, and record offsets. The architectural point is where allocation and interpretation happen:
-
-| Representation | What It Stores | Best Use |
-|----------------|----------------|----------|
-| `Vec<Event>` | one owned text/string event per raw line | current compatibility path, tests, simple capture |
-| `RawEvents` | one owned request byte buffer plus line offsets | scan-only benchmarks, byte-preserving store, tokenizer/indexer input |
-| `RawEventOwned` | cheap `Bytes` handle plus one event offset range | per-event queue/fanout where the whole `RawEvents` batch is not moved together |
-
-Current raw parsing eagerly turns every nonblank line into owned text and a full `Event`:
+The default path is intentionally simple: keep the request bytes as the source sequence, split on LF, remove only the CR immediately before LF from the text view, skip empty/ASCII-whitespace-only lines, convert each accepted line with lossy UTF-8 only at the compatibility boundary, and produce one owned `Event` per line:
 
 ```rust
 for line in body.split(|byte| *byte == b'\n') {
@@ -1064,15 +1106,21 @@ for line in body.split(|byte| *byte == b'\n') {
     if is_blank_raw_line(line) {
         continue;
     }
-    let raw_bytes_len = line.len();
     let raw = String::from_utf8_lossy(line).into_owned();
-    let mut event = Event::from_raw_line_with_len(raw_bytes_len, raw, Endpoint::Raw);
+    let mut event = Event::from_raw_line_with_len(line.len(), raw, Endpoint::Raw);
     event.index = default_index.map(ToOwned::to_owned);
     events.push(event);
 }
 ```
 
-That code remains the behavioral reference. It is safe and readable, but it allocates a `String` and full `Event` for each line before the sink/store path has chosen whether it needs text, bytes, both, or neither.
+This path still allocates a `String` and full `Event` per nonblank line. That is acceptable for the current fixture, but it is the reason for the proposed `RawEvents` path: keep one owned request byte buffer and store per-line offsets so later store/tokenizer code can decide whether it needs text, bytes, both, or neither.
+
+| Representation | What It Stores | Best Use |
+|----------------|----------------|----------|
+| `Vec<Event>` in `split_lines` | one owned text/string event per nonblank raw line | current Spank default, tests, simple capture |
+| `Vec<Event>` in `preserve_body` | one owned text/string event per raw HTTP body | explicit comparison mode only |
+| `RawEvents` | one owned request byte buffer plus event offsets | scan-only benchmarks, byte-preserving store, tokenizer/indexer input |
+| `RawEventOwned` | cheap `Bytes` handle plus one event offset range | per-event queue/fanout where the whole `RawEvents` batch is not moved together |
 
 Recommended ownership shape for the parallel implementation:
 
@@ -1180,18 +1228,19 @@ fn has_non_whitespace(line: &[u8]) -> bool {
 }
 ```
 
-The above is the conceptual equivalent of the current `for line in body.split(...)` loop, but it shows the intended fast path directly: use a `memchr`-style newline search, trim only a single trailing `\r`, skip all-whitespace records, check `max_events` immediately before `push`, and store byte offsets. The task is deliberately simple; the extra structs exist only to preserve ownership boundaries and delay allocation, not because newline scanning itself is complex.
+The above is the conceptual equivalent of the current `split_lines` loop, but it shows the intended fast path directly: use a `memchr`-style newline search, trim only a single trailing `\r`, skip all-whitespace records, check `max_events` immediately before `push`, and store byte offsets. The task is deliberately simple; the extra structs exist only to preserve ownership boundaries and delay allocation, not because newline scanning itself is complex.
 
 Raw endpoint newline behavior:
 
-| Input | Current Behavior | Intended `RawEventRef` Behavior |
-|-------|------------------|----------------------------------|
+| Input | Default `split_lines` Behavior | Explicit `preserve_body` Comparison Behavior |
+|-------|-------------------------------|-------------------------------------------|
 | `one` | accepted as one event; final `\n` is not required | same |
-| `one\n` | accepted as one event; trailing empty segment is ignored | same |
-| `one\r\n` | accepted as one event with trailing `\r` stripped | same |
-| `\n` | no nonblank events; returns `NoData` | same |
-| `\r\n` | no nonblank events after CR stripping; returns `NoData` | same |
-| `a\rb` | accepted with embedded `\r`; only final CR before LF/end is stripped | same |
+| `one\n` | one event; trailing empty segment ignored | one event with one final LF omitted from text output |
+| `one\r\n` | one event with CR before LF stripped | one event with one final CRLF omitted from text output |
+| `one\ntwo\n` | two events | one event containing the interior LF |
+| `\n` | no nonblank lines; returns `NoData` | no nonblank body; returns `NoData` |
+| `\r\n` | no nonblank lines after CR stripping; returns `NoData` | no nonblank body; returns `NoData` |
+| `a\rb` | accepted with embedded `\r` | same |
 
 Current compatibility conversion to existing sinks/tests:
 
@@ -1219,8 +1268,8 @@ Parallel implementation and transition path:
 
 | Phase | Implementation State | Effect On Ongoing Work |
 |-------|----------------------|------------------------|
-| 1. Keep current parser | `parse_raw_body(...) -> Vec<Event>` remains the production path | HEC compatibility, Splunk verification, and sink work continue unchanged |
-| 2. Add scanner in parallel | add `scan_raw_events(...) -> RawEvents` with tests mirroring `parse_raw_body` | no runtime behavior change; validates newline, CRLF, blank, invalid UTF-8, NUL, and max-event behavior |
+| 1. Keep current parser | `parse_raw_body(...) -> Vec<Event>` remains the production path with `split_lines` default and explicit `preserve_body` comparison mode | HEC compatibility, Splunk verification, and sink work continue unchanged |
+| 2. Add scanner in parallel | keep `scan_raw_events(...) -> RawEvents` with tests mirroring `split_lines` behavior | no default runtime behavior change; validates newline, CRLF, blank, invalid UTF-8, NUL, and max-event behavior |
 | 3. Benchmark side by side | measure current parser, scan-only, and scan-plus-materialize | proves whether `RawEvents` helps before store/sink interfaces change |
 | 4. Bridge compatibility | optionally implement current parser as `scan_raw_events(...).materialize_events()` after tests prove equivalence | reduces duplicate parsing logic while preserving `Vec<Event>` output |
 | 5. Add direct consumers | selected sinks/store/tokenizer accept `&RawEvents` or owned `RawEventOwned` | only performance-sensitive paths bypass `Vec<Event>`; simple paths keep compatibility |
@@ -1288,7 +1337,7 @@ scripts/raw_socket_hec.sh \
   --stats-url http://127.0.0.1:18447/hec/stats
 ```
 
-The command defaults are `--addr 127.0.0.1:18088`, `--token dev-token`, `--case all`, `--read-timeout-ms 8000`, `--slow-body-delay-ms 6000`, and `--out results/raw-socket`. The `--stats-url` argument is optional and HECpoc-specific; omit it for Splunk unless an equivalent stats endpoint is intentionally provided by a separate harness.
+The command defaults are `--addr 127.0.0.1:18088`, `--token dev-token`, `--case all`, `--read-timeout-ms 8000`, `--slow-body-delay-ms 6000`, and `--out results/raw-socket`; each run creates a unique timestamp subdirectory, with numeric suffixes if needed. The `--stats-url` argument is optional and HECpoc-specific; omit it for Splunk unless an equivalent stats endpoint is intentionally provided by a separate harness.
 
 Implemented cases are numbered in the binary and may be selected by number, by name, or by `all`. The verifier reports `Pass` or `Fail` only where the expectation is simple enough to assess from the response and optional stats delta. Stack-owned cases report `Info` or `Review`, because their purpose is diagnostic evidence rather than HEC protocol compliance.
 
@@ -1327,9 +1376,48 @@ Goals:
 | generate exact bytes curl cannot generate | complete | numbered request artifacts are written before every case |
 | classify handler-visible body failures | complete | cases `3` through `7` distinguish timeout, EOF/read error, short body, chunk error, and slow-body timeout |
 | identify pre-handler stack boundary | sufficient for now | cases `2` and `8` show no handler counters and no false HEC responses |
-| compare with Splunk over plain HTTP | pending | non-TLS Splunk is assumed available; use the same command without `--stats-url` |
+| compare with Splunk over plain HTTP | complete for cases 1, 3, and 7; broader rerun optional | Splunk accepted valid raw and 35s slow body; declared-length/no-body produced no response within 35s |
+| compare with OTel Collector HEC receiver | complete for current eight cases | `/Users/walter/Work/Spank/HECpoc/results/raw-socket-otel/20260516T061428Z` shows useful adjacent behavior but not Splunk-compatible auth/index/blank-raw policy |
 
 The current case set is deliberately narrow. Additional variants should be added only when they answer a named defect or compatibility question. The main useful extension is a **same-input, different-client-action** comparison: case `3` leaves the write side open and times out; case `4` reads for `500ms`, calls `shutdown(Write)`, and shows EOF/read-error classification. Generic client-drop, abortive close / TCP RST, keep-alive reuse, and extra malformed-header cases are postponed until a concrete failure requires them.
+
+Findings:
+
+| Finding | Evidence | Impact |
+|---|---|---|
+| Splunk tolerates at least one very slow body | `slow_body` with 35s delay returned `200/code0` | Spank should keep timeout values configurable and record effective config beside compatibility runs |
+| Spank strict default rejects slower-than-idle bodies | HECpoc raw-socket default returns `408/code9` for 6s delay with 5s idle timeout | good default for attack resistance; not a Splunk-emulation profile |
+| declared length with no body is not mapped by Splunk within 35s | `header_length` had no response in 35s | do not claim Splunk-compatible `408` for this case yet |
+| short-body and truncated-chunk behavior remain underexplored | Splunk cases `4`, `5`, `6` need longer oracle runs | next raw-socket work should target these exact cases, not invent broad variants |
+
+Plain-HTTP Splunk comparison, using local Splunk with `enableSSL = 0`:
+
+| Case | Result | Interpretation |
+|------|--------|----------------|
+| `valid_raw` | HTTP `200`, HEC code `0` | baseline exact-byte raw request succeeds |
+| `header_length` with no body | no application response within a 35s read window | Splunk waits longer than our observation window or closes without a HEC response later; do not force this into a HEC code without longer oracle work |
+| `slow_body` with 35s delay | HTTP `200`, HEC code `0` | Splunk tolerates a slow body at least this long; HECpoc must use configured timeouts above the delay to match |
+
+OTel comparison, using `otelcol-contrib 0.152.0` with `splunk_hec` receiver on plain HTTP port `18089`:
+
+| Case | Result | Interpretation |
+|------|--------|----------------|
+| `valid_raw` | HTTP `200`, HEC code `0` | baseline exact-byte raw request succeeds |
+| `partial_header_timeout` | no response before verifier timeout | incomplete headers remain HTTP-stack behavior, consistent with HECpoc/Splunk boundary expectations |
+| `header_length` with no body | no response before verifier timeout | OTel waits for missing body bytes rather than selecting an immediate HEC response |
+| `header_length_shutdown` | HTTP `200`, HEC code `0` | write-side shutdown after missing body bytes can still produce an accepted empty or partial record in OTel; not Splunk oracle behavior |
+| `header_length_short_body` | HTTP `200`, HEC code `0` | OTel accepts available body bytes despite declared length mismatch in this probe |
+| `chunked_truncated` | HTTP `200`, HEC code `0` | OTel accepts the body observed before truncated chunk framing becomes fatal, or the probe is not strict enough to expose its parser boundary |
+| `slow_body` | HTTP `200`, HEC code `0` | default OTel receiver tolerates the verifier's `6000ms` body delay |
+| `malformed_header_bytes` | HTTP `400` text response | malformed header bytes are rejected by HTTP stack, not mapped to a HEC JSON code |
+
+What remains unclear about Splunk short-body behavior:
+
+- We have not yet run the full short-body matrix against Splunk with the same confidence as cases `1`, `3`, and `7`.
+- `header_length_short_body` has at least two interpretations: client half-closes cleanly after too few bytes, or client disappears/reset mid-body. Servers may classify those differently.
+- The observable result may be no response, a generic HTTP response, a HEC JSON error, or a logged socket error after the client has already closed.
+- Curl cannot craft this reliably because it tends to normalize `Content-Length`; raw socket is required.
+- The useful next Splunk oracle is cases `4`, `5`, and `6` with longer read windows, plus saved request/response bytes and Splunk logs if accessible.
 
 Receiver logging should stay light by default. Existing reporting already supplies request success/failure, reason counters, body read errors, timeouts, and component tracing targets. If raw-socket debugging needs more detail, add optional debug-level facts only at three points:
 
@@ -1343,8 +1431,9 @@ Do not add an owned `accept()` loop for this evidence alone. It becomes useful o
 
 Remaining raw-socket work:
 
-- run the sequential case set against plain-HTTP Splunk and record mismatches;
-- add optional debug-level receiver facts only if Splunk or local behavior cannot be explained from status, response bytes, and stats deltas;
+- optionally run the full sequential case set against plain-HTTP Splunk after any raw-socket case semantics change;
+- if OTel comparison remains important, add an authenticated OTel configuration and rerun auth cases separately from parser/transport cases;
+- add optional debug-level receiver facts only if Splunk, OTel, or local behavior cannot be explained from status, response bytes, and stats deltas;
 - postpone generic client-drop, TCP RST, keep-alive reuse, and additional malformed-header variants until a specific defect or compatibility gap requires them.
 
 ## Appendix D — Test Strategy And Harness
@@ -1370,7 +1459,7 @@ Immediate tests should close known behavior holes before adding new subsystems:
 3. next local tests: detailed bounded subreason values for parse/index failures;
 4. Splunk exploration: timeout, malformed HTTP framing, malformed `Content-Length`, disabled-token oracle configuration, and later-invalid JSON arrays;
 5. system validation: health while stopping and request behavior during graceful drain;
-6. only after design work: ACK registry tests, bounded-queue tests, query-string index tests, and byte-preserving raw-mode tests.
+6. after query implementation: query-string metadata tests for raw `index`, `host`, `source`, `sourcetype`, duplicate keys, unknown keys, and query-token disabled behavior; later ACK registry, bounded-queue, and byte-preserving raw-store tests.
 
 ### D.3 Raw Socket Complexity
 

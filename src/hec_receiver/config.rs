@@ -9,12 +9,16 @@ use std::{
 };
 use thiserror::Error;
 
-use super::{app::Limits, index::is_valid_index_name, protocol::Protocol, report::ReportOutputs};
+use super::{
+    app::Limits, index::is_valid_index_name, parse_raw::RawMode, protocol::Protocol,
+    report::ReportOutputs,
+};
 
 const DEFAULT_ADDR: &str = "127.0.0.1:18088";
 const DEFAULT_TOKEN_ID: &str = "default";
 const DEFAULT_TOKEN: &str = "dev-token";
 const DEFAULT_INDEX: &str = "main";
+const DEFAULT_RAW_MODE: &str = "split_lines";
 const DEFAULT_MAX_BYTES: usize = 1_000_000;
 const DEFAULT_MAX_DECODED_BYTES: usize = 4 * DEFAULT_MAX_BYTES;
 const DEFAULT_MAX_EVENTS: usize = 100_000;
@@ -35,6 +39,7 @@ const ENV_TOKEN_ACK_ENABLED: &str = "HEC_TOKEN_ACK_ENABLED";
 const ENV_DEFAULT_INDEX: &str = "HEC_DEFAULT_INDEX";
 const ENV_ALLOWED_INDEXES: &str = "HEC_ALLOWED_INDEXES";
 const ENV_CAPTURE: &str = "HEC_CAPTURE";
+const ENV_RAW_MODE: &str = "HEC_RAW_MODE";
 const ENV_MAX_BYTES: &str = "HEC_MAX_BYTES";
 const ENV_MAX_DECODED_BYTES: &str = "HEC_MAX_DECODED_BYTES";
 const ENV_MAX_EVENTS: &str = "HEC_MAX_EVENTS";
@@ -66,6 +71,7 @@ pub struct RuntimeConfig {
     pub default_index: Option<String>,
     pub allowed_indexes: Vec<String>,
     pub capture_path: Option<String>,
+    pub raw_mode: RawMode,
     pub limits: Limits,
     pub protocol: Protocol,
     pub observe: ObserveConfig,
@@ -212,6 +218,13 @@ pub struct Cli {
 
     #[arg(long)]
     pub capture: Option<String>,
+
+    #[arg(
+        long,
+        value_name = "preserve_body|split_lines",
+        help = "Raw endpoint event formation mode"
+    )]
+    pub raw_mode: Option<String>,
 
     #[arg(long)]
     pub max_bytes: Option<usize>,
@@ -370,6 +383,7 @@ impl Cli {
                 default_index: self.default_index.clone(),
                 allowed_indexes: self.allowed_indexes.clone(),
                 capture: self.capture.clone(),
+                raw_mode: self.raw_mode.clone(),
                 tokens: None,
             })
             .filter(has_hec_values),
@@ -449,6 +463,7 @@ impl ConfigDoc {
                 default_index: Some(DEFAULT_INDEX.to_string()),
                 allowed_indexes: Some(vec![DEFAULT_INDEX.to_string()]),
                 capture: None,
+                raw_mode: Some(DEFAULT_RAW_MODE.to_string()),
                 tokens: None,
             }),
             limits: Some(LimitsDoc {
@@ -491,6 +506,7 @@ impl ConfigDoc {
                 default_index: env_string(ENV_DEFAULT_INDEX),
                 allowed_indexes: env_list(ENV_ALLOWED_INDEXES),
                 capture: env_string(ENV_CAPTURE),
+                raw_mode: env_string(ENV_RAW_MODE),
                 tokens: None,
             })
             .filter(has_hec_values),
@@ -574,6 +590,7 @@ impl ConfigDoc {
                 default_index: config.default_index.clone(),
                 allowed_indexes: Some(config.allowed_indexes.clone()),
                 capture: config.capture_path.clone(),
+                raw_mode: Some(config.raw_mode.as_str().to_string()),
                 tokens: if config.tokens.len() > 1 {
                     Some(
                         config
@@ -646,6 +663,7 @@ impl ConfigDoc {
         if matches!(hec.capture.as_deref(), Some("")) {
             return invalid("hec.capture", "capture path cannot be empty");
         }
+        let raw_mode = parse_raw_mode(required(hec.raw_mode.clone(), "hec.raw_mode")?)?;
 
         let max_bytes = required(limits.max_bytes, "limits.max_bytes")?;
         let max_decoded_bytes = required(limits.max_decoded_bytes, "limits.max_decoded_bytes")?;
@@ -736,6 +754,7 @@ impl ConfigDoc {
             default_index: hec.default_index.clone(),
             allowed_indexes,
             capture_path: hec.capture.clone(),
+            raw_mode,
             limits: Limits {
                 max_content_length: max_bytes,
                 max_http_body_bytes: max_bytes,
@@ -771,6 +790,8 @@ struct HecDoc {
     allowed_indexes: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     capture: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tokens: Option<Vec<HecTokenDoc>>,
 }
@@ -1004,6 +1025,7 @@ fn has_hec_values(value: &HecDoc) -> bool {
         || value.default_index.is_some()
         || value.allowed_indexes.is_some()
         || value.capture.is_some()
+        || value.raw_mode.is_some()
         || value.tokens.is_some()
 }
 
@@ -1216,6 +1238,15 @@ fn parse_duration(value: String, field: &'static str) -> Result<Duration, Config
     })
 }
 
+fn parse_raw_mode(value: String) -> Result<RawMode, ConfigError> {
+    value
+        .parse::<RawMode>()
+        .map_err(|message| ConfigError::Invalid {
+            field: "hec.raw_mode",
+            message: message.to_string(),
+        })
+}
+
 fn validate_token(token: &str) -> Result<(), ConfigError> {
     validate_token_field(token, "hec.token")
 }
@@ -1341,6 +1372,7 @@ mod tests {
         "HEC_DEFAULT_INDEX",
         "HEC_ALLOWED_INDEXES",
         "HEC_CAPTURE",
+        "HEC_RAW_MODE",
         "HEC_MAX_BYTES",
         "HEC_MAX_DECODED_BYTES",
         "HEC_MAX_EVENTS",
@@ -1428,6 +1460,7 @@ stats = true
         assert!(!config.token_ack_enabled);
         assert_eq!(config.default_index.as_deref(), Some("app_logs"));
         assert_eq!(config.allowed_indexes, vec!["app_logs", "audit_logs"]);
+        assert_eq!(config.raw_mode, super::RawMode::SplitLines);
         assert_eq!(
             config.capture_path.as_deref(),
             Some("/tmp/hec-events.jsonl")
@@ -1478,6 +1511,7 @@ max_events = 10
         env::set_var("HEC_TOKEN_ACK_ENABLED", "true");
         env::set_var("HEC_DEFAULT_INDEX", "env_index");
         env::set_var("HEC_ALLOWED_INDEXES", "env_index,other_index");
+        env::set_var("HEC_RAW_MODE", "split_lines");
         env::set_var("HEC_MAX_EVENTS", "30");
         env::set_var("HEC_OBSERVE_CONSOLE", "true");
 
@@ -1500,6 +1534,7 @@ max_events = 10
             loaded.config.allowed_indexes,
             vec!["env_index", "other_index"]
         );
+        assert_eq!(loaded.config.raw_mode, super::RawMode::SplitLines);
         assert_eq!(loaded.config.limits.max_content_length, 1000);
         assert_eq!(loaded.config.limits.max_events_per_request, 30);
         assert!(loaded.config.observe.console);
@@ -1647,6 +1682,7 @@ token = "env-file-token"
         assert_eq!(loaded.config.default_index.as_deref(), Some("main"));
         assert_eq!(loaded.config.allowed_indexes, vec!["main"]);
         assert_eq!(loaded.config.token_id, "default");
+        assert_eq!(loaded.config.raw_mode, super::RawMode::SplitLines);
         assert!(loaded.config.token_enabled);
         assert!(!loaded.config.token_ack_enabled);
         assert_eq!(loaded.config.tokens.len(), 1);
@@ -1823,6 +1859,18 @@ allowed_indexes = ["main"]
 
         assert!(error.to_string().contains("limits.max_bytes"));
         assert!(error.to_string().contains("HEC_MAX_BYTES"));
+    }
+
+    #[test]
+    fn validation_rejects_invalid_raw_mode() {
+        let _guard = env_guard();
+        let error = RuntimeConfig::load_with_cli(Cli {
+            raw_mode: Some("line-ish".to_string()),
+            ..Cli::default()
+        })
+        .expect_err("invalid config");
+
+        assert!(error.to_string().contains("hec.raw_mode"));
     }
 
     fn write_config(contents: &str) -> std::path::PathBuf {

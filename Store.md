@@ -70,7 +70,7 @@ Allowed on the HEC request path for the first implementation:
 
 - auth and HEC response classification;
 - bounded body read and optional gzip decode;
-- raw endpoint line boundary detection for bounded bodies;
+- raw endpoint event formation for bounded bodies, with split-line default and optional raw-byte evidence storage;
 - HEC JSON envelope parsing for bounded bodies;
 - shallow event metadata extraction;
 - `HecEvents` formation;
@@ -294,7 +294,7 @@ The interface must expose capabilities and policies rather than pretending every
 
 Backend capability metadata should include:
 
-- accepted input units: `HecEvents`, `RawEvents`, owned event objects, or `WriteBlock`;
+- accepted input units: `HecEvents`, `RequestRaw`/`RawEvents` where byte preservation is needed, owned event objects, or `WriteBlock`;
 - preferred write granularity: event count, byte size, elapsed time, or explicit flush boundary;
 - commit states supported: written, flushed, durable, indexed;
 - byte preservation: raw bytes, decoded text, dual raw+decoded, or structured-only;

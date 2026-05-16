@@ -3,7 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
-    fs::{create_dir_all, File},
+    fs::{create_dir, create_dir_all, File},
     io::{Read, Write},
     net::{Shutdown, SocketAddr, TcpStream},
     path::PathBuf,
@@ -151,7 +151,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    let run_dir = cli.out.join(run_timestamp());
+    let run_dir = unique_run_dir(&cli.out)?;
     create_dir_all(run_dir.join("requests"))?;
     create_dir_all(run_dir.join("responses"))?;
     if cli.stats_url.is_some() {
@@ -176,7 +176,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             Some(url) => snapshot_stats(&run_dir, &case, url, stats_timeout, "after"),
             None => None,
         };
-        results.push(write_result(&run_dir, &case, result, stats_before, stats_after)?);
+        results.push(write_result(
+            &run_dir,
+            &case,
+            result,
+            stats_before,
+            stats_after,
+        )?);
     }
     write_summary(&run_dir, &results)?;
     serde_json::to_writer_pretty(File::create(run_dir.join("results.json"))?, &results)?;
@@ -190,6 +196,28 @@ fn run_timestamp() -> String {
         .replace(['-', ':'], "")
 }
 
+fn unique_run_dir(root: &std::path::Path) -> std::io::Result<std::path::PathBuf> {
+    create_dir_all(root)?;
+    let timestamp = run_timestamp();
+    for suffix in 0..1000 {
+        let name = if suffix == 0 {
+            timestamp.clone()
+        } else {
+            format!("{timestamp}-{suffix:03}")
+        };
+        let candidate = root.join(name);
+        match create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not create unique raw-socket run directory",
+    ))
+}
+
 fn write_run_config(
     out: &std::path::Path,
     cli: &Cli,
@@ -200,7 +228,11 @@ fn write_run_config(
     writeln!(file, "case={}", cli.case)?;
     writeln!(file, "read_timeout_ms={}", cli.read_timeout_ms)?;
     writeln!(file, "slow_body_delay_ms={}", cli.slow_body_delay_ms)?;
-    writeln!(file, "stats_url={}", cli.stats_url.as_deref().unwrap_or("-"))?;
+    writeln!(
+        file,
+        "stats_url={}",
+        cli.stats_url.as_deref().unwrap_or("-")
+    )?;
     writeln!(file, "stats_timeout_ms={}", cli.stats_timeout_ms)?;
     writeln!(file, "token_present={}", !cli.token.is_empty())?;
     writeln!(file)?;
